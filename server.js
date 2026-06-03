@@ -3,7 +3,7 @@ import multer from "multer";
 import cors from "cors";
 import fetch from "node-fetch";
 import { getDocument } from "pdfjs-dist/legacy/build/pdf.mjs";
-import { createCanvas } from "canvas";
+import sharp from "sharp";
 import { fileURLToPath } from "url";
 import path from "path";
 
@@ -19,10 +19,12 @@ const API_KEY = process.env.ANTHROPIC_API_KEY;
 async function renderPage(pdfDoc, pageNum, scale = 1.0) {
   const page = await pdfDoc.getPage(pageNum);
   const viewport = page.getViewport({ scale });
-  const canvas = createCanvas(viewport.width, viewport.height);
-  const ctx = canvas.getContext("2d");
-  await page.render({ canvasContext: ctx, viewport }).promise;
-  return canvas.toDataURL("image/jpeg", 0.75).split(",")[1];
+  const width = Math.floor(viewport.width);
+  const height = Math.floor(viewport.height);
+  const buffer = new Uint8ClampedArray(width * height * 4);
+  await page.render({ canvasContext: { canvas: { width, height }, drawImage: () => {}, fillRect: () => {}, save: () => {}, restore: () => {}, transform: () => {}, scale: () => {} }, viewport }).promise;
+  const jpeg = await sharp(Buffer.from(buffer), { raw: { width, height, channels: 4 } }).jpeg({ quality: 75 }).toBuffer();
+  return jpeg.toString("base64");
 }
 
 // ─── Call Claude API ──────────────────────────────────────────────────────────
