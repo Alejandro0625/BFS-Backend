@@ -8,7 +8,7 @@ import pkg from "pdfjs-dist/legacy/build/pdf.js"; const { getDocument, GlobalWor
 GlobalWorkerOptions.workerSrc = "";
 
 const app = express();
-const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 500 * 1024 * 1024 } });
+const upload = multer({ storage: multer.diskStorage({ destination: '/tmp', filename: (req, file, cb) => cb(null, Date.now() + '.pdf') }), limits: { fileSize: 500 * 1024 * 1024 } });
 
 app.use(cors());
 app.use(express.json({ limit: "10mb" }));
@@ -71,8 +71,7 @@ app.post("/analyze", upload.single("pdf"), async (req, res) => {
   try {
     send(res, { type: "log", msg: "Loading PDF...", level: "info" });
 
-    const pdfData = new Uint8Array(req.file.buffer);
-    const pdfDoc = await getDocument({ data: pdfData }).promise;
+const pdfDoc = await getDocument({ url: `file://${req.file.path}` }).promise;
     const total = pdfDoc.numPages;
 
     send(res, { type: "log", msg: `✓ ${total} pages loaded — ${req.file.originalname}`, level: "ok" });
