@@ -2,10 +2,10 @@ import express from "express";
 import multer from "multer";
 import cors from "cors";
 import fetch from "node-fetch";
-import pkg from "pdfjs-dist"; const { getDocument, GlobalWorkerOptions } = pkg; GlobalWorkerOptions.workerSrc = "";
 import { createCanvas } from "canvas";
-import { fileURLToPath } from "url";
-import path from "path";
+import { getDocument, GlobalWorkerOptions } from "pdfjs-dist/legacy/build/pdf.js";
+
+GlobalWorkerOptions.workerSrc = "";
 
 const app = express();
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 500 * 1024 * 1024 } });
@@ -15,73 +15,16 @@ app.use(express.json({ limit: "10mb" }));
 
 const API_KEY = process.env.ANTHROPIC_API_KEY;
 
-// ─── Render PDF page to base64 JPEG ──────────────────────────────────────────
-async function renderPage(pdfDoc, pageNum, scale = 1.0) {
+async function renderPage(pdfDoc, pageNum, scale) {
   const page = await pdfDoc.getPage(pageNum);
   const viewport = page.getViewport({ scale });
-  const canvas = createCanvas(viewport.width, viewport.height);
+  const canvas = createCanvas(Math.floor(viewport.width), Math.floor(viewport.height));
   const ctx = canvas.getContext("2d");
   await page.render({ canvasContext: ctx, viewport }).promise;
   return canvas.toDataURL("image/jpeg", 0.75).split(",")[1];
 }
 
-  // Create a minimal canvas context for pdfjs
-  const canvasData = new Uint8ClampedArray(width * height * 4);
-  const ctx = {
-    canvas: { width, height },
-    _data: canvasData,
-    currentTransform: [1, 0, 0, 1, 0, 0],
-    getTransform: () => ({ a: 1, b: 0, c: 0, d: 1, e: 0, f: 0, invertSelf: () => ({ a: 1, b: 0, c: 0, d: 1, e: 0, f: 0 }) }),
-    setTransform: () => {},
-    transform: () => {},
-    save: () => {},
-    restore: () => {},
-    scale: () => {},
-    rotate: () => {},
-    translate: () => {},
-    fillRect: () => {},
-    clearRect: () => {},
-    beginPath: () => {},
-    stroke: () => {},
-    fill: () => {},
-    moveTo: () => {},
-    lineTo: () => {},
-    bezierCurveTo: () => {},
-    rect: () => {},
-    clip: () => {},
-    drawImage: () => {},
-    createImageData: (w, h) => ({ data: new Uint8ClampedArray(w * h * 4), width: w, height: h }),
-    putImageData: (imgData, x, y) => {},
-    getImageData: (x, y, w, h) => ({ data: canvasData, width: w, height: h }),
-    measureText: (t) => ({ width: t.length * 5 }),
-    fillText: () => {},
-    strokeText: () => {},
-    createLinearGradient: () => ({ addColorStop: () => {} }),
-    createPattern: () => ({}),
-    set fillStyle(_) {},
-    set strokeStyle(_) {},
-    set lineWidth(_) {},
-    set font(_) {},
-    set globalAlpha(_) {},
-    set globalCompositeOperation(_) {},
-    set imageSmoothingEnabled(_) {},
-    set shadowBlur(_) {},
-    set shadowColor(_) {},
-    set lineCap(_) {},
-    set lineJoin(_) {},
-  };
-
-  await page.render({ canvasContext: ctx, viewport }).promise;
-
-  const jpeg = await sharp(Buffer.from(canvasData.buffer), {
-    raw: { width, height, channels: 4 },
-  }).jpeg({ quality: 70 }).toBuffer();
-
-  return jpeg.toString("base64");
-}
-
-// ─── Call Claude API ──────────────────────────────────────────────────────────
-async function claude(content, system, maxTokens = 4000) {
+async function claude(content, system) {
   const res = await fetch("https://api.anthropic.com/v1/messages", {
     method: "POST",
     headers: {
@@ -91,7 +34,7 @@ async function claude(content, system, maxTokens = 4000) {
     },
     body: JSON.stringify({
       model: "claude-sonnet-4-20250514",
-      max_tokens: maxTokens,
+      max_tokens: 4000,
       system,
       messages: [{ role: "user", content }],
     }),
@@ -101,24 +44,24 @@ async function claude(content, system, maxTokens = 4000) {
   return data.content?.find((b) => b.type === "text")?.text || "";
 }
 
-// ─── Parse JSON ───────────────────────────────────────────────────────────────
 function parseJSON(text) {
   try {
     const m = text.match(/```json\s*([\s\S]*?)```/);
     return JSON.parse(m ? m[1] : text);
   } catch {
-    const s = text.indexOf("{"), e = text.lastIndexOf("}");
-    if (s !== -1 && e !== -1) try { return JSON.parse(text.slice(s, e + 1)); } catch {}
+    const s = text.indexOf("{");
+    const e = text.lastIndexOf("}");
+    if (s !== -1 && e !== -1) {
+      try { return JSON.parse(text.slice(s, e + 1)); } catch {}
+    }
     return null;
   }
 }
 
-// ─── SSE helper ──────────────────────────────────────────────────────────────
 function send(res, data) {
   res.write(`data: ${JSON.stringify(data)}\n\n`);
 }
 
-// ─── Main analysis endpoint ───────────────────────────────────────────────────
 app.post("/analyze", upload.single("pdf"), async (req, res) => {
   res.setHeader("Content-Type", "text/event-stream");
   res.setHeader("Cache-Control", "no-cache");
@@ -133,8 +76,6 @@ app.post("/analyze", upload.single("pdf"), async (req, res) => {
     const total = pdfDoc.numPages;
 
     send(res, { type: "log", msg: `✓ ${total} pages loaded — ${req.file.originalname}`, level: "ok" });
-
-    // ── Step 1: Filter pages ──
     send(res, { type: "phase", phase: "filtering" });
     send(res, { type: "log", msg: "Scanning pages to find elevations, floor plans, and legend...", level: "info" });
 
@@ -160,7 +101,9 @@ app.post("/analyze", upload.single("pdf"), async (req, res) => {
         if (t.includes("MATERIAL_LEGEND")) relevant.materialLegend.push(p);
         if (t.includes("3D_VIEW")) relevant.views3d.push(p);
         if (t.includes("ENLARGED_DETAIL")) relevant.enlargedDetails.push(p);
-        if (!t.includes("IRRELEVANT")) send(res, { type: "log", msg: `Page ${p}: ${t.join(", ")}`, level: "dim" });
+        if (!t.includes("IRRELEVANT")) {
+          send(res, { type: "log", msg: `Page ${p}: ${t.join(", ")}`, level: "dim" });
+        }
       }
     }
 
@@ -170,7 +113,6 @@ app.post("/analyze", upload.single("pdf"), async (req, res) => {
       throw new Error("No exterior elevation pages found in this PDF.");
     }
 
-    // ── Step 2: Read legend ──
     send(res, { type: "phase", phase: "legend" });
     send(res, { type: "log", msg: "Reading material legend...", level: "info" });
     send(res, { type: "progress", label: "Reading legend", pct: 35 });
@@ -196,9 +138,10 @@ app.post("/analyze", upload.single("pdf"), async (req, res) => {
       }
     }
 
-    if (!legend.length) send(res, { type: "log", msg: "⚠ No legend found — will identify materials from drawing labels", level: "warn" });
+    if (!legend.length) {
+      send(res, { type: "log", msg: "⚠ No legend found — will identify materials from drawing labels", level: "warn" });
+    }
 
-    // ── Step 3: Analyze elevations ──
     send(res, { type: "phase", phase: "analyzing" });
     const elevPages = [
       ...relevant.exteriorElevations.map((p) => ({ p, type: "elevation" })),
@@ -250,7 +193,6 @@ Return ONLY JSON:
       }
     }
 
-    // ── Step 4: 3D cross-reference ──
     if (relevant.views3d.length) {
       send(res, { type: "progress", label: "Cross-referencing 3D views", pct: 92 });
       send(res, { type: "log", msg: "Cross-checking 3D views for soffits and returns...", level: "info" });
