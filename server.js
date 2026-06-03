@@ -3,7 +3,7 @@ import multer from "multer";
 import cors from "cors";
 import fetch from "node-fetch";
 import { createCanvas } from "canvas";
-import { getDocument, GlobalWorkerOptions } from "pdfjs-dist/legacy/build/pdf.js";
+import pkg from "pdfjs-dist/legacy/build/pdf.js"; const { getDocument, GlobalWorkerOptions } = pkg;
 
 GlobalWorkerOptions.workerSrc = "";
 
