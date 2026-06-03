@@ -3,7 +3,7 @@ import multer from "multer";
 import cors from "cors";
 import fetch from "node-fetch";
 import pkg from "pdfjs-dist"; const { getDocument, GlobalWorkerOptions } = pkg; GlobalWorkerOptions.workerSrc = "";
-import sharp from "sharp";
+import { createCanvas } from "canvas";
 import { fileURLToPath } from "url";
 import path from "path";
 
@@ -19,8 +19,11 @@ const API_KEY = process.env.ANTHROPIC_API_KEY;
 async function renderPage(pdfDoc, pageNum, scale = 1.0) {
   const page = await pdfDoc.getPage(pageNum);
   const viewport = page.getViewport({ scale });
-  const width = Math.floor(viewport.width);
-  const height = Math.floor(viewport.height);
+  const canvas = createCanvas(viewport.width, viewport.height);
+  const ctx = canvas.getContext("2d");
+  await page.render({ canvasContext: ctx, viewport }).promise;
+  return canvas.toDataURL("image/jpeg", 0.75).split(",")[1];
+}
 
   // Create a minimal canvas context for pdfjs
   const canvasData = new Uint8ClampedArray(width * height * 4);
