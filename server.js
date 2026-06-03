@@ -31,7 +31,7 @@ async function renderPage(pdfDoc, pageNum, scale = 1.0) {
     canvas: { width, height },
     _data: canvasData,
     currentTransform: [1, 0, 0, 1, 0, 0],
-    getTransform: () => ({ a: 1, b: 0, c: 0, d: 1, e: 0, f: 0 }),
+    getTransform: () => ({ a: 1, b: 0, c: 0, d: 1, e: 0, f: 0, invertSelf: () => ({ a: 1, b: 0, c: 0, d: 1, e: 0, f: 0 }) }),
     setTransform: () => {},
     transform: () => {},
     save: () => {},
