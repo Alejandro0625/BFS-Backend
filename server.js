@@ -21,9 +21,59 @@ async function renderPage(pdfDoc, pageNum, scale = 1.0) {
   const viewport = page.getViewport({ scale });
   const width = Math.floor(viewport.width);
   const height = Math.floor(viewport.height);
-  const buffer = new Uint8ClampedArray(width * height * 4);
-  await page.render({ canvasContext: { canvas: { width, height }, drawImage: () => {}, fillRect: () => {}, save: () => {}, restore: () => {}, transform: () => {}, scale: () => {} }, viewport }).promise;
-  const jpeg = await sharp(Buffer.from(buffer), { raw: { width, height, channels: 4 } }).jpeg({ quality: 75 }).toBuffer();
+
+  // Create a minimal canvas context for pdfjs
+  const canvasData = new Uint8ClampedArray(width * height * 4);
+  const ctx = {
+    canvas: { width, height },
+    _data: canvasData,
+    currentTransform: [1, 0, 0, 1, 0, 0],
+    getTransform: () => ({ a: 1, b: 0, c: 0, d: 1, e: 0, f: 0 }),
+    setTransform: () => {},
+    transform: () => {},
+    save: () => {},
+    restore: () => {},
+    scale: () => {},
+    rotate: () => {},
+    translate: () => {},
+    fillRect: () => {},
+    clearRect: () => {},
+    beginPath: () => {},
+    stroke: () => {},
+    fill: () => {},
+    moveTo: () => {},
+    lineTo: () => {},
+    bezierCurveTo: () => {},
+    rect: () => {},
+    clip: () => {},
+    drawImage: () => {},
+    createImageData: (w, h) => ({ data: new Uint8ClampedArray(w * h * 4), width: w, height: h }),
+    putImageData: (imgData, x, y) => {},
+    getImageData: (x, y, w, h) => ({ data: canvasData, width: w, height: h }),
+    measureText: (t) => ({ width: t.length * 5 }),
+    fillText: () => {},
+    strokeText: () => {},
+    createLinearGradient: () => ({ addColorStop: () => {} }),
+    createPattern: () => ({}),
+    set fillStyle(_) {},
+    set strokeStyle(_) {},
+    set lineWidth(_) {},
+    set font(_) {},
+    set globalAlpha(_) {},
+    set globalCompositeOperation(_) {},
+    set imageSmoothingEnabled(_) {},
+    set shadowBlur(_) {},
+    set shadowColor(_) {},
+    set lineCap(_) {},
+    set lineJoin(_) {},
+  };
+
+  await page.render({ canvasContext: ctx, viewport }).promise;
+
+  const jpeg = await sharp(Buffer.from(canvasData.buffer), {
+    raw: { width, height, channels: 4 },
+  }).jpeg({ quality: 70 }).toBuffer();
+
   return jpeg.toString("base64");
 }
 
