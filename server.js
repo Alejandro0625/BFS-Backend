@@ -2,7 +2,7 @@ import express from "express";
 import multer from "multer";
 import cors from "cors";
 import fetch from "node-fetch";
-import { getDocument } from "pdfjs-dist/legacy/build/pdf.mjs";
+import pkg from "pdfjs-dist"; const { getDocument, GlobalWorkerOptions } = pkg; GlobalWorkerOptions.workerSrc = "";
 import sharp from "sharp";
 import { fileURLToPath } from "url";
 import path from "path";
