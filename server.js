@@ -3,12 +3,18 @@ import multer from "multer";
 import cors from "cors";
 import fetch from "node-fetch";
 import { createCanvas } from "canvas";
-import pkg from "pdfjs-dist/legacy/build/pdf.js"; const { getDocument, GlobalWorkerOptions } = pkg;
-
+import pkg from "pdfjs-dist/legacy/build/pdf.js";
+const { getDocument, GlobalWorkerOptions } = pkg;
 GlobalWorkerOptions.workerSrc = "";
 
 const app = express();
-const upload = multer({ storage: multer.diskStorage({ destination: '/tmp', filename: (req, file, cb) => cb(null, Date.now() + '.pdf') }), limits: { fileSize: 500 * 1024 * 1024 } });
+const upload = multer({ 
+  storage: multer.diskStorage({ 
+    destination: '/tmp', 
+    filename: (req, file, cb) => cb(null, Date.now() + '.pdf') 
+  }), 
+  limits: { fileSize: 500 * 1024 * 1024 } 
+});
 
 app.use(cors());
 app.use(express.json({ limit: "10mb" }));
@@ -21,7 +27,9 @@ async function renderPage(pdfDoc, pageNum, scale) {
   const canvas = createCanvas(Math.floor(viewport.width), Math.floor(viewport.height));
   const ctx = canvas.getContext("2d");
   await page.render({ canvasContext: ctx, viewport }).promise;
-  return canvas.toDataURL("image/jpeg", 0.75).split(",")[1];
+  const b64 = canvas.toDataURL("image/jpeg", 0.75).split(",")[1];
+  page.cleanup();
+  return b64;
 }
 
 async function claude(content, system) {
@@ -71,47 +79,39 @@ app.post("/analyze", upload.single("pdf"), async (req, res) => {
   try {
     send(res, { type: "log", msg: "Loading PDF...", level: "info" });
 
-const pdfDoc = await getDocument({ url: `file://${req.file.path}` }).promise;
+    const pdfDoc = await getDocument({ url: `file://${req.file.path}` }).promise;
     const total = pdfDoc.numPages;
 
     send(res, { type: "log", msg: `✓ ${total} pages loaded — ${req.file.originalname}`, level: "ok" });
     send(res, { type: "phase", phase: "filtering" });
-    send(res, { type: "log", msg: "Scanning pages to find elevations, floor plans, and legend...", level: "info" });
+    send(res, { type: "log", msg: "Reading sheet index to identify relevant pages...", level: "info" });
 
     const relevant = { floorPlans: [], exteriorElevations: [], returnElevations: [], materialLegend: [], views3d: [], enlargedDetails: [] };
 
-    for (let p = 1; p <= total; p++) {
-      send(res, { type: "progress", label: `Scanning page ${p} of ${total}`, pct: Math.round((p / total) * 30) });
+    // Read only first 5 pages to find the sheet index
+    const indexImages = [];
+    for (let p = 1; p <= Math.min(5, total); p++) {
+      send(res, { type: "progress", label: `Reading sheet index page ${p}`, pct: p * 5 });
+      const b64 = await renderPage(pdfDoc, p, 0.8);
+      indexImages.push({ type: "image", source: { type: "base64", media_type: "image/jpeg", data: b64 } });
+    }
+    indexImages.push({ 
+      type: "text", 
+      text: `These are the first pages of a commercial architectural blueprint set with ${total} total pages. Find the SHEET INDEX or TABLE OF CONTENTS which lists all drawing sheet numbers and their titles. Use it to identify which page numbers contain: exterior elevations, return elevations, material legend/finish schedule, floor plans, and 3D exterior views. Return ONLY JSON: {"floorPlans":[page numbers],"exteriorElevations":[page numbers],"returnElevations":[page numbers],"materialLegend":[page numbers],"views3d":[page numbers],"enlargedDetails":[page numbers]}` 
+    });
 
-      const b64 = await renderPage(pdfDoc, p, 0.12);
-      const result = parseJSON(await claude(
-        [
-          { type: "image", source: { type: "base64", media_type: "image/jpeg", data: b64 } },
-          { type: "text", text: `Page ${p} of a commercial architectural blueprint. Classify it. Return ONLY JSON: {"types":["FLOOR_PLAN"|"EXTERIOR_ELEVATION"|"RETURN_ELEVATION"|"MATERIAL_LEGEND"|"3D_VIEW"|"ENLARGED_DETAIL"|"IRRELEVANT"]}` },
-        ],
-        "Classify architectural blueprint pages. Return ONLY valid JSON."
-      ));
-
-      if (result?.types) {
-        const t = result.types;
-        if (t.includes("FLOOR_PLAN")) relevant.floorPlans.push(p);
-        if (t.includes("EXTERIOR_ELEVATION")) relevant.exteriorElevations.push(p);
-        if (t.includes("RETURN_ELEVATION")) relevant.returnElevations.push(p);
-        if (t.includes("MATERIAL_LEGEND")) relevant.materialLegend.push(p);
-        if (t.includes("3D_VIEW")) relevant.views3d.push(p);
-        if (t.includes("ENLARGED_DETAIL")) relevant.enlargedDetails.push(p);
-        if (!t.includes("IRRELEVANT")) {
-          send(res, { type: "log", msg: `Page ${p}: ${t.join(", ")}`, level: "dim" });
-        }
-      }
+    const filterResult = parseJSON(await claude(indexImages, "You read architectural sheet indexes to identify relevant drawings. Return ONLY valid JSON."));
+    if (filterResult) {
+      Object.keys(relevant).forEach(k => { if (filterResult[k]) relevant[k].push(...filterResult[k]); });
     }
 
     send(res, { type: "log", msg: `✓ Found: ${relevant.materialLegend.length} legend | ${relevant.exteriorElevations.length} elevations | ${relevant.returnElevations.length} returns | ${relevant.views3d.length} 3D views`, level: "ok" });
 
     if (!relevant.exteriorElevations.length && !relevant.returnElevations.length) {
-      throw new Error("No exterior elevation pages found in this PDF.");
+      throw new Error("No exterior elevation pages found. Make sure the PDF has a sheet index on the first few pages.");
     }
 
+    // Read legend
     send(res, { type: "phase", phase: "legend" });
     send(res, { type: "log", msg: "Reading material legend...", level: "info" });
     send(res, { type: "progress", label: "Reading legend", pct: 35 });
@@ -141,6 +141,7 @@ const pdfDoc = await getDocument({ url: `file://${req.file.path}` }).promise;
       send(res, { type: "log", msg: "⚠ No legend found — will identify materials from drawing labels", level: "warn" });
     }
 
+    // Analyze elevations
     send(res, { type: "phase", phase: "analyzing" });
     const elevPages = [
       ...relevant.exteriorElevations.map((p) => ({ p, type: "elevation" })),
@@ -192,6 +193,7 @@ Return ONLY JSON:
       }
     }
 
+    // 3D cross reference
     if (relevant.views3d.length) {
       send(res, { type: "progress", label: "Cross-referencing 3D views", pct: 92 });
       send(res, { type: "log", msg: "Cross-checking 3D views for soffits and returns...", level: "info" });
