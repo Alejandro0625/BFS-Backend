@@ -17,6 +17,7 @@ const upload = multer({
 });
 
 app.use(cors());
+app.use((req, res, next) => { req.setTimeout(600000); res.setTimeout(600000); next(); });
 app.use(express.json({ limit: "10mb" }));
 
 const API_KEY = process.env.ANTHROPIC_API_KEY;
