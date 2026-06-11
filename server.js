@@ -126,8 +126,12 @@ ACM panels, MCM panels, fiber cement panels, fiber cement plank, Nichiha panels,
 
 We do NOT want: structural drawings, mechanical, plumbing, electrical, interior elevations, interior plans, sections, civil, landscape, roofing, masonry details.
 
-Return ONLY JSON: {"floorPlans":[page numbers],"exteriorElevations":[page numbers],"returnElevations":[page numbers],"materialLegend":[page numbers],"views3d":[page numbers],"enlargedDetails":[page numbers]}`
-    });
+Exterior elevations are typically labeled A-200, A-201, A-202 etc. in the sheet index.
+Return elevations are typically A-220, A-221, A-222 etc.
+Material legends are often on the same page as the first elevation sheet.
+Look carefully at the sheet index table for these sheet numbers and match them to their PDF page numbers.
+
+Return ONLY JSON: {"floorPlans":[page numbers],"exteriorElevations":[page numbers],"returnElevations":[page numbers],"materialLegend":[page numbers],"views3d":[page numbers],"enlargedDetails":[page numbers]}
 
     const filterResult = parseJSON(await claude(indexImages, "You are a commercial panel siding estimator reading architectural sheet indexes. Identify only pages relevant to exterior panel cladding. Return ONLY valid JSON."));
     if (filterResult) {
