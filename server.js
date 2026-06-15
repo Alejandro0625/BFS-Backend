@@ -125,9 +125,9 @@ app.post("/analyze", upload.single("pdf"), async (req, res) => {
     const relevant = { floorPlans: [], exteriorElevations: [], returnElevations: [], materialLegend: [], views3d: [], enlargedDetails: [] };
 
     const indexImages = [];
-    for (let p = 1; p <= Math.min(5, total); p++) {
+    for (let p = 1; p <= Math.min(4, total); p++) {
       send(res, { type: "progress", label: "Reading sheet index page " + p, pct: p * 4 });
-      const b64 = await renderPage(pdfDoc, p, 0.8);
+      const b64 = await renderPage(pdfDoc, p, 2.0);
       indexImages.push({ type: "image", source: { type: "base64", media_type: "image/jpeg", data: b64 } });
     }
 
