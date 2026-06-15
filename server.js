@@ -19,7 +19,7 @@ const upload = multer({
 
 app.use(cors());
 app.use(express.json({ limit: "50mb" }));
-app.use((req, res, next) => { req.setTimeout(600000); res.setTimeout(600000); next(); });
+app.use((req, res, next) => { req.setTimeout(0); res.setTimeout(0); next(); });
 
 const API_KEY = process.env.ANTHROPIC_API_KEY;
 let lastPdfPath = null;
