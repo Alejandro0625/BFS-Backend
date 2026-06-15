@@ -22,8 +22,6 @@ app.use(express.json({ limit: "50mb" }));
 app.use((req, res, next) => { req.setTimeout(600000); res.setTimeout(600000); next(); });
 
 const API_KEY = process.env.ANTHROPIC_API_KEY;
-
-// Store last analyzed PDF path for PDF generation
 let lastPdfPath = null;
 
 const IGNORE_MATERIALS = [
@@ -64,6 +62,18 @@ async function renderPageToCanvas(pdfDoc, pageNum, scale) {
   await page.render({ canvasContext: ctx, viewport }).promise;
   page.cleanup();
   return canvas;
+}
+
+async function getPageText(pdfDoc, pageNum) {
+  try {
+    const page = await pdfDoc.getPage(pageNum);
+    const content = await page.getTextContent();
+    const text = content.items.map(function(i) { return i.str; }).join(" ");
+    page.cleanup();
+    return text;
+  } catch(e) {
+    return "";
+  }
 }
 
 async function claude(content, system) {
@@ -113,41 +123,54 @@ app.post("/analyze", upload.single("pdf"), async (req, res) => {
 
   try {
     send(res, { type: "log", msg: "Loading PDF...", level: "info" });
-
     lastPdfPath = req.file.path;
+
     const pdfDoc = await getDocument({ url: "file://" + req.file.path }).promise;
     const total = pdfDoc.numPages;
-
     send(res, { type: "log", msg: "Pages loaded: " + total + " — " + req.file.originalname, level: "ok" });
+
+    // ── STEP 1: Extract text from every page title block (FREE - no API) ──────
     send(res, { type: "phase", phase: "filtering" });
-    send(res, { type: "log", msg: "Reading sheet index to identify relevant pages...", level: "info" });
+    send(res, { type: "log", msg: "Reading all page title blocks (no API cost)...", level: "info" });
 
-    const relevant = { floorPlans: [], exteriorElevations: [], returnElevations: [], materialLegend: [], views3d: [], enlargedDetails: [] };
-
-    const indexImages = [];
-    for (let p = 1; p <= Math.min(4, total); p++) {
-      send(res, { type: "progress", label: "Reading sheet index page " + p, pct: p * 4 });
-      const b64 = await renderPage(pdfDoc, p, 2.0);
-      indexImages.push({ type: "image", source: { type: "base64", media_type: "image/jpeg", data: b64 } });
+    const pageIndex = [];
+    for (let p = 1; p <= total; p++) {
+      send(res, { type: "progress", label: "Reading page " + p + " of " + total, pct: Math.round((p / total) * 20) });
+      const text = await getPageText(pdfDoc, p);
+      if (text.trim().length > 10) {
+        pageIndex.push({ page: p, text: text.slice(0, 300) });
+      }
     }
 
-    indexImages.push({
-      type: "text",
-      text: "These are the first pages of a commercial architectural blueprint set with " + total + " total pages. Find the SHEET INDEX, DRAWING LIST, TABLE OF CONTENTS, or DRAWING SCHEDULE. We ONLY want sheets in the A-200 to A-228 range. Exterior elevations are A-200 through A-211. Return elevations are A-220 through A-228. Material legend is usually on the first elevation sheet. DO NOT include any A-300 series, A-350 series, or any wall sections, building sections, or construction details. Only exterior elevation and return elevation sheets. Look carefully at the sheet index table for these sheet numbers and match them to their PDF page numbers. Return ONLY JSON: {\"floorPlans\":[page numbers],\"exteriorElevations\":[page numbers],\"returnElevations\":[page numbers],\"materialLegend\":[page numbers],\"views3d\":[page numbers],\"enlargedDetails\":[page numbers]}"
-    });
+    send(res, { type: "log", msg: "Extracted text from " + pageIndex.length + " pages — sending to AI to classify...", level: "info" });
 
-    const filterResult = parseJSON(await claude(indexImages, "You are a commercial panel siding estimator reading architectural sheet indexes. Identify only pages relevant to exterior panel cladding in the A-200 to A-228 sheet range. Return ONLY valid JSON."));
-    if (filterResult) {
-      Object.keys(relevant).forEach(k => { if (filterResult[k]) relevant[k].push(...filterResult[k]); });
-    }
+    // ── STEP 2: ONE Claude call to classify all pages ─────────────────────────
+    const indexSummary = pageIndex.map(function(p) {
+      return "Page " + p.page + ": " + p.text.replace(/\s+/g, " ").trim();
+    }).join("\n");
 
-    send(res, { type: "log", msg: "Sheet index read: " + relevant.exteriorElevations.length + " elevations | " + relevant.returnElevations.length + " returns | " + relevant.materialLegend.length + " legend | " + relevant.views3d.length + " 3D views", level: "ok" });
+    const classifyResult = parseJSON(await claude(
+      [{ type: "text", text: "You are a commercial panel siding estimator. Below is a list of page numbers with text extracted from their title blocks from a " + total + "-page architectural blueprint set.\n\nIdentify which pages contain:\n- EXTERIOR ELEVATIONS (outside building faces showing siding/panels — any sheet labeled with words like elevation, facade, exterior, building face)\n- RETURN ELEVATIONS (corner/return details — sheets with words like return, corner, balcony return)\n- MATERIAL LEGEND or FINISH SCHEDULE (exterior material key/schedule)\n- FLOOR PLANS (only needed to find soffit/return locations)\n- 3D VIEWS or RENDERINGS (exterior perspective views)\n\nWe ONLY care about: ACM panels, fiber cement panels, Nichiha panels, aluminum wall panels, perforated metal panels, soffits, returns.\nIGNORE: structural, mechanical, plumbing, electrical, interior sheets, sections, civil, landscape, roofing.\n\nPAGE DATA:\n" + indexSummary + "\n\nReturn ONLY JSON: {\"exteriorElevations\":[page numbers],\"returnElevations\":[page numbers],\"materialLegend\":[page numbers],\"floorPlans\":[page numbers],\"views3d\":[page numbers]}" }],
+      "You classify architectural blueprint pages for exterior panel siding estimation. Return ONLY valid JSON."
+    ));
+
+    const relevant = {
+      floorPlans: (classifyResult && classifyResult.floorPlans) || [],
+      exteriorElevations: (classifyResult && classifyResult.exteriorElevations) || [],
+      returnElevations: (classifyResult && classifyResult.returnElevations) || [],
+      materialLegend: (classifyResult && classifyResult.materialLegend) || [],
+      views3d: (classifyResult && classifyResult.views3d) || [],
+      enlargedDetails: [],
+    };
+
+    send(res, { type: "log", msg: "Found: " + relevant.exteriorElevations.length + " elevations | " + relevant.returnElevations.length + " returns | " + relevant.materialLegend.length + " legend | " + relevant.floorPlans.length + " floor plans | " + relevant.views3d.length + " 3D views", level: "ok" });
+    send(res, { type: "log", msg: "Elevation pages: " + relevant.exteriorElevations.join(", "), level: "dim" });
 
     if (!relevant.exteriorElevations.length && !relevant.returnElevations.length) {
-      throw new Error("No exterior elevation pages found. Make sure the PDF has a sheet index on the first few pages.");
+      throw new Error("No exterior elevation pages found. The PDF may not have readable text in title blocks.");
     }
 
-    // Read legend
+    // ── STEP 3: Read legend ───────────────────────────────────────────────────
     send(res, { type: "phase", phase: "legend" });
     send(res, { type: "log", msg: "Reading material legend...", level: "info" });
     send(res, { type: "progress", label: "Reading legend", pct: 25 });
@@ -174,10 +197,10 @@ app.post("/analyze", upload.single("pdf"), async (req, res) => {
     }
 
     if (!legend.length) {
-      send(res, { type: "log", msg: "No legend found — will identify panel materials from drawing callouts", level: "warn" });
+      send(res, { type: "log", msg: "No dedicated legend found — will identify materials from drawing callouts", level: "warn" });
     }
 
-    // Check floor plans for soffits
+    // ── STEP 4: Check floor plans for soffits ────────────────────────────────
     let soffitNotes = [];
     if (relevant.floorPlans.length) {
       send(res, { type: "log", msg: "Checking floor plans for soffit and return locations...", level: "info" });
@@ -198,12 +221,11 @@ app.post("/analyze", upload.single("pdf"), async (req, res) => {
       }
     }
 
-    // Analyze elevations
+    // ── STEP 5: Analyze elevations ────────────────────────────────────────────
     send(res, { type: "phase", phase: "analyzing" });
     const elevPages = [
       ...relevant.exteriorElevations.map(function(p) { return { p: p, type: "elevation" }; }),
       ...relevant.returnElevations.map(function(p) { return { p: p, type: "return" }; }),
-      ...relevant.enlargedDetails.map(function(p) { return { p: p, type: "detail" }; }),
     ];
 
     send(res, { type: "log", msg: "Analyzing " + elevPages.length + " elevation pages...", level: "info" });
@@ -219,7 +241,7 @@ app.post("/analyze", upload.single("pdf"), async (req, res) => {
       send(res, { type: "progress", label: "Analyzing elevation " + (i + 1) + " of " + elevPages.length, pct: 35 + Math.round((i / elevPages.length) * 55) });
 
       const b64 = await renderPage(pdfDoc, p, 1.5);
-      const prompt = "You are a senior commercial PANEL SIDING estimator doing a material takeoff.\n\n" + legendCtx + "\n" + soffitCtx + "\n\nPage " + p + " type: " + type + ".\n\nINSTRUCTIONS:\n1. Read the drawing title\n2. Read the sheet reference\n3. Read the SCALE printed on the drawing\n4. For EACH panel material zone: identify material, calculate GROSS area using scale, list ALL openings, NET = Gross minus Openings\n5. SOFFITS: measure underside of overhangs (width x depth = SF)\n6. RETURNS: measure corner wraps (height x return depth = SF)\n7. IGNORE: brick, masonry, stone, EIFS, stucco, concrete, glass, curtainwall\n8. If this is a BUILDING SECTION or WALL SECTION not an elevation, return 0 zones\n\nReturn ONLY JSON:\n{\"pageNumber\":" + p + ",\"elevations\":[{\"title\":\"\",\"sheetRef\":\"\",\"scale\":\"\",\"building\":\"\",\"direction\":\"\",\"zones\":[{\"materialId\":\"\",\"materialName\":\"\",\"category\":\"\",\"description\":\"\",\"grossArea\":0,\"totalOpeningArea\":0,\"netArea\":0}],\"flags\":[]}]}";
+      const prompt = "You are a senior commercial PANEL SIDING estimator doing a material takeoff.\n\n" + legendCtx + "\n" + soffitCtx + "\n\nPage " + p + " type: " + type + ".\n\nINSTRUCTIONS:\n1. Read the drawing title\n2. Read the sheet reference\n3. Read the SCALE printed on the drawing\n4. For EACH panel material zone: identify material using legend, calculate GROSS area using scale, list ALL openings (windows/doors/louvers), NET = Gross minus Openings\n5. SOFFITS: measure underside of overhangs (width x depth = SF)\n6. RETURNS: measure corner wraps (height x return depth = SF)\n7. IGNORE: brick, masonry, stone, EIFS, stucco, concrete, glass, curtainwall\n8. If this is a BUILDING SECTION or WALL SECTION not an elevation, return 0 zones\n\nReturn ONLY JSON:\n{\"pageNumber\":" + p + ",\"elevations\":[{\"title\":\"\",\"sheetRef\":\"\",\"scale\":\"\",\"building\":\"\",\"direction\":\"\",\"zones\":[{\"materialId\":\"\",\"materialName\":\"\",\"category\":\"\",\"description\":\"\",\"grossArea\":0,\"totalOpeningArea\":0,\"netArea\":0}],\"flags\":[]}]}";
 
       const raw = await claude(
         [
@@ -250,7 +272,7 @@ app.post("/analyze", upload.single("pdf"), async (req, res) => {
       }
     }
 
-    // 3D cross reference
+    // ── STEP 6: 3D cross reference ────────────────────────────────────────────
     if (relevant.views3d.length) {
       send(res, { type: "progress", label: "Cross-referencing 3D views", pct: 93 });
       send(res, { type: "log", msg: "Cross-checking 3D views for missed soffits and returns...", level: "info" });
@@ -286,7 +308,6 @@ app.post("/generate-pdf", express.json({ limit: "50mb" }), async (req, res) => {
   try {
     const { takeoffData } = req.body;
     const pdfPath = lastPdfPath;
-
     if (!pdfPath || !takeoffData) throw new Error("No PDF available. Run analysis first.");
 
     const pdfDoc = await getDocument({ url: "file://" + pdfPath }).promise;
@@ -303,32 +324,25 @@ app.post("/generate-pdf", express.json({ limit: "50mb" }), async (req, res) => {
       const pageNum = elev.pageNumber;
       const elevCanvas = await renderPageToCanvas(pdfDoc, pageNum, 1.5);
 
-      // Build combined canvas: elevation + legend strip at bottom
       const legendH = 32 + elev.zones.length * 22 + 12;
       const combined = createCanvas(elevCanvas.width, elevCanvas.height + legendH);
       const ctx = combined.getContext("2d");
 
-      // Draw elevation
       ctx.drawImage(elevCanvas, 0, 0);
 
-      // Legend strip background
       ctx.fillStyle = "#111108";
       ctx.fillRect(0, elevCanvas.height, elevCanvas.width, legendH);
 
-      // Title
       ctx.fillStyle = "#e0cc80";
       ctx.font = "bold 15px Arial";
       ctx.fillText(elev.title + "  |  " + (elev.sheetRef || "") + "  |  Scale: " + (elev.scale || "N/A"), 12, elevCanvas.height + 22);
 
-      // Material rows
       elev.zones.forEach(function(z, i) {
         const y = elevCanvas.height + 42 + i * 22;
         const color = MATERIAL_COLORS[z.category] || [0.48, 0.48, 0.48];
         const hex = "#" + color.map(function(c) { return Math.round(c * 255).toString(16).padStart(2, "0"); }).join("");
-
         ctx.fillStyle = hex;
         ctx.fillRect(12, y - 13, 14, 14);
-
         ctx.fillStyle = "#ccc4aa";
         ctx.font = "12px Arial";
         const label = (z.materialId ? z.materialId + ": " : "") + z.materialName +
@@ -340,16 +354,12 @@ app.post("/generate-pdf", express.json({ limit: "50mb" }), async (req, res) => {
       const imgBytes = combined.toBuffer("image/png");
       const embeddedImg = await outputPdf.embedPng(imgBytes);
 
-      // Landscape letter page
       const pageW = 1056;
       const pageH = 816;
       const scale = Math.min(pageW / combined.width, pageH / combined.height);
 
       const newPage = outputPdf.addPage([pageW, pageH]);
-
-      // Dark background
       newPage.drawRectangle({ x: 0, y: 0, width: pageW, height: pageH, color: rgb(0.05, 0.05, 0.04) });
-
       newPage.drawImage(embeddedImg, {
         x: (pageW - combined.width * scale) / 2,
         y: (pageH - combined.height * scale) / 2,
