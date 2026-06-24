@@ -32,19 +32,19 @@ const IGNORE_MATERIALS = [
 ];
 
 const MATERIAL_COLORS = {
-  "ACM Panel":              { rgb: [0.78, 0.63, 0.19], hex: "#c8a030" },
-  "MCM Panel":              { rgb: [0.78, 0.63, 0.19], hex: "#c8a030" },
-  "Fiber Cement Panel":     { rgb: [0.35, 0.54, 0.35], hex: "#5a8a5a" },
-  "Fiber Cement Plank":     { rgb: [0.29, 0.48, 0.42], hex: "#4a7a6a" },
-  "Nichiha Panel":          { rgb: [0.48, 0.42, 0.67], hex: "#7a6aaa" },
-  "Aluminum Wall Panel":    { rgb: [0.42, 0.60, 0.67], hex: "#6a99aa" },
-  "Perforated Metal Panel": { rgb: [0.67, 0.48, 0.35], hex: "#aa7a5a" },
-  "Soffit Panel":           { rgb: [0.35, 0.48, 0.67], hex: "#5a7aaa" },
-  "Return/Trim":            { rgb: [0.67, 0.35, 0.48], hex: "#aa5a7a" },
-  "Other":                  { rgb: [0.48, 0.48, 0.48], hex: "#7a7a7a" },
+  "ACM Panel":              { hex: "#c8a030" },
+  "MCM Panel":              { hex: "#c8a030" },
+  "Fiber Cement Panel":     { hex: "#5a8a5a" },
+  "Fiber Cement Plank":     { hex: "#4a7a6a" },
+  "Nichiha Panel":          { hex: "#7a6aaa" },
+  "Aluminum Wall Panel":    { hex: "#6a99aa" },
+  "Perforated Metal Panel": { hex: "#aa7a5a" },
+  "Soffit Panel":           { hex: "#5a7aaa" },
+  "Return/Trim":            { hex: "#aa5a7a" },
+  "Other":                  { hex: "#7a7a7a" },
 };
 
-// Render page ONCE — returns both canvas and base64
+// Render page ONCE — returns canvas + base64, then caller must free canvas
 async function renderPageOnce(pdfDoc, pageNum, scale) {
   const page = await pdfDoc.getPage(pageNum);
   const viewport = page.getViewport({ scale });
@@ -109,19 +109,13 @@ async function addEvidencePage(outputPdf, canvas, elev) {
   const combined = createCanvas(canvas.width, canvas.height + legendH);
   const ctx = combined.getContext("2d");
 
-  // Draw elevation
   ctx.drawImage(canvas, 0, 0);
-
-  // Legend strip
   ctx.fillStyle = "#0f0e0b";
   ctx.fillRect(0, canvas.height, canvas.width, legendH);
-
-  // Title
   ctx.fillStyle = "#e0cc80";
   ctx.font = "bold 14px Arial";
   ctx.fillText((elev.title || "") + "   " + (elev.sheetRef || "") + "   Scale: " + (elev.scale || "N/A"), 12, canvas.height + 22);
 
-  // Material rows
   zones.forEach((z, i) => {
     const y = canvas.height + 42 + i * 24;
     const color = MATERIAL_COLORS[z.category] || MATERIAL_COLORS["Other"];
@@ -137,27 +131,30 @@ async function addEvidencePage(outputPdf, canvas, elev) {
     ctx.fillText(label, 34, y);
   });
 
-  // Total
   const totalNet = zones.reduce((s, z) => s + (z.netArea || 0), 0);
   ctx.fillStyle = "#7ab87a";
   ctx.font = "bold 13px Arial";
-  ctx.fillText("PAGE TOTAL: " + Math.round(totalNet) + " SF net   /   " + Math.round(totalNet * 1.15) + " SF adj (+15%)", 12, canvas.height + legendH - 5);
+  ctx.fillText("TOTAL: " + Math.round(totalNet) + " SF net   /   " + Math.round(totalNet * 1.15) + " SF adj (+15%)", 12, canvas.height + legendH - 5);
 
   const imgBytes = combined.toBuffer("image/png");
+  
+  // Free combined canvas immediately
+  combined.width = 0;
+  combined.height = 0;
+
   const embeddedImg = await outputPdf.embedPng(imgBytes);
   const pageW = 1188, pageH = 840;
-  const scale = Math.min(pageW / combined.width, pageH / combined.height);
+  const scale = Math.min(pageW / (imgBytes.length > 0 ? embeddedImg.width : pageW), pageH / (imgBytes.length > 0 ? embeddedImg.height : pageH));
   const newPage = outputPdf.addPage([pageW, pageH]);
   newPage.drawRectangle({ x: 0, y: 0, width: pageW, height: pageH, color: rgb(0.05, 0.05, 0.04) });
   newPage.drawImage(embeddedImg, {
-    x: (pageW - combined.width * scale) / 2,
-    y: (pageH - combined.height * scale) / 2,
-    width: combined.width * scale,
-    height: combined.height * scale,
+    x: 0,
+    y: 0,
+    width: pageW,
+    height: pageH,
   });
 }
 
-// ─── Main Analysis endpoint ───────────────────────────────────────────────────
 app.post("/analyze", upload.single("pdf"), async (req, res) => {
   res.setHeader("Content-Type", "text/event-stream");
   res.setHeader("Cache-Control", "no-cache");
@@ -171,9 +168,9 @@ app.post("/analyze", upload.single("pdf"), async (req, res) => {
     send(res, { type: "log", msg: "Pages loaded: " + total + " — " + req.file.originalname, level: "ok" });
 
     const outputPdf = await PDFDocument.create();
-    const font = await outputPdf.embedFont(StandardFonts.HelveticaBold);
+    await outputPdf.embedFont(StandardFonts.HelveticaBold);
 
-    // STEP 1: Free text extraction
+    // STEP 1: Free text extraction from all pages
     send(res, { type: "phase", phase: "filtering" });
     send(res, { type: "log", msg: "Reading all page title blocks (free)...", level: "info" });
 
@@ -186,7 +183,7 @@ app.post("/analyze", upload.single("pdf"), async (req, res) => {
 
     send(res, { type: "log", msg: "Classifying " + pageIndex.length + " pages with 1 API call...", level: "info" });
 
-    // STEP 2: One Claude call to classify
+    // STEP 2: One Claude call to classify all pages
     const indexSummary = pageIndex.map(p => "Page " + p.page + ": " + p.text.replace(/\s+/g, " ").trim()).join("\n");
     const classifyResult = parseJSON(await claude(
       [{ type: "text", text: "You are a commercial panel siding estimator. Here is text from every page title block of a " + total + "-page architectural blueprint set.\n\nIdentify pages containing:\n- EXTERIOR ELEVATIONS: outside building faces with panel cladding (words: elevation, facade, exterior, enlarged elevation)\n- RETURN ELEVATIONS: corner/return details (words: return, corner return, balcony return)\n- MATERIAL LEGEND or FINISH SCHEDULE\n- FLOOR PLANS: only needed for soffit/return locations\n- 3D VIEWS: exterior renderings\n\nWe ONLY care about: ACM, fiber cement, Nichiha, aluminum panels, perforated metal, soffits, returns.\nIGNORE: structural, mechanical, plumbing, electrical, interior, sections, civil, landscape, roofing.\n\nPAGE DATA:\n" + indexSummary + "\n\nReturn ONLY JSON: {\"exteriorElevations\":[page numbers],\"returnElevations\":[page numbers],\"materialLegend\":[page numbers],\"floorPlans\":[page numbers],\"views3d\":[page numbers]}" }],
@@ -215,7 +212,8 @@ app.post("/analyze", upload.single("pdf"), async (req, res) => {
     let legend = [];
     const legendPages = relevant.materialLegend.length ? relevant.materialLegend : relevant.exteriorElevations.slice(0, 2);
     for (const p of legendPages.slice(0, 3)) {
-      const { b64 } = await renderPageOnce(pdfDoc, p, 1.5);
+      const { canvas, b64 } = await renderPageOnce(pdfDoc, p, 1.5);
+      canvas.width = 0; canvas.height = 0; // free immediately
       const raw = await claude(
         [
           { type: "image", source: { type: "base64", media_type: "image/jpeg", data: b64 } },
@@ -239,7 +237,8 @@ app.post("/analyze", upload.single("pdf"), async (req, res) => {
     if (relevant.floorPlans.length) {
       send(res, { type: "log", msg: "Checking floor plans for soffits and returns...", level: "info" });
       for (const p of relevant.floorPlans.slice(0, 2)) {
-        const { b64 } = await renderPageOnce(pdfDoc, p, 1.0);
+        const { canvas, b64 } = await renderPageOnce(pdfDoc, p, 1.0);
+        canvas.width = 0; canvas.height = 0; // free immediately
         const raw = await claude(
           [
             { type: "image", source: { type: "base64", media_type: "image/jpeg", data: b64 } },
@@ -255,14 +254,14 @@ app.post("/analyze", upload.single("pdf"), async (req, res) => {
       }
     }
 
-    // STEP 5: Analyze elevations — render ONCE per page
+    // STEP 5: Analyze elevations — render once, free immediately after
     send(res, { type: "phase", phase: "analyzing" });
     const elevPages = [
       ...relevant.exteriorElevations.map(p => ({ p, type: "elevation" })),
       ...relevant.returnElevations.map(p => ({ p, type: "return" })),
     ];
 
-    send(res, { type: "log", msg: "Analyzing " + elevPages.length + " pages — each rendered once for both AI + PDF...", level: "info" });
+    send(res, { type: "log", msg: "Analyzing " + elevPages.length + " pages — rendered once, freed after each...", level: "info" });
 
     const legendCtx = legend.length ? "PANEL MATERIAL LEGEND: " + JSON.stringify(legend) : "Identify panel materials from callouts.";
     const soffitCtx = soffitNotes.length ? "\nSOFFIT/RETURN NOTES: " + JSON.stringify(soffitNotes) : "";
@@ -272,17 +271,17 @@ app.post("/analyze", upload.single("pdf"), async (req, res) => {
       const { p, type } = elevPages[i];
       send(res, { type: "progress", label: "Page " + (i + 1) + " of " + elevPages.length, pct: 20 + Math.round((i / elevPages.length) * 72) });
 
-      // Render ONCE — used for both Claude analysis and evidence PDF
+      // Render ONCE
       const { canvas, b64 } = await renderPageOnce(pdfDoc, p, 1.5);
 
-      const prompt = "You are a senior commercial PANEL SIDING estimator.\n\n" + legendCtx + soffitCtx + "\n\nPage " + p + " — " + type + ".\n\nTAKEOFF PROCESS:\n1. Read drawing TITLE and SHEET REF from title block\n2. Read the SCALE (e.g. 1/8\"=1'-0\")\n3. For each panel material zone:\n   - Identify material using legend\n   - GROSS area = width x height using scale\n   - List ALL openings: windows, doors, louvers, curtainwall\n   - NET = Gross minus Openings\n4. SOFFITS: underside of overhangs — width x depth = SF\n5. RETURNS: corner wraps — height x depth = SF\n6. BUMP-OUTS: treat as separate zones\n7. IGNORE: brick, masonry, stone, EIFS, glass, curtainwall, roofing, vapor barriers\n8. If BUILDING SECTION or WALL SECTION — return 0 zones\n\nReturn ONLY JSON:\n{\"pageNumber\":" + p + ",\"elevations\":[{\"title\":\"\",\"sheetRef\":\"\",\"scale\":\"\",\"building\":\"\",\"direction\":\"\",\"zones\":[{\"materialId\":\"\",\"materialName\":\"\",\"category\":\"\",\"description\":\"\",\"grossArea\":0,\"totalOpeningArea\":0,\"netArea\":0}],\"flags\":[]}]}";
+      const prompt = "You are a senior commercial PANEL SIDING estimator.\n\n" + legendCtx + soffitCtx + "\n\nPage " + p + " — " + type + ".\n\nTAKEOFF PROCESS:\n1. Read drawing TITLE and SHEET REF\n2. Read the SCALE\n3. For each panel material zone: identify material, GROSS area using scale, subtract ALL openings (windows/doors/louvers), NET = Gross minus Openings\n4. SOFFITS: underside of overhangs — width x depth = SF\n5. RETURNS: corner wraps — height x depth = SF\n6. BUMP-OUTS: separate zones\n7. IGNORE: brick, masonry, stone, EIFS, glass, curtainwall, roofing, vapor barriers\n8. BUILDING SECTION or WALL SECTION — return 0 zones\n\nReturn ONLY JSON:\n{\"pageNumber\":" + p + ",\"elevations\":[{\"title\":\"\",\"sheetRef\":\"\",\"scale\":\"\",\"building\":\"\",\"direction\":\"\",\"zones\":[{\"materialId\":\"\",\"materialName\":\"\",\"category\":\"\",\"description\":\"\",\"grossArea\":0,\"totalOpeningArea\":0,\"netArea\":0}],\"flags\":[]}]}";
 
       const raw = await claude(
         [
           { type: "image", source: { type: "base64", media_type: "image/jpeg", data: b64 } },
           { type: "text", text: prompt },
         ],
-        "Senior commercial panel siding estimator doing Bluebeam-style takeoffs. Focus ONLY on panel materials. Return ONLY valid JSON."
+        "Senior commercial panel siding estimator. Focus ONLY on panel materials. Return ONLY valid JSON."
       );
 
       const parsed = parseJSON(raw);
@@ -297,7 +296,7 @@ app.post("/analyze", upload.single("pdf"), async (req, res) => {
 
         takeoffData.push(...parsed.elevations);
 
-        // Build evidence PDF page using the SAME canvas — no second render
+        // Build evidence PDF page using canvas, then free canvas
         for (const elev of parsed.elevations) {
           const sf = (elev.zones || []).reduce((s, z) => s + (z.netArea || 0), 0);
           if (sf > 0) {
@@ -305,7 +304,7 @@ app.post("/analyze", upload.single("pdf"), async (req, res) => {
               await addEvidencePage(outputPdf, canvas, elev);
               send(res, { type: "log", msg: "  ✓ " + elev.title + " (" + elev.sheetRef + ") — " + Math.round(sf) + " SF", level: "ok" });
             } catch(e) {
-              send(res, { type: "log", msg: "  ✓ " + elev.title + " — " + Math.round(sf) + " SF (PDF page skipped)", level: "ok" });
+              send(res, { type: "log", msg: "  ✓ " + elev.title + " — " + Math.round(sf) + " SF", level: "ok" });
             }
           }
           (elev.flags || []).filter(Boolean).forEach(f => send(res, { type: "log", msg: "    ⚠ " + f, level: "warn" }));
@@ -314,24 +313,29 @@ app.post("/analyze", upload.single("pdf"), async (req, res) => {
       } else {
         send(res, { type: "log", msg: "  Page " + p + ": could not read", level: "warn" });
       }
+
+      // FREE canvas memory immediately after page is fully processed
+      canvas.width = 0;
+      canvas.height = 0;
     }
 
     // STEP 6: 3D cross-reference
     if (relevant.views3d.length) {
       send(res, { type: "progress", label: "3D cross-reference", pct: 94 });
       send(res, { type: "log", msg: "Cross-checking 3D views...", level: "info" });
-      const { b64 } = await renderPageOnce(pdfDoc, relevant.views3d[0], 1.0);
+      const { canvas, b64 } = await renderPageOnce(pdfDoc, relevant.views3d[0], 1.0);
+      canvas.width = 0; canvas.height = 0;
       const cr = parseJSON(await claude(
         [
           { type: "image", source: { type: "base64", media_type: "image/jpeg", data: b64 } },
-          { type: "text", text: legendCtx + "\n\n3D exterior view. Look for SOFFITS, RETURNS, BUMP-OUTS, HIDDEN ELEVATIONS that flat drawings might miss. Return ONLY JSON: {\"warnings\":[\"items with location\"],\"notes\":\"description\"}" },
+          { type: "text", text: legendCtx + "\n\n3D exterior view. Look for SOFFITS, RETURNS, BUMP-OUTS, HIDDEN ELEVATIONS. Return ONLY JSON: {\"warnings\":[\"items with location\"],\"notes\":\"description\"}" },
         ],
         "Review 3D exterior renderings for missed panel areas."
       ));
       if (cr && cr.warnings && cr.warnings.length) {
         cr.warnings.forEach(w => send(res, { type: "log", msg: "3D: " + w, level: "warn" }));
       } else {
-        send(res, { type: "log", msg: "3D check complete — no additional items", level: "ok" });
+        send(res, { type: "log", msg: "3D check complete", level: "ok" });
       }
     }
 
@@ -344,7 +348,7 @@ app.post("/analyze", upload.single("pdf"), async (req, res) => {
 
     send(res, { type: "done", takeoffData, legend, soffitNotes, evidenceReady: true });
     send(res, { type: "progress", label: "Complete", pct: 100 });
-    send(res, { type: "log", msg: "Done — " + takeoffData.length + " elevations — Excel + PDF ready to export", level: "success" });
+    send(res, { type: "log", msg: "Done — " + takeoffData.length + " elevations — Excel + PDF ready", level: "success" });
     res.end();
 
   } catch (err) {
