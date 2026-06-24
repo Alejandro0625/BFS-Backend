@@ -4,6 +4,8 @@ import cors from "cors";
 import fetch from "node-fetch";
 import { createCanvas } from "canvas";
 import { PDFDocument, rgb, StandardFonts } from "pdf-lib";
+import fs from "fs";
+import path from "path";
 import pkg from "pdfjs-dist/legacy/build/pdf.js";
 const { getDocument, GlobalWorkerOptions } = pkg;
 GlobalWorkerOptions.workerSrc = "";
@@ -22,7 +24,9 @@ app.use(express.json({ limit: "50mb" }));
 app.use((req, res, next) => { req.setTimeout(0); res.setTimeout(0); next(); });
 
 const API_KEY = process.env.ANTHROPIC_API_KEY;
-let lastPdfPath = null;
+
+// Store completed evidence PDF path for download
+let evidencePdfPath = null;
 
 const IGNORE_MATERIALS = [
   "brick", "masonry", "stone", "cast stone", "eifs", "stucco",
@@ -31,16 +35,16 @@ const IGNORE_MATERIALS = [
 ];
 
 const MATERIAL_COLORS = {
-  "ACM Panel":              [0.78, 0.63, 0.19],
-  "MCM Panel":              [0.78, 0.63, 0.19],
-  "Fiber Cement Panel":     [0.35, 0.54, 0.35],
-  "Fiber Cement Plank":     [0.29, 0.48, 0.42],
-  "Nichiha Panel":          [0.48, 0.42, 0.67],
-  "Aluminum Wall Panel":    [0.42, 0.60, 0.67],
-  "Perforated Metal Panel": [0.67, 0.48, 0.35],
-  "Soffit Panel":           [0.35, 0.48, 0.67],
-  "Return/Trim":            [0.67, 0.35, 0.48],
-  "Other":                  [0.48, 0.48, 0.48],
+  "ACM Panel":              { rgb: [0.78, 0.63, 0.19], hex: "#c8a030" },
+  "MCM Panel":              { rgb: [0.78, 0.63, 0.19], hex: "#c8a030" },
+  "Fiber Cement Panel":     { rgb: [0.35, 0.54, 0.35], hex: "#5a8a5a" },
+  "Fiber Cement Plank":     { rgb: [0.29, 0.48, 0.42], hex: "#4a7a6a" },
+  "Nichiha Panel":          { rgb: [0.48, 0.42, 0.67], hex: "#7a6aaa" },
+  "Aluminum Wall Panel":    { rgb: [0.42, 0.60, 0.67], hex: "#6a99aa" },
+  "Perforated Metal Panel": { rgb: [0.67, 0.48, 0.35], hex: "#aa7a5a" },
+  "Soffit Panel":           { rgb: [0.35, 0.48, 0.67], hex: "#5a7aaa" },
+  "Return/Trim":            { rgb: [0.67, 0.35, 0.48], hex: "#aa5a7a" },
+  "Other":                  { rgb: [0.48, 0.48, 0.48], hex: "#7a7a7a" },
 };
 
 async function renderPage(pdfDoc, pageNum, scale) {
@@ -49,7 +53,7 @@ async function renderPage(pdfDoc, pageNum, scale) {
   const canvas = createCanvas(Math.floor(viewport.width), Math.floor(viewport.height));
   const ctx = canvas.getContext("2d");
   await page.render({ canvasContext: ctx, viewport }).promise;
-  const b64 = canvas.toDataURL("image/jpeg", 0.75).split(",")[1];
+  const b64 = canvas.toDataURL("image/jpeg", 0.80).split(",")[1];
   page.cleanup();
   return b64;
 }
@@ -68,12 +72,10 @@ async function getPageText(pdfDoc, pageNum) {
   try {
     const page = await pdfDoc.getPage(pageNum);
     const content = await page.getTextContent();
-    const text = content.items.map(function(i) { return i.str; }).join(" ");
+    const text = content.items.map(i => i.str).join(" ");
     page.cleanup();
     return text;
-  } catch(e) {
-    return "";
-  }
+  } catch(e) { return ""; }
 }
 
 async function claude(content, system) {
@@ -93,7 +95,7 @@ async function claude(content, system) {
   });
   const data = await res.json();
   if (data.error) throw new Error(data.error.message);
-  return data.content?.find((b) => b.type === "text")?.text || "";
+  return data.content?.find(b => b.type === "text")?.text || "";
 }
 
 function parseJSON(text) {
@@ -101,11 +103,8 @@ function parseJSON(text) {
     const m = text.match(/```json\s*([\s\S]*?)```/);
     return JSON.parse(m ? m[1] : text);
   } catch {
-    const s = text.indexOf("{");
-    const e = text.lastIndexOf("}");
-    if (s !== -1 && e !== -1) {
-      try { return JSON.parse(text.slice(s, e + 1)); } catch {}
-    }
+    const s = text.indexOf("{"), e = text.lastIndexOf("}");
+    if (s !== -1 && e !== -1) try { return JSON.parse(text.slice(s, e + 1)); } catch {}
     return null;
   }
 }
@@ -114,7 +113,83 @@ function send(res, data) {
   res.write("data: " + JSON.stringify(data) + "\n\n");
 }
 
-// ─── Analysis endpoint ────────────────────────────────────────────────────────
+// Build one evidence page for an elevation
+async function buildEvidencePage(outputPdf, font, fontReg, elevCanvas, elev) {
+  const zones = (elev.zones || []).filter(z => (z.netArea || 0) > 0);
+  if (!zones.length) return;
+
+  // Legend strip height
+  const legendH = 36 + zones.length * 24 + 14;
+  const combined = createCanvas(elevCanvas.width, elevCanvas.height + legendH);
+  const ctx = combined.getContext("2d");
+
+  // Draw elevation drawing
+  ctx.drawImage(elevCanvas, 0, 0);
+
+  // Legend strip background
+  ctx.fillStyle = "#0f0e0b";
+  ctx.fillRect(0, elevCanvas.height, elevCanvas.width, legendH);
+
+  // Title line
+  ctx.fillStyle = "#e0cc80";
+  ctx.font = "bold 14px Arial";
+  const title = (elev.title || "Elevation") + "   " + (elev.sheetRef || "") + "   Scale: " + (elev.scale || "N/A");
+  ctx.fillText(title, 12, elevCanvas.height + 22);
+
+  // Material rows with color swatches
+  zones.forEach((z, i) => {
+    const y = elevCanvas.height + 40 + i * 24;
+    const color = MATERIAL_COLORS[z.category] || MATERIAL_COLORS["Other"];
+
+    // Color swatch
+    ctx.fillStyle = color.hex;
+    ctx.fillRect(12, y - 14, 16, 16);
+    ctx.strokeStyle = "#ffffff30";
+    ctx.lineWidth = 1;
+    ctx.strokeRect(12, y - 14, 16, 16);
+
+    // Material label + SF
+    ctx.fillStyle = "#ccc4aa";
+    ctx.font = "12px Arial";
+    const matLabel = (z.materialId ? z.materialId + ": " : "") + (z.materialName || z.category);
+    const sfLabel = "   Gross: " + Math.round(z.grossArea || 0) + " SF   Openings: (" + Math.round(z.totalOpeningArea || 0) + ")   Net: " + Math.round(z.netArea) + " SF   Adj (+15%): " + Math.round(z.netArea * 1.15) + " SF";
+    ctx.fillText(matLabel + sfLabel, 34, y);
+  });
+
+  // Total line
+  const totalNet = zones.reduce((s, z) => s + (z.netArea || 0), 0);
+  ctx.fillStyle = "#7ab87a";
+  ctx.font = "bold 13px Arial";
+  ctx.fillText("TOTAL: " + Math.round(totalNet) + " SF net   /   " + Math.round(totalNet * 1.15) + " SF adjusted (+15%)", 12, elevCanvas.height + legendH - 6);
+
+  // Embed into PDF page
+  const imgBytes = combined.toBuffer("image/png");
+  const embeddedImg = await outputPdf.embedPng(imgBytes);
+
+  const pageW = 1188;  // A3 landscape width
+  const pageH = 840;
+  const scale = Math.min(pageW / combined.width, pageH / combined.height);
+
+  const newPage = outputPdf.addPage([pageW, pageH]);
+  newPage.drawRectangle({ x: 0, y: 0, width: pageW, height: pageH, color: rgb(0.05, 0.05, 0.04) });
+  newPage.drawImage(embeddedImg, {
+    x: (pageW - combined.width * scale) / 2,
+    y: (pageH - combined.height * scale) / 2,
+    width: combined.width * scale,
+    height: combined.height * scale,
+  });
+
+  // BPS watermark top right
+  newPage.drawText("BOSTON PANEL SYSTEMS — AI TAKEOFF", {
+    x: pageW - 280,
+    y: pageH - 16,
+    size: 8,
+    font,
+    color: rgb(0.35, 0.30, 0.18),
+  });
+}
+
+// ─── Main Analysis + Evidence PDF endpoint ───────────────────────────────────
 app.post("/analyze", upload.single("pdf"), async (req, res) => {
   res.setHeader("Content-Type", "text/event-stream");
   res.setHeader("Cache-Control", "no-cache");
@@ -123,34 +198,36 @@ app.post("/analyze", upload.single("pdf"), async (req, res) => {
 
   try {
     send(res, { type: "log", msg: "Loading PDF...", level: "info" });
-    lastPdfPath = req.file.path;
 
     const pdfDoc = await getDocument({ url: "file://" + req.file.path }).promise;
     const total = pdfDoc.numPages;
     send(res, { type: "log", msg: "Pages loaded: " + total + " — " + req.file.originalname, level: "ok" });
 
-    // ── STEP 1: Extract text from every page title block (FREE - no API) ──────
+    // Initialize evidence PDF
+    const outputPdf = await PDFDocument.create();
+    const font = await outputPdf.embedFont(StandardFonts.HelveticaBold);
+    const fontReg = await outputPdf.embedFont(StandardFonts.Helvetica);
+
+    // ── STEP 1: Extract text from all pages (FREE) ────────────────────────────
     send(res, { type: "phase", phase: "filtering" });
-    send(res, { type: "log", msg: "Reading all page title blocks (no API cost)...", level: "info" });
+    send(res, { type: "log", msg: "Reading all page title blocks (free — no API cost)...", level: "info" });
 
     const pageIndex = [];
     for (let p = 1; p <= total; p++) {
-      send(res, { type: "progress", label: "Reading page " + p + " of " + total, pct: Math.round((p / total) * 20) });
+      send(res, { type: "progress", label: "Reading title blocks " + p + "/" + total, pct: Math.round((p / total) * 15) });
       const text = await getPageText(pdfDoc, p);
       if (text.trim().length > 10) {
-        pageIndex.push({ page: p, text: text.slice(0, 300) });
+        pageIndex.push({ page: p, text: text.slice(0, 400) });
       }
     }
 
-    send(res, { type: "log", msg: "Extracted text from " + pageIndex.length + " pages — sending to AI to classify...", level: "info" });
+    send(res, { type: "log", msg: "Extracted text from " + pageIndex.length + " pages — classifying with AI (1 API call)...", level: "info" });
 
     // ── STEP 2: ONE Claude call to classify all pages ─────────────────────────
-    const indexSummary = pageIndex.map(function(p) {
-      return "Page " + p.page + ": " + p.text.replace(/\s+/g, " ").trim();
-    }).join("\n");
+    const indexSummary = pageIndex.map(p => "Page " + p.page + ": " + p.text.replace(/\s+/g, " ").trim()).join("\n");
 
     const classifyResult = parseJSON(await claude(
-      [{ type: "text", text: "You are a commercial panel siding estimator. Below is a list of page numbers with text extracted from their title blocks from a " + total + "-page architectural blueprint set.\n\nIdentify which pages contain:\n- EXTERIOR ELEVATIONS (outside building faces showing siding/panels — any sheet labeled with words like elevation, facade, exterior, building face)\n- RETURN ELEVATIONS (corner/return details — sheets with words like return, corner, balcony return)\n- MATERIAL LEGEND or FINISH SCHEDULE (exterior material key/schedule)\n- FLOOR PLANS (only needed to find soffit/return locations)\n- 3D VIEWS or RENDERINGS (exterior perspective views)\n\nWe ONLY care about: ACM panels, fiber cement panels, Nichiha panels, aluminum wall panels, perforated metal panels, soffits, returns.\nIGNORE: structural, mechanical, plumbing, electrical, interior sheets, sections, civil, landscape, roofing.\n\nPAGE DATA:\n" + indexSummary + "\n\nReturn ONLY JSON: {\"exteriorElevations\":[page numbers],\"returnElevations\":[page numbers],\"materialLegend\":[page numbers],\"floorPlans\":[page numbers],\"views3d\":[page numbers]}" }],
+      [{ type: "text", text: "You are a commercial panel siding estimator. Below is text from every page title block of a " + total + "-page architectural blueprint set.\n\nIdentify which pages contain:\n- EXTERIOR ELEVATIONS: outside building faces showing panel siding/cladding. Look for words like: elevation, facade, exterior, building face, enlarged elevation\n- RETURN ELEVATIONS: corner/return details. Look for: return, corner return, balcony return\n- MATERIAL LEGEND or FINISH SCHEDULE: exterior material key\n- FLOOR PLANS: building floor plans (needed only for soffit/return locations)\n- 3D VIEWS: exterior renderings or perspective views\n\nWe ONLY care about panel cladding materials: ACM, fiber cement, Nichiha, aluminum wall panels, perforated metal, soffits, returns.\nIGNORE: structural, mechanical, plumbing, electrical, interior, sections, civil, landscape, roofing.\n\nPAGE DATA:\n" + indexSummary + "\n\nReturn ONLY JSON: {\"exteriorElevations\":[page numbers],\"returnElevations\":[page numbers],\"materialLegend\":[page numbers],\"floorPlans\":[page numbers],\"views3d\":[page numbers]}" }],
       "You classify architectural blueprint pages for exterior panel siding estimation. Return ONLY valid JSON."
     ));
 
@@ -160,20 +237,18 @@ app.post("/analyze", upload.single("pdf"), async (req, res) => {
       returnElevations: (classifyResult && classifyResult.returnElevations) || [],
       materialLegend: (classifyResult && classifyResult.materialLegend) || [],
       views3d: (classifyResult && classifyResult.views3d) || [],
-      enlargedDetails: [],
     };
 
     send(res, { type: "log", msg: "Found: " + relevant.exteriorElevations.length + " elevations | " + relevant.returnElevations.length + " returns | " + relevant.materialLegend.length + " legend | " + relevant.floorPlans.length + " floor plans | " + relevant.views3d.length + " 3D views", level: "ok" });
-    send(res, { type: "log", msg: "Elevation pages: " + relevant.exteriorElevations.join(", "), level: "dim" });
 
     if (!relevant.exteriorElevations.length && !relevant.returnElevations.length) {
-      throw new Error("No exterior elevation pages found. The PDF may not have readable text in title blocks.");
+      throw new Error("No exterior elevation pages found. Check that PDF has readable title block text.");
     }
 
-    // ── STEP 3: Read legend ───────────────────────────────────────────────────
+    // ── STEP 3: Read material legend ──────────────────────────────────────────
     send(res, { type: "phase", phase: "legend" });
     send(res, { type: "log", msg: "Reading material legend...", level: "info" });
-    send(res, { type: "progress", label: "Reading legend", pct: 25 });
+    send(res, { type: "progress", label: "Reading legend", pct: 20 });
 
     let legend = [];
     const legendPages = relevant.materialLegend.length ? relevant.materialLegend : relevant.exteriorElevations.slice(0, 2);
@@ -183,14 +258,14 @@ app.post("/analyze", upload.single("pdf"), async (req, res) => {
       const raw = await claude(
         [
           { type: "image", source: { type: "base64", media_type: "image/jpeg", data: b64 } },
-          { type: "text", text: "Find the EXTERIOR BUILDING MATERIALS LEGEND or FINISH SCHEDULE on this page. Extract ONLY panel materials: ACM panels, MCM panels, fiber cement panels, fiber cement plank, Nichiha panels, aluminum wall panels, perforated metal panels, soffit panels, returns and trim. IGNORE: brick, masonry, stone, EIFS, stucco, concrete, glass, curtainwall, roofing. Return ONLY JSON: {\"projectName\":\"if visible\",\"materials\":[{\"id\":\"e.g. 1 or ACM-1\",\"name\":\"full material name\",\"category\":\"ACM Panel|Fiber Cement Panel|Fiber Cement Plank|Nichiha Panel|Aluminum Wall Panel|Perforated Metal Panel|Soffit Panel|Return/Trim\",\"color\":\"color or finish if noted\",\"notes\":\"any spec notes\"}]}" },
+          { type: "text", text: "Find the EXTERIOR BUILDING MATERIALS LEGEND or FINISH SCHEDULE. Extract ONLY panel cladding materials: ACM panels, MCM panels, fiber cement panels/planks, Nichiha, aluminum wall panels, perforated metal panels, soffit panels, returns/trim. IGNORE: brick, masonry, stone, EIFS, stucco, concrete, glass, curtainwall, roofing, vapor barriers. Return ONLY JSON: {\"projectName\":\"if visible\",\"materials\":[{\"id\":\"e.g. 1 or ACM-1\",\"name\":\"full material name\",\"category\":\"ACM Panel|Fiber Cement Panel|Fiber Cement Plank|Nichiha Panel|Aluminum Wall Panel|Perforated Metal Panel|Soffit Panel|Return/Trim\",\"color\":\"color/finish if noted\",\"notes\":\"spec notes\"}]}" },
         ],
-        "You are a commercial panel siding estimator extracting material legends. Return ONLY valid JSON."
+        "Extract exterior panel material legends from architectural drawings. Return ONLY valid JSON."
       );
       const parsed = parseJSON(raw);
       if (parsed && parsed.materials && parsed.materials.length) {
         legend = parsed.materials;
-        send(res, { type: "log", msg: "Found " + legend.length + " panel materials: " + legend.map(function(m) { return m.id + " (" + m.name + ")"; }).join(", "), level: "ok" });
+        send(res, { type: "log", msg: "Found " + legend.length + " panel materials: " + legend.map(m => m.id + " — " + m.name).join(", "), level: "ok" });
         send(res, { type: "legend", legend });
         break;
       }
@@ -200,7 +275,7 @@ app.post("/analyze", upload.single("pdf"), async (req, res) => {
       send(res, { type: "log", msg: "No dedicated legend found — will identify materials from drawing callouts", level: "warn" });
     }
 
-    // ── STEP 4: Check floor plans for soffits ────────────────────────────────
+    // ── STEP 4: Check floor plans for soffits/returns ─────────────────────────
     let soffitNotes = [];
     if (relevant.floorPlans.length) {
       send(res, { type: "log", msg: "Checking floor plans for soffit and return locations...", level: "info" });
@@ -209,91 +284,133 @@ app.post("/analyze", upload.single("pdf"), async (req, res) => {
         const raw = await claude(
           [
             { type: "image", source: { type: "base64", media_type: "image/jpeg", data: b64 } },
-            { type: "text", text: "This is a floor plan. Identify ALL soffit locations (overhangs, canopies, covered areas) and return locations (where panel wraps around corners). Return ONLY JSON: {\"soffits\":[{\"location\":\"description\",\"width\":\"dimension if visible\",\"depth\":\"dimension if visible\"}],\"returns\":[{\"location\":\"description\",\"height\":\"if visible\",\"depth\":\"if visible\"}]}" },
+            { type: "text", text: "This is a floor plan for a commercial building. Identify ALL soffit locations (canopies, overhangs, covered walkways, bump-outs with undersides) and return locations (where panel wraps around building corners). For each note approximate dimensions if visible. Return ONLY JSON: {\"soffits\":[{\"location\":\"description\",\"width\":\"ft\",\"depth\":\"ft\"}],\"returns\":[{\"location\":\"description\",\"height\":\"ft\",\"depth\":\"ft\"}]}" },
           ],
-          "You are identifying soffit and return locations from architectural floor plans for a panel siding takeoff."
+          "Identify soffit and return locations from architectural floor plans for panel siding takeoff."
         );
         const parsed = parseJSON(raw);
         if (parsed && ((parsed.soffits && parsed.soffits.length) || (parsed.returns && parsed.returns.length))) {
           soffitNotes.push(parsed);
-          send(res, { type: "log", msg: "Floor plan page " + p + ": " + (parsed.soffits ? parsed.soffits.length : 0) + " soffits, " + (parsed.returns ? parsed.returns.length : 0) + " returns", level: "ok" });
+          send(res, { type: "log", msg: "Floor plan p." + p + ": " + (parsed.soffits || []).length + " soffits, " + (parsed.returns || []).length + " returns", level: "ok" });
         }
       }
     }
 
-    // ── STEP 5: Analyze elevations ────────────────────────────────────────────
+    // ── STEP 5: Analyze each elevation AND build evidence PDF page together ────
     send(res, { type: "phase", phase: "analyzing" });
+
     const elevPages = [
-      ...relevant.exteriorElevations.map(function(p) { return { p: p, type: "elevation" }; }),
-      ...relevant.returnElevations.map(function(p) { return { p: p, type: "return" }; }),
+      ...relevant.exteriorElevations.map(p => ({ p, type: "elevation" })),
+      ...relevant.returnElevations.map(p => ({ p, type: "return" })),
     ];
 
-    send(res, { type: "log", msg: "Analyzing " + elevPages.length + " elevation pages...", level: "info" });
+    send(res, { type: "log", msg: "Analyzing " + elevPages.length + " elevation pages + building evidence PDF simultaneously...", level: "info" });
 
     const legendCtx = legend.length ? "PANEL MATERIAL LEGEND: " + JSON.stringify(legend) : "Identify panel materials from callouts and labels on the drawing.";
-    const soffitCtx = soffitNotes.length ? "SOFFIT AND RETURN NOTES FROM FLOOR PLANS: " + JSON.stringify(soffitNotes) : "";
+    const soffitCtx = soffitNotes.length ? "\nSOFFIT & RETURN LOCATIONS FROM FLOOR PLANS: " + JSON.stringify(soffitNotes) : "";
     const takeoffData = [];
 
     for (let i = 0; i < elevPages.length; i++) {
-      const ep = elevPages[i];
-      const p = ep.p;
-      const type = ep.type;
-      send(res, { type: "progress", label: "Analyzing elevation " + (i + 1) + " of " + elevPages.length, pct: 35 + Math.round((i / elevPages.length) * 55) });
+      const { p, type } = elevPages[i];
+      send(res, { type: "progress", label: "Analyzing + rendering page " + (i + 1) + " of " + elevPages.length, pct: 30 + Math.round((i / elevPages.length) * 60) });
 
       const b64 = await renderPage(pdfDoc, p, 1.5);
-      const prompt = "You are a senior commercial PANEL SIDING estimator doing a material takeoff.\n\n" + legendCtx + "\n" + soffitCtx + "\n\nPage " + p + " type: " + type + ".\n\nINSTRUCTIONS:\n1. Read the drawing title\n2. Read the sheet reference\n3. Read the SCALE printed on the drawing\n4. For EACH panel material zone: identify material using legend, calculate GROSS area using scale, list ALL openings (windows/doors/louvers), NET = Gross minus Openings\n5. SOFFITS: measure underside of overhangs (width x depth = SF)\n6. RETURNS: measure corner wraps (height x return depth = SF)\n7. IGNORE: brick, masonry, stone, EIFS, stucco, concrete, glass, curtainwall\n8. If this is a BUILDING SECTION or WALL SECTION not an elevation, return 0 zones\n\nReturn ONLY JSON:\n{\"pageNumber\":" + p + ",\"elevations\":[{\"title\":\"\",\"sheetRef\":\"\",\"scale\":\"\",\"building\":\"\",\"direction\":\"\",\"zones\":[{\"materialId\":\"\",\"materialName\":\"\",\"category\":\"\",\"description\":\"\",\"grossArea\":0,\"totalOpeningArea\":0,\"netArea\":0}],\"flags\":[]}]}";
+
+      const prompt = `You are a senior commercial PANEL SIDING estimator performing a precise material takeoff, following the same process as Bluebeam Revu manual takeoffs.
+
+${legendCtx}${soffitCtx}
+
+Page ${p} — type: ${type}.
+
+TAKEOFF PROCESS:
+1. Read the drawing TITLE and SHEET REFERENCE from the title block
+2. Read the SCALE from the drawing (e.g. 1/8"=1'-0", 1/4"=1'-0", 1/16"=1'-0")
+3. For each material zone visible on this elevation:
+   - Identify the material using the legend (match by hatch pattern, label, or callout)
+   - Calculate GROSS area using the scale: width × height in real-world feet → SF
+   - List every opening to subtract: windows, doors, louvers, curtainwall, storefronts
+   - NET area = Gross − Total Openings
+4. SOFFITS: measure any underside of overhang or canopy (width × depth = SF) — flag separately
+5. RETURNS: measure any corner wrap (height × return depth = SF) — flag separately  
+6. BUMP-OUTS: treat as separate zones if they project from the main wall plane
+7. HIDDEN ELEVATIONS: flag any condition where a face may not be fully visible
+8. If scale is very small (1/32" or 1/16") note it as a flag — measurement is approximate
+9. IGNORE: brick, masonry, stone, EIFS, stucco, concrete, glass, curtainwall, roofing, vapor barriers
+10. If this is a BUILDING SECTION or WALL SECTION — return 0 zones
+
+Return ONLY valid JSON:
+{"pageNumber":${p},"elevations":[{"title":"","sheetRef":"","scale":"","building":"","direction":"","zones":[{"materialId":"","materialName":"","category":"","description":"","grossArea":0,"totalOpeningArea":0,"netArea":0}],"flags":[]}]}`;
 
       const raw = await claude(
         [
           { type: "image", source: { type: "base64", media_type: "image/jpeg", data: b64 } },
           { type: "text", text: prompt },
         ],
-        "You are a senior commercial panel siding estimator. Focus ONLY on panel materials. Return ONLY valid JSON."
+        "You are a senior commercial panel siding estimator. Perform precise Bluebeam-style material takeoffs. Focus ONLY on panel cladding materials. Return ONLY valid JSON."
       );
 
       const parsed = parseJSON(raw);
       if (parsed && parsed.elevations && parsed.elevations.length) {
-        parsed.elevations.forEach(function(e) {
+        parsed.elevations.forEach(e => {
           e.pageNumber = p;
-          e.zones = (e.zones || []).filter(function(z) {
-            const nameLower = (z.materialName || "").toLowerCase();
-            return !IGNORE_MATERIALS.some(function(ig) { return nameLower.includes(ig); });
+          e.zones = (e.zones || []).filter(z => {
+            const n = (z.materialName || "").toLowerCase();
+            return !IGNORE_MATERIALS.some(ig => n.includes(ig));
           });
         });
+
         takeoffData.push(...parsed.elevations);
-        parsed.elevations.forEach(function(e) {
-          const sf = (e.zones || []).reduce(function(s, z) { return s + (z.netArea || 0); }, 0);
-          if (sf > 0) send(res, { type: "log", msg: "  " + e.title + " (" + e.sheetRef + ") — " + (e.zones ? e.zones.length : 0) + " zones, " + Math.round(sf) + " SF", level: "ok" });
-          (e.flags || []).filter(Boolean).forEach(function(f) { send(res, { type: "log", msg: "    " + f, level: "warn" }); });
-        });
+
+        // Build evidence PDF page immediately for this elevation
+        for (const elev of parsed.elevations) {
+          const sf = (elev.zones || []).reduce((s, z) => s + (z.netArea || 0), 0);
+          if (sf > 0) {
+            try {
+              const elevCanvas = await renderPageToCanvas(pdfDoc, p, 1.5);
+              await buildEvidencePage(outputPdf, font, fontReg, elevCanvas, elev);
+              send(res, { type: "log", msg: "  ✓ " + elev.title + " (" + elev.sheetRef + ") — " + (elev.zones || []).length + " zones, " + Math.round(sf) + " SF — evidence page added", level: "ok" });
+            } catch(pdfErr) {
+              send(res, { type: "log", msg: "  ✓ " + elev.title + " — " + Math.round(sf) + " SF (evidence page skipped: " + pdfErr.message + ")", level: "ok" });
+            }
+          }
+          (elev.flags || []).filter(Boolean).forEach(f => send(res, { type: "log", msg: "    ⚠ " + f, level: "warn" }));
+        }
+
         send(res, { type: "elevation", data: parsed.elevations });
       } else {
-        send(res, { type: "log", msg: "Page " + p + ": could not read — manual review needed", level: "warn" });
+        send(res, { type: "log", msg: "  Page " + p + ": could not read — manual review needed", level: "warn" });
       }
     }
 
-    // ── STEP 6: 3D cross reference ────────────────────────────────────────────
+    // ── STEP 6: 3D cross-reference ────────────────────────────────────────────
     if (relevant.views3d.length) {
-      send(res, { type: "progress", label: "Cross-referencing 3D views", pct: 93 });
-      send(res, { type: "log", msg: "Cross-checking 3D views for missed soffits and returns...", level: "info" });
+      send(res, { type: "progress", label: "Cross-referencing 3D views", pct: 92 });
+      send(res, { type: "log", msg: "Cross-checking 3D views for missed soffits, returns, bump-outs...", level: "info" });
       const b64 = await renderPage(pdfDoc, relevant.views3d[0], 1.0);
       const cr = parseJSON(await claude(
         [
           { type: "image", source: { type: "base64", media_type: "image/jpeg", data: b64 } },
-          { type: "text", text: legendCtx + "\n\nThis is a 3D exterior view. Look for SOFFITS and RETURNS that may be missed. Return ONLY JSON: {\"warnings\":[\"specific items\"],\"notes\":\"description\"}" },
+          { type: "text", text: legendCtx + "\n\nThis is a 3D exterior rendering. Look specifically for:\n1. SOFFITS — underside of overhangs, canopies, covered walkways\n2. RETURNS — where panel wraps around building corners\n3. BUMP-OUTS — wall projections that create additional surfaces\n4. HIDDEN ELEVATIONS — faces not clearly visible in flat elevation drawings\n\nFlag anything that may have been missed. Return ONLY JSON: {\"warnings\":[\"specific items with location\"],\"notes\":\"overall description of exterior\"}" },
         ],
-        "Review 3D exterior renderings for missed soffit and return conditions."
+        "Review 3D exterior renderings to catch missed soffits, returns, and bump-outs for panel siding takeoff."
       ));
       if (cr && cr.warnings && cr.warnings.length) {
-        cr.warnings.forEach(function(w) { send(res, { type: "log", msg: "3D CHECK: " + w, level: "warn" }); });
+        cr.warnings.forEach(w => send(res, { type: "log", msg: "3D CHECK: " + w, level: "warn" }));
       } else {
-        send(res, { type: "log", msg: "3D cross-reference complete", level: "ok" });
+        send(res, { type: "log", msg: "3D cross-reference complete — no additional items flagged", level: "ok" });
       }
     }
 
-    send(res, { type: "done", takeoffData: takeoffData, legend: legend, soffitNotes: soffitNotes, pdfPath: req.file.path });
+    // ── STEP 7: Save evidence PDF ─────────────────────────────────────────────
+    send(res, { type: "progress", label: "Saving evidence PDF...", pct: 96 });
+    const pdfBytes = await outputPdf.save();
+    evidencePdfPath = "/tmp/evidence_" + Date.now() + ".pdf";
+    fs.writeFileSync(evidencePdfPath, Buffer.from(pdfBytes));
+    send(res, { type: "log", msg: "Evidence PDF saved — " + outputPdf.getPageCount() + " pages", level: "ok" });
+
+    send(res, { type: "done", takeoffData, legend, soffitNotes, evidenceReady: true });
     send(res, { type: "progress", label: "Complete", pct: 100 });
-    send(res, { type: "log", msg: "Analysis complete — " + takeoffData.length + " elevations processed", level: "success" });
+    send(res, { type: "log", msg: "✅ Done — " + takeoffData.length + " elevations processed — Excel + PDF ready", level: "success" });
     res.end();
 
   } catch (err) {
@@ -303,79 +420,14 @@ app.post("/analyze", upload.single("pdf"), async (req, res) => {
   }
 });
 
-// ─── PDF Generation endpoint ──────────────────────────────────────────────────
-app.post("/generate-pdf", express.json({ limit: "50mb" }), async (req, res) => {
-  try {
-    const { takeoffData } = req.body;
-    const pdfPath = lastPdfPath;
-    if (!pdfPath || !takeoffData) throw new Error("No PDF available. Run analysis first.");
-
-    const pdfDoc = await getDocument({ url: "file://" + pdfPath }).promise;
-    const outputPdf = await PDFDocument.create();
-    const font = await outputPdf.embedFont(StandardFonts.HelveticaBold);
-    const fontReg = await outputPdf.embedFont(StandardFonts.Helvetica);
-
-    for (const elev of takeoffData) {
-      if (!elev.pageNumber) continue;
-      if (!elev.zones || elev.zones.length === 0) continue;
-      const sf = elev.zones.reduce(function(s, z) { return s + (z.netArea || 0); }, 0);
-      if (sf === 0) continue;
-
-      const pageNum = elev.pageNumber;
-      const elevCanvas = await renderPageToCanvas(pdfDoc, pageNum, 1.5);
-
-      const legendH = 32 + elev.zones.length * 22 + 12;
-      const combined = createCanvas(elevCanvas.width, elevCanvas.height + legendH);
-      const ctx = combined.getContext("2d");
-
-      ctx.drawImage(elevCanvas, 0, 0);
-
-      ctx.fillStyle = "#111108";
-      ctx.fillRect(0, elevCanvas.height, elevCanvas.width, legendH);
-
-      ctx.fillStyle = "#e0cc80";
-      ctx.font = "bold 15px Arial";
-      ctx.fillText(elev.title + "  |  " + (elev.sheetRef || "") + "  |  Scale: " + (elev.scale || "N/A"), 12, elevCanvas.height + 22);
-
-      elev.zones.forEach(function(z, i) {
-        const y = elevCanvas.height + 42 + i * 22;
-        const color = MATERIAL_COLORS[z.category] || [0.48, 0.48, 0.48];
-        const hex = "#" + color.map(function(c) { return Math.round(c * 255).toString(16).padStart(2, "0"); }).join("");
-        ctx.fillStyle = hex;
-        ctx.fillRect(12, y - 13, 14, 14);
-        ctx.fillStyle = "#ccc4aa";
-        ctx.font = "12px Arial";
-        const label = (z.materialId ? z.materialId + ": " : "") + z.materialName +
-          "   Net: " + Math.round(z.netArea || 0) + " SF" +
-          "   Adj (+15%): " + Math.round((z.netArea || 0) * 1.15) + " SF";
-        ctx.fillText(label, 32, y);
-      });
-
-      const imgBytes = combined.toBuffer("image/png");
-      const embeddedImg = await outputPdf.embedPng(imgBytes);
-
-      const pageW = 1056;
-      const pageH = 816;
-      const scale = Math.min(pageW / combined.width, pageH / combined.height);
-
-      const newPage = outputPdf.addPage([pageW, pageH]);
-      newPage.drawRectangle({ x: 0, y: 0, width: pageW, height: pageH, color: rgb(0.05, 0.05, 0.04) });
-      newPage.drawImage(embeddedImg, {
-        x: (pageW - combined.width * scale) / 2,
-        y: (pageH - combined.height * scale) / 2,
-        width: combined.width * scale,
-        height: combined.height * scale,
-      });
-    }
-
-    const pdfBytes = await outputPdf.save();
-    res.setHeader("Content-Type", "application/pdf");
-    res.setHeader("Content-Disposition", "attachment; filename=BPS_Takeoff_Verified.pdf");
-    res.send(Buffer.from(pdfBytes));
-
-  } catch (err) {
-    res.status(500).json({ error: err.message });
+// ─── Download evidence PDF ────────────────────────────────────────────────────
+app.get("/evidence-pdf", (req, res) => {
+  if (!evidencePdfPath || !fs.existsSync(evidencePdfPath)) {
+    return res.status(404).json({ error: "No evidence PDF available. Run analysis first." });
   }
+  res.setHeader("Content-Type", "application/pdf");
+  res.setHeader("Content-Disposition", "attachment; filename=BPS_Takeoff_Evidence.pdf");
+  fs.createReadStream(evidencePdfPath).pipe(res);
 });
 
 app.get("/health", (req, res) => res.json({ status: "ok" }));
