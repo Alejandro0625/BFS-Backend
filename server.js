@@ -421,7 +421,7 @@ Return ONLY valid JSON:
 });
 
 // ─── Download evidence PDF ────────────────────────────────────────────────────
-app.get("/evidence-pdf", (req, res) => {
+app.post("/evidence-pdf", (req, res) => {
   if (!evidencePdfPath || !fs.existsSync(evidencePdfPath)) {
     return res.status(404).json({ error: "No evidence PDF available. Run analysis first." });
   }
