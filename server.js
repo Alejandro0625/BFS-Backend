@@ -215,49 +215,47 @@ async function runAnalysis(job, pdfPath, originalName) {
       ? sheetListResult.sheets.filter(s => s.type !== "IRRELEVANT")
       : [];
 
-    // Scan every page's text and look for each relevant sheet number
-    const pageTexts = {};
-    for (let p = 1; p <= total; p++) {
-      job.progress = { label: "Scanning page " + p + " of " + total, pct: 15 + Math.round((p / total) * 10) };
-      const text = await getPageText(pdfDoc, p);
-      pageTexts[p] = text.toUpperCase().replace(/\s+/g, " ");
-    }
+    // Visually scan all pages in batches to match sheet numbers
+    jobLog(job, "Scanning all pages visually to match sheet numbers...", "info");
+    const sheetNums = relevantSheets.map(s => s.number);
+    const BATCH = 15;
 
-    // Match each sheet number to a page
-    for (const sheet of relevantSheets) {
-      const sheetNum = sheet.number.toUpperCase().replace(/\s+/g, "");
-      let foundPage = null;
+    for (let start = 1; start <= total; start += BATCH) {
+      const end = Math.min(start + BATCH - 1, total);
+      job.progress = { label: "Scanning pages " + start + "-" + end + " of " + total, pct: 15 + Math.round((start / total) * 10) };
 
-      for (const [pageNum, text] of Object.entries(pageTexts)) {
-        // Try exact match and common variations
-        if (
-          text.includes(sheetNum) ||
-          text.includes(sheetNum.replace("-", " ")) ||
-          text.includes(sheetNum.replace("-", ".")) ||
-          text.includes(sheetNum.replace(".", "-"))
-        ) {
-          foundPage = parseInt(pageNum);
-          break;
-        }
+      const content = [];
+      for (let p = start; p <= end; p++) {
+        const { canvas, b64 } = await renderPageOnce(pdfDoc, p, 0.2);
+        canvas.width = 0; canvas.height = 0;
+        content.push({ type: "text", text: "PAGE " + p + ":" });
+        content.push({ type: "image", source: { type: "base64", media_type: "image/jpeg", data: b64 } });
       }
 
-      if (foundPage) {
-        jobLog(job, "Matched " + sheet.number + " → page " + foundPage, "dim");
-        if (sheet.type === "EXTERIOR_ELEVATION") relevant.exteriorElevations.push(foundPage);
-        else if (sheet.type === "RETURN_ELEVATION") relevant.returnElevations.push(foundPage);
-        else if (sheet.type === "MATERIAL_LEGEND") relevant.materialLegend.push(foundPage);
-        else if (sheet.type === "FLOOR_PLAN") relevant.floorPlans.push(foundPage);
-        else if (sheet.type === "3D_VIEW") relevant.views3d.push(foundPage);
-      } else {
-        jobLog(job, "Could not find page for sheet " + sheet.number + " (" + sheet.name + ")", "warn");
+      content.push({ type: "text", text: "Look at the BOTTOM RIGHT corner title block of each page. Read the sheet number shown there (e.g. A1-1, A1-2, A-200, A2.1 etc). We are looking for these specific sheet numbers: " + sheetNums.join(", ") + ". Return ONLY JSON: {\"matches\":[{\"page\":1,\"sheetNumber\":\"A1-1\"}]}. Only include pages where the sheet number in the bottom right matches one from our list exactly." });
+
+      const matchResult = parseJSON(await claude(content, "Match PDF pages to sheet numbers by reading title blocks. Return ONLY valid JSON."));
+
+      if (matchResult && matchResult.matches) {
+        matchResult.matches.forEach(match => {
+          const sheet = relevantSheets.find(s => s.number === match.sheetNumber);
+          if (sheet && match.page) {
+            jobLog(job, "Matched " + match.sheetNumber + " → page " + match.page, "dim");
+            if (sheet.type === "EXTERIOR_ELEVATION") relevant.exteriorElevations.push(match.page);
+            else if (sheet.type === "RETURN_ELEVATION") relevant.returnElevations.push(match.page);
+            else if (sheet.type === "MATERIAL_LEGEND") relevant.materialLegend.push(match.page);
+            else if (sheet.type === "FLOOR_PLAN") relevant.floorPlans.push(match.page);
+            else if (sheet.type === "3D_VIEW") relevant.views3d.push(match.page);
+          }
+        });
       }
     }
 
-    // Fallback: if nothing matched, scan page texts for elevation keywords
+    // Fallback: keyword scan if visual matching found nothing
     if (!relevant.exteriorElevations.length && !relevant.returnElevations.length) {
-      jobLog(job, "Sheet matching found nothing — scanning page text for elevation keywords...", "warn");
-      for (const [pageNum, text] of Object.entries(pageTexts)) {
-        const p = parseInt(pageNum);
+      jobLog(job, "Visual matching found nothing — trying keyword fallback...", "warn");
+      for (let p = 1; p <= total; p++) {
+        const text = (await getPageText(pdfDoc, p)).toUpperCase();
         if (text.includes("EXTERIOR ELEVATION") || text.includes("BUILDING ELEVATION") || text.includes("ENLARGED ELEVATION")) {
           relevant.exteriorElevations.push(p);
         } else if (text.includes("RETURN ELEVATION") || text.includes("BALCONY RETURN")) {
