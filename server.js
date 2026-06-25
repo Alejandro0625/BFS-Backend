@@ -171,14 +171,33 @@ async function runAnalysis(job, pdfPath, originalName) {
     job.progress = { label: "Reading drawing index", pct: 2 };
     jobLog(job, "Reading drawing index at high resolution...", "info");
 
-    // Render first 8 pages at high res to catch the drawing index/list
-    const indexPageImages = [];
-    for (let p = 1; p <= Math.min(8, total); p++) {
-      job.progress = { label: "Reading index page " + p, pct: p };
-      const { canvas, b64 } = await renderPageOnce(pdfDoc, p, 2.0); // HIGH RES
-      canvas.width = 0; canvas.height = 0;
-      indexPageImages.push({ type: "image", source: { type: "base64", media_type: "image/jpeg", data: b64 } });
-    }
+// Find the drawing index page using free text scan first
+let indexPageNum = null;
+for (let p = 1; p <= Math.min(10, total); p++) {
+  const text = (await getPageText(pdfDoc, p)).toLowerCase();
+  if (
+    text.includes("drawing index") || text.includes("sheet index") ||
+    text.includes("drawing list") || text.includes("sheet list") ||
+    text.includes("drawing schedule") || text.includes("index of drawings") ||
+    text.includes("list of drawings") || text.includes("table of contents")
+  ) {
+    indexPageNum = p;
+    jobLog(job, "Found drawing index on page " + p, "ok");
+    break;
+  }
+}
+
+// If not found by keyword, default to page 2
+if (!indexPageNum) {
+  indexPageNum = 2;
+  jobLog(job, "Drawing index keyword not found — trying page 2", "warn");
+}
+
+// Render ONLY that one page at high resolution
+jobLog(job, "Rendering drawing index page " + indexPageNum + " at high resolution...", "info");
+const { canvas: idxCanvas, b64: idxB64 } = await renderPageOnce(pdfDoc, indexPageNum, 2.5);
+idxCanvas.width = 0; idxCanvas.height = 0;
+const indexPageImages = [{ type: "image", source: { type: "base64", media_type: "image/jpeg", data: idxB64 } }];
 
     // Ask Claude to read the drawing index and extract ALL sheet names
     jobLog(job, "Extracting sheet list from drawing index...", "info");
