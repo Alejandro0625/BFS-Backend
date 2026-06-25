@@ -171,40 +171,21 @@ async function runAnalysis(job, pdfPath, originalName) {
     job.progress = { label: "Reading drawing index", pct: 2 };
     jobLog(job, "Reading drawing index at high resolution...", "info");
 
-// Find the drawing index page using free text scan first
-let indexPageNum = null;
-for (let p = 1; p <= Math.min(10, total); p++) {
-  const text = (await getPageText(pdfDoc, p)).toLowerCase();
-  if (
-    text.includes("drawing index") || text.includes("sheet index") ||
-    text.includes("drawing list") || text.includes("sheet list") ||
-    text.includes("drawing schedule") || text.includes("index of drawings") ||
-    text.includes("list of drawings") || text.includes("table of contents")
-  ) {
-    indexPageNum = p;
-    jobLog(job, "Found drawing index on page " + p, "ok");
-    break;
-  }
-}
-
-// If not found by keyword, default to page 2
-if (!indexPageNum) {
-  indexPageNum = 2;
-  jobLog(job, "Drawing index keyword not found — trying page 2", "warn");
-}
-
-// Render ONLY that one page at high resolution
-jobLog(job, "Rendering drawing index page " + indexPageNum + " at high resolution...", "info");
-const { canvas: idxCanvas, b64: idxB64 } = await renderPageOnce(pdfDoc, indexPageNum, 2.5);
-idxCanvas.width = 0; idxCanvas.height = 0;
-const indexPageImages = [{ type: "image", source: { type: "base64", media_type: "image/jpeg", data: idxB64 } }];
+    // Render first 8 pages at high res to catch the drawing index/list
+    const indexPageImages = [];
+    for (let p = 1; p <= Math.min(8, total); p++) {
+      job.progress = { label: "Reading index page " + p, pct: p };
+      const { canvas, b64 } = await renderPageOnce(pdfDoc, p, 2.0); // HIGH RES
+      canvas.width = 0; canvas.height = 0;
+      indexPageImages.push({ type: "image", source: { type: "base64", media_type: "image/jpeg", data: b64 } });
+    }
 
     // Ask Claude to read the drawing index and extract ALL sheet names
     jobLog(job, "Extracting sheet list from drawing index...", "info");
     const sheetListResult = parseJSON(await claude(
       [
         ...indexPageImages,
-        { type: "text", text: "These are the first pages of a commercial architectural blueprint set with " + total + " total pages.\n\nFind the DRAWING INDEX, SHEET INDEX, DRAWING LIST, or TABLE OF CONTENTS — it is a table listing every drawing with a sheet number and sheet name/description.\n\nExtract the COMPLETE list of every sheet. For each sheet include:\n- The sheet number exactly as shown (e.g. A-200, A1.1, E-101, etc.)\n- The sheet name/description exactly as shown\n\nAlso look for sheet numbers that indicate exterior elevations, return elevations, material legends, floor plans, and 3D views. These are the ones we need for a panel siding takeoff.\n\nReturn ONLY JSON:\n{\n  \"sheets\": [\n    {\"number\": \"A-200\", \"name\": \"Building 1 Overall Exterior Elevations\", \"type\": \"EXTERIOR_ELEVATION|RETURN_ELEVATION|MATERIAL_LEGEND|FLOOR_PLAN|3D_VIEW|IRRELEVANT\"}\n  ],\n  \"notes\": \"any notes about the drawing set\"\n}" }
+        { type: "text", text: "These are the first pages of a commercial architectural blueprint set with " + total + " total pages.\n\nFind the DRAWING INDEX, SHEET INDEX, DRAWING LIST, or TABLE OF CONTENTS — it is a table listing every drawing with a sheet number and description.\n\nWe are a PANEL SIDING contractor. We ONLY care about ARCHITECTURAL sheets (sheets starting with 'A' or labeled as architectural). Ignore all civil, structural, mechanical, plumbing, electrical, landscape sheets.\n\nFrom the architectural sheets, identify which ones are:\n- EXTERIOR ELEVATIONS: outside building faces showing panel cladding (e.g. 'Exterior Elevations', 'Building Elevations', 'Enlarged Elevations')\n- RETURN ELEVATIONS: corner/return details (e.g. 'Return Elevations', 'Corner Details')\n- MATERIAL LEGEND or FINISH SCHEDULE: exterior material key\n- FLOOR PLANS: building floor plans\n- 3D VIEWS: exterior renderings or perspective views\n\nReturn ONLY JSON:\n{\n  \"sheets\": [\n    {\"number\": \"A1-1\", \"name\": \"Exterior Elevations\", \"type\": \"EXTERIOR_ELEVATION|RETURN_ELEVATION|MATERIAL_LEGEND|FLOOR_PLAN|3D_VIEW|IRRELEVANT\"}\n  ]\n}" }
       ],
       "You are reading an architectural drawing index to extract a complete sheet list. Read carefully — the index may have small text. Return ONLY valid JSON."
     ));
@@ -217,28 +198,10 @@ const indexPageImages = [{ type: "image", source: { type: "base64", media_type: 
       jobLog(job, "Relevant sheets: " + relevant_types.map(s => s.number + " (" + s.type + ")").join(", "), "dim");
     }
 
-    // ── STEP 2: Map sheet numbers to PDF page numbers using text scan ─────────
-    job.progress = { label: "Mapping sheets to pages", pct: 15 };
-    jobLog(job, "Scanning all pages to find which PDF page = which sheet number...", "info");
+    // ── STEP 2: Scan every page text for the relevant sheet numbers ──────────
+    job.progress = { label: "Scanning pages for sheet numbers", pct: 15 };
+    jobLog(job, "Scanning all pages for sheet numbers (free)...", "info");
 
-    // Extract text from every page title block (free, no API)
-    const pageSheetMap = {}; // pageNum -> sheet number
-    for (let p = 1; p <= total; p++) {
-      job.progress = { label: "Scanning page " + p + " of " + total, pct: 15 + Math.round((p / total) * 10) };
-      const text = await getPageText(pdfDoc, p);
-      if (text.trim().length > 5) {
-        // Look for any sheet number pattern in the text
-        const matches = text.match(/\b[A-Z]{0,3}-?\d{1,4}(?:\.\d{1,2})?\b/g) || [];
-        // Also look for common sheet number formats
-        const sheetMatches = text.match(/\b(?:A|S|M|P|E|C|L|I|FP|EX|EL|ELEV|ARCH)-?\d{1,4}(?:\.\d{1,2})?\b/gi) || [];
-        const allMatches = [...new Set([...matches, ...sheetMatches])];
-        if (allMatches.length > 0) {
-          pageSheetMap[p] = { text: text.slice(0, 300), matches: allMatches };
-        }
-      }
-    }
-
-    // Now match the sheet list from the index to actual PDF pages
     const relevant = {
       exteriorElevations: [],
       returnElevations: [],
@@ -247,50 +210,65 @@ const indexPageImages = [{ type: "image", source: { type: "base64", media_type: 
       views3d: [],
     };
 
-    if (sheetListResult && sheetListResult.sheets) {
-      const relevantSheets = sheetListResult.sheets.filter(s => s.type !== "IRRELEVANT");
+    // Get the relevant A-sheets from the index
+    const relevantSheets = (sheetListResult && sheetListResult.sheets)
+      ? sheetListResult.sheets.filter(s => s.type !== "IRRELEVANT")
+      : [];
 
-      for (const sheet of relevantSheets) {
-        const sheetNum = sheet.number.toUpperCase().replace(/\s+/g, "");
-        // Find which PDF page contains this sheet number
-        let foundPage = null;
-        for (const [pageNum, data] of Object.entries(pageSheetMap)) {
-          const pageMatches = data.matches.map(m => m.toUpperCase().replace(/\s+/g, ""));
-          if (pageMatches.some(m => m === sheetNum || m.includes(sheetNum) || sheetNum.includes(m))) {
-            foundPage = parseInt(pageNum);
-            break;
-          }
-        }
+    // Scan every page's text and look for each relevant sheet number
+    const pageTexts = {};
+    for (let p = 1; p <= total; p++) {
+      job.progress = { label: "Scanning page " + p + " of " + total, pct: 15 + Math.round((p / total) * 10) };
+      const text = await getPageText(pdfDoc, p);
+      pageTexts[p] = text.toUpperCase().replace(/\s+/g, " ");
+    }
 
-        if (foundPage) {
-          if (sheet.type === "EXTERIOR_ELEVATION") relevant.exteriorElevations.push(foundPage);
-          else if (sheet.type === "RETURN_ELEVATION") relevant.returnElevations.push(foundPage);
-          else if (sheet.type === "MATERIAL_LEGEND") relevant.materialLegend.push(foundPage);
-          else if (sheet.type === "FLOOR_PLAN") relevant.floorPlans.push(foundPage);
-          else if (sheet.type === "3D_VIEW") relevant.views3d.push(foundPage);
-        } else {
-          jobLog(job, "Could not find page for sheet " + sheet.number + " — " + sheet.name, "warn");
+    // Match each sheet number to a page
+    for (const sheet of relevantSheets) {
+      const sheetNum = sheet.number.toUpperCase().replace(/\s+/g, "");
+      let foundPage = null;
+
+      for (const [pageNum, text] of Object.entries(pageTexts)) {
+        // Try exact match and common variations
+        if (
+          text.includes(sheetNum) ||
+          text.includes(sheetNum.replace("-", " ")) ||
+          text.includes(sheetNum.replace("-", ".")) ||
+          text.includes(sheetNum.replace(".", "-"))
+        ) {
+          foundPage = parseInt(pageNum);
+          break;
         }
+      }
+
+      if (foundPage) {
+        jobLog(job, "Matched " + sheet.number + " → page " + foundPage, "dim");
+        if (sheet.type === "EXTERIOR_ELEVATION") relevant.exteriorElevations.push(foundPage);
+        else if (sheet.type === "RETURN_ELEVATION") relevant.returnElevations.push(foundPage);
+        else if (sheet.type === "MATERIAL_LEGEND") relevant.materialLegend.push(foundPage);
+        else if (sheet.type === "FLOOR_PLAN") relevant.floorPlans.push(foundPage);
+        else if (sheet.type === "3D_VIEW") relevant.views3d.push(foundPage);
+      } else {
+        jobLog(job, "Could not find page for sheet " + sheet.number + " (" + sheet.name + ")", "warn");
       }
     }
 
-    // If index reading failed or found nothing, fall back to text-based classification
+    // Fallback: if nothing matched, scan page texts for elevation keywords
     if (!relevant.exteriorElevations.length && !relevant.returnElevations.length) {
-      jobLog(job, "Index matching found no elevations — using AI text classification as fallback...", "warn");
-      const pageIndex = Object.entries(pageSheetMap).map(([p, data]) => "Page " + p + ": " + data.text.replace(/\s+/g, " ").trim());
-      const indexSummary = pageIndex.join("\n");
-
-      const classifyResult = parseJSON(await claude(
-        [{ type: "text", text: "You are a commercial panel siding estimator. Here is text from every page of a " + total + "-page architectural blueprint set.\n\nIdentify which PDF page numbers contain:\n- EXTERIOR ELEVATIONS: outside building faces (words: elevation, facade, exterior)\n- RETURN ELEVATIONS: corner/return details (words: return, corner return, balcony return)\n- MATERIAL LEGEND or FINISH SCHEDULE\n- FLOOR PLANS\n- 3D VIEWS or RENDERINGS\n\nWe ONLY care about: ACM, fiber cement, Nichiha, aluminum panels, perforated metal, soffits, returns.\nIGNORE: structural, mechanical, electrical, interior, sections, civil, roofing.\n\nPAGE DATA:\n" + indexSummary + "\n\nReturn ONLY JSON: {\"exteriorElevations\":[page numbers],\"returnElevations\":[page numbers],\"materialLegend\":[page numbers],\"floorPlans\":[page numbers],\"views3d\":[page numbers]}" }],
-        "Classify architectural blueprint pages for exterior panel siding estimation. Return ONLY valid JSON."
-      ));
-
-      if (classifyResult) {
-        Object.keys(relevant).forEach(k => { if (classifyResult[k]) relevant[k].push(...classifyResult[k]); });
+      jobLog(job, "Sheet matching found nothing — scanning page text for elevation keywords...", "warn");
+      for (const [pageNum, text] of Object.entries(pageTexts)) {
+        const p = parseInt(pageNum);
+        if (text.includes("EXTERIOR ELEVATION") || text.includes("BUILDING ELEVATION") || text.includes("ENLARGED ELEVATION")) {
+          relevant.exteriorElevations.push(p);
+        } else if (text.includes("RETURN ELEVATION") || text.includes("BALCONY RETURN")) {
+          relevant.returnElevations.push(p);
+        } else if (text.includes("FINISH SCHEDULE") || text.includes("MATERIAL LEGEND") || text.includes("EXTERIOR MATERIALS")) {
+          relevant.materialLegend.push(p);
+        }
       }
     }
 
-    // Remove duplicates
+    // Remove duplicates and sort
     Object.keys(relevant).forEach(k => { relevant[k] = [...new Set(relevant[k])].sort((a, b) => a - b); });
 
     jobLog(job, "Found: " + relevant.exteriorElevations.length + " elevations | " + relevant.returnElevations.length + " returns | " + relevant.materialLegend.length + " legend | " + relevant.floorPlans.length + " floor plans | " + relevant.views3d.length + " 3D views", "ok");
