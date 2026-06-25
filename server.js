@@ -119,6 +119,32 @@ async function addEvidencePage(outputPdf, canvas, elev) {
   const ctx = combined.getContext("2d");
 
   ctx.drawImage(canvas, 0, 0);
+
+  // Draw colored zone overlays directly on the elevation drawing
+  zones.forEach((z) => {
+    if (!z.wPct || z.wPct === 0) return;
+    const color = MATERIAL_COLORS[z.category] || MATERIAL_COLORS["Other"];
+    const x = ((z.xPct || 0) / 100) * canvas.width;
+    const y = ((z.yPct || 0) / 100) * canvas.height;
+    const w = (z.wPct / 100) * canvas.width;
+    const h = ((z.hPct || 10) / 100) * canvas.height;
+    // Semi-transparent fill
+    ctx.globalAlpha = 0.35;
+    ctx.fillStyle = color.hex;
+    ctx.fillRect(x, y, w, h);
+    ctx.globalAlpha = 1.0;
+    // Solid border
+    ctx.strokeStyle = color.hex;
+    ctx.lineWidth = 3;
+    ctx.strokeRect(x, y, w, h);
+    // SF label on drawing
+    ctx.fillStyle = "#ffffff";
+    ctx.font = "bold 16px Arial";
+    ctx.fillText(Math.round(z.netArea) + " SF net", x + 6, y + 22);
+    ctx.fillStyle = color.hex;
+    ctx.font = "12px Arial";
+    ctx.fillText((z.materialId || "") + " " + (z.materialName || "").slice(0, 20), x + 6, y + 40);
+  });
   ctx.fillStyle = "#0f0e0b";
   ctx.fillRect(0, canvas.height, canvas.width, legendH);
   ctx.fillStyle = "#e0cc80";
@@ -344,7 +370,40 @@ async function runAnalysis(job, pdfPath, originalName) {
 
       const { canvas, b64 } = await renderPageOnce(pdfDoc, p, 1.5);
 
-      const prompt = "You are a senior commercial PANEL SIDING estimator performing a precise material takeoff — the same process as a manual Bluebeam Revu takeoff.\n\n" + legendCtx + soffitCtx + "\n\nPage " + p + " — " + type + ".\n\nTAKEOFF PROCESS:\n1. Read drawing TITLE and SHEET REFERENCE from the title block\n2. Read the SCALE printed on the drawing (e.g. 1/8 inch = 1 foot). Then use this scale carefully: at 1/8 inch scale, every 1 inch on paper = 8 feet real. At 1/4 inch scale, every 1 inch = 4 feet. At 1/16 inch scale, every 1 inch = 16 feet. Estimate the physical size of each material zone on the drawing in inches, then multiply by the scale factor to get real feet. Be conservative — if unsure, estimate smaller not larger.\n3. For each panel material zone:\n   - Identify material using the legend above\n   - GROSS area = width x height using the scale\n   - List ALL openings: windows, doors, louvers, curtainwall, storefronts\n   - NET = Gross minus Total Openings\n4. SOFFITS: measure underside of any overhang or canopy (width x depth = SF) — note separately\n5. RETURNS: measure any corner wrap (height x return depth = SF) — note separately\n6. BUMP-OUTS: treat projecting wall sections as separate zones\n7. IGNORE completely: brick, masonry, stone, EIFS, stucco, concrete, glass, curtainwall, roofing, vapor barriers\n8. If this is a BUILDING SECTION or WALL SECTION — return 0 zones\n\nReturn ONLY valid JSON:\n{\"pageNumber\":" + p + ",\"elevations\":[{\"title\":\"\",\"sheetRef\":\"\",\"scale\":\"\",\"building\":\"\",\"direction\":\"\",\"zones\":[{\"materialId\":\"\",\"materialName\":\"\",\"category\":\"\",\"description\":\"\",\"grossArea\":0,\"totalOpeningArea\":0,\"netArea\":0}],\"flags\":[]}]}";
+      const prompt = [
+        "You are a senior commercial PANEL SIDING estimator performing a precise material takeoff.",
+        "",
+        legendCtx,
+        soffitCtx,
+        "",
+        "Page " + p + " — " + type + ".",
+        "",
+        "TAKEOFF PROCESS:",
+        "1. Read the drawing TITLE and SHEET REFERENCE from the title block (bottom right corner)",
+        "2. Read the SCALE printed on the drawing. Common scales:",
+        "   - 1/8 inch = 1 foot: every inch on paper = 8 real feet",
+        "   - 1/4 inch = 1 foot: every inch on paper = 4 real feet",
+        "   - 1/16 inch = 1 foot: every inch on paper = 16 real feet",
+        "3. For each panel material zone visible on this elevation:",
+        "   - Identify the material using the legend",
+        "   - Estimate the zone width and height in real feet using the scale",
+        "   - GROSS area = width x height in SF",
+        "   - Subtract ALL openings: windows, doors, overhead doors, garage doors, louvers, curtainwall, storefronts, vision lites",
+        "   - OVERHEAD/GARAGE DOORS are large — typically 10x10, 12x12, 14x14 feet each — always deduct them",
+        "   - When you see SEE ALTERNATE or ALTERNATE noted at a door location, still deduct that opening",
+        "   - NET = Gross minus ALL openings",
+        "4. SANITY CHECK: A typical commercial wall zone is 200-5000 SF.",
+        "   If any single zone exceeds 8000 SF you likely misread the scale — recheck.",
+        "5. SOFFITS: underside of overhangs — width x depth = SF",
+        "6. RETURNS: corner wraps — height x depth = SF",
+        "7. IGNORE: brick, masonry, stone, EIFS, stucco, concrete, glass, curtainwall, roofing",
+        "8. BUILDING SECTION or WALL SECTION — return 0 zones",
+        "9. For each zone also estimate its position on the drawing as percentages (0-100):",
+        "   xPct = left edge %, yPct = top edge %, wPct = width %, hPct = height %",
+        "   This is used to draw colored highlights on the evidence PDF.",
+        "",
+        'Return ONLY valid JSON: {"pageNumber":' + p + ',"elevations":[{"title":"","sheetRef":"","scale":"","building":"","direction":"","zones":[{"materialId":"","materialName":"","category":"","description":"","grossArea":0,"totalOpeningArea":0,"netArea":0,"xPct":10,"yPct":10,"wPct":60,"hPct":40}],"flags":[]}]}'
+      ].join("\n");
 
       const raw = await claude(
         [
