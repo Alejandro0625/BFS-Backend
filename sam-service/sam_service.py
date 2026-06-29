@@ -373,12 +373,86 @@ def measure(req: MeasureRequest):
     return MeasureResponse(zones=out, method=method)
 
 
+def _normalize_verts(verts, pw, ph):
+    """Convert PyMuPDF vertices (Points or tuples) to normalized [0-1] coord pairs."""
+    out = []
+    for v in verts:
+        if isinstance(v, (tuple, list)):
+            out.append([round(v[0] / pw, 4), round(v[1] / ph, 4)])
+        else:
+            out.append([round(v.x / pw, 4), round(v.y / ph, 4)])
+    return out
+
+
+def extract_bluebeam_polygons(pdf_bytes: bytes, page_number: int, ft_per_inch: float = 8.0) -> list:
+    """
+    Read Bluebeam (and PDF-native) Polygon annotations from a page.
+    These store the estimator's exact traced shapes AND the measured SF value
+    in the annotation content label (e.g. "871 sf").
+    Returns list of polygon dicts ready for the interactive view.
+    """
+    import re
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    page = doc[page_number - 1]
+    pw, ph = page.rect.width, page.rect.height
+
+    results = []
+    for a in page.annots():
+        if a.type[0] != 6:   # only Polygon annotations
+            continue
+
+        verts = a.vertices or []
+        if len(verts) < 3:
+            continue
+
+        content  = a.info.get("content", "")
+        fill     = a.colors.get("fill", [])
+        stroke   = a.colors.get("stroke", [])
+        rect     = a.rect
+
+        # Parse SF from label ("493 sf", "2,209 sf", etc.) — use Bluebeam's own measurement
+        sf_match = re.search(r"([\d,]+)\s*sf", content, re.IGNORECASE)
+        if sf_match:
+            area_sf = float(sf_match.group(1).replace(",", ""))
+        else:
+            # No SF label — calculate from polygon vertices
+            raw_pts = []
+            for v in verts:
+                if isinstance(v, (tuple, list)):
+                    raw_pts.append((v[0], v[1]))
+                else:
+                    raw_pts.append((v.x, v.y))
+            area_sf = round(pdf_pts_to_sf(polygon_area(raw_pts), ft_per_inch), 1)
+
+        norm = _normalize_verts(verts, pw, ph)
+        cx   = round(sum(v[0] for v in norm) / len(norm), 4)
+        cy   = round(sum(v[1] for v in norm) / len(norm), 4)
+
+        results.append({
+            "id":         len(results),
+            "points":     norm,
+            "area_sf":    area_sf,
+            "cx":         cx,
+            "cy":         cy,
+            "bbox":       [round(rect.x0/pw,4), round(rect.y0/ph,4),
+                           round(rect.x1/pw,4), round(rect.y1/ph,4)],
+            "source":     "bluebeam",
+            "label":      content,
+            "fill_color": [round(c, 3) for c in fill] if fill else None,
+        })
+
+    doc.close()
+    return results
+
+
 @app.post("/polygons")
 def get_page_polygons(req: PolygonRequest):
     """
-    Extract all significant closed vector shapes from a PDF page.
-    Returns polygon contours as normalized [0-1] coords so the frontend
-    can draw SVG overlays aligned to the rendered page image.
+    Extract surface polygons from a PDF page.
+
+    Priority:
+      1. Bluebeam/PDF polygon annotations  — exact shapes + SF from estimator's markup
+      2. Vector paths from CAD PDF          — exact geometry, SF from scale
     """
     pdf_bytes = base64.b64decode(req.pdf_b64)
     ft_per_inch = scale_to_ft_per_inch(req.scale_str or "")
@@ -386,11 +460,22 @@ def get_page_polygons(req: PolygonRequest):
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     page = doc[req.page_number - 1]
     pw, ph = page.rect.width, page.rect.height
+    doc.close()
+
+    # ── Priority 1: Bluebeam polygon annotations ────────────────────────────
+    bb = extract_bluebeam_polygons(pdf_bytes, req.page_number, ft_per_inch)
+    if bb:
+        print(f"/polygons [bluebeam]: page {req.page_number} → {len(bb)} annotation polygons")
+        return {"polygons": bb, "page_width": pw, "page_height": ph,
+                "count": len(bb), "method": "bluebeam"}
+
+    # ── Priority 2: Vector path extraction ──────────────────────────────────
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    page = doc[req.page_number - 1]
     drawings = page.get_drawings()
     doc.close()
 
-    MIN_AREA_PTS = 300  # ~4 SF at 1/8"=1'-0" — filters dimension lines & text boxes
-
+    MIN_AREA_PTS = 300
     raw = []
     for d in drawings:
         r = d.get("rect")
@@ -400,20 +485,18 @@ def get_page_polygons(req: PolygonRequest):
         if r.is_empty or r.width < 12 or r.height < 12:
             continue
 
-        # Build polygon vertices from drawing path items
         pts = []
         for item in d.get("items", []):
             if item[0] == "l":
                 pts.append([float(item[1].x), float(item[1].y)])
-            elif item[0] == "c":   # bezier curve — use endpoint
+            elif item[0] == "c":
                 pts.append([float(item[3].x), float(item[3].y)])
-            elif item[0] == "re":  # rectangle item
+            elif item[0] == "re":
                 rr = fitz.Rect(item[1])
                 pts = [[rr.x0, rr.y0], [rr.x1, rr.y0], [rr.x1, rr.y1], [rr.x0, rr.y1]]
                 break
 
         if len(pts) < 3:
-            # Fall back to bounding rect
             pts = [[r.x0, r.y0], [r.x1, r.y0], [r.x1, r.y1], [r.x0, r.y1]]
 
         poly_area = polygon_area(pts)
@@ -421,27 +504,25 @@ def get_page_polygons(req: PolygonRequest):
             continue
 
         area_sf = round(pdf_pts_to_sf(poly_area, ft_per_inch), 1)
-        # Normalize coords to 0-1 range
         norm = [[round(x / pw, 4), round(y / ph, 4)] for x, y in pts]
-        cx = round(sum(p[0] for p in norm) / len(norm), 4)
-        cy = round(sum(p[1] for p in norm) / len(norm), 4)
+        cx   = round(sum(p[0] for p in norm) / len(norm), 4)
+        cy   = round(sum(p[1] for p in norm) / len(norm), 4)
 
         raw.append({
-            "id": len(raw),
-            "points": norm,
-            "area_sf": area_sf,
+            "id": len(raw), "points": norm, "area_sf": area_sf,
             "cx": cx, "cy": cy,
             "bbox": [round(r.x0/pw,4), round(r.y0/ph,4), round(r.x1/pw,4), round(r.y1/ph,4)],
+            "source": "vector",
         })
 
-    # Largest shapes first; cap at 60 (title blocks, dim lines already filtered by size)
     raw.sort(key=lambda p: p["area_sf"], reverse=True)
     raw = raw[:60]
     for i, p in enumerate(raw):
         p["id"] = i
 
-    print(f"/polygons: page {req.page_number} → {len(raw)} polygons  (pw={pw:.0f} ph={ph:.0f})")
-    return {"polygons": raw, "page_width": pw, "page_height": ph, "count": len(raw)}
+    print(f"/polygons [vector]: page {req.page_number} → {len(raw)} polygons")
+    return {"polygons": raw, "page_width": pw, "page_height": ph,
+            "count": len(raw), "method": "vector"}
 
 
 @app.get("/health")
