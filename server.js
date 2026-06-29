@@ -92,7 +92,7 @@ async function claude(content, system, retries = 6) {
         "anthropic-version": "2023-06-01",
       },
       body: JSON.stringify({
-        model: "claude-sonnet-4-6",
+        model: "claude-opus-4-5",
         max_tokens: 4000,
         system,
         messages: [{ role: "user", content }],
@@ -493,19 +493,25 @@ async function runAnalysis(job, pdfPath, originalName) {
           });
 
           if (allZones.length > 0) {
-            jobLog(job, "  Page " + p + ": sending " + allZones.length + " zone(s) to SAM...", "dim");
+            jobLog(job, "  Page " + p + ": measuring zones (vector-first)...", "dim");
             const scale = parsed.elevations[0]?.scale || "1/8\"=1'-0\"";
+
+            // Send raw PDF page bytes so the service can extract vector geometry
+            const pdfPageBytes = fs.readFileSync(pdfPath);
+            const pdfB64 = pdfPageBytes.toString("base64");
 
             const samRes = await fetch(SAM_URL + "/measure", {
               method: "POST",
               headers: { "Content-Type": "application/json" },
               body: JSON.stringify({
                 image_b64: samB64,
+                pdf_b64: pdfB64,
+                page_number: p,
                 zones: allZones.map(z => ({ id: z.id, x0pct: z.x0pct, y0pct: z.y0pct, x1pct: z.x1pct, y1pct: z.y1pct })),
                 scale_str: scale,
                 dpi: 150,
               }),
-              signal: AbortSignal.timeout(300000), // 5 min — SAM takes time
+              signal: AbortSignal.timeout(300000),
             });
 
             if (samRes.ok) {
