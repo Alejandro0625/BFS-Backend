@@ -1,15 +1,15 @@
 [phases.setup]
-nixPkgs = ["python312", "libGL", "glib", "wget"]
+nixPkgs = ["python312", "python312Packages.pip", "libGL", "glib", "wget"]
 
 [phases.install]
 cmds = [
-  "pip install -r requirements.txt",
+  "python3.12 -m pip install -r requirements.txt",
   "mkdir -p /data/sam",
   "wget -q -O /data/sam/sam_vit_b_01ec64.pth https://dl.fbaipublicfiles.com/segment_anything/sam_vit_b_01ec64.pth"
 ]
 
 [start]
-cmd = "python sam_service.py"
+cmd = "python3.12 sam_service.py"
 
 [variables]
 SAM_CHECKPOINT = "/data/sam/sam_vit_b_01ec64.pth"
