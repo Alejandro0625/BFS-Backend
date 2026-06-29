@@ -32,6 +32,9 @@ function createJob(id) {
     phase: "filtering",
     takeoffData: [], legend: [], soffitNotes: [],
     evidencePdfPath: null, error: null,
+    pdfPath: null,
+    polygons_by_page: {},
+    page_dims_by_page: {},
   };
   return jobs[id];
 }
@@ -207,6 +210,7 @@ async function addEvidencePage(outputPdf, canvas, elev) {
 // ─── Main analysis function ───────────────────────────────────────────────────
 async function runAnalysis(job, pdfPath, originalName) {
   try {
+    job.pdfPath = pdfPath;
     jobLog(job, "Loading PDF...", "info");
     const pdfDoc = await getDocument({ url: "file://" + pdfPath }).promise;
     const total = pdfDoc.numPages;
@@ -532,6 +536,27 @@ async function runAnalysis(job, pdfPath, originalName) {
           }
 
           samCanvas.width = 0; samCanvas.height = 0;
+
+          // Fetch polygon shapes for interactive takeoff view
+          try {
+            const polyRes = await fetch(SAM_URL + "/polygons", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                pdf_b64: pdfB64,
+                page_number: p,
+                scale_str: parsed.elevations[0]?.scale || "1/8\"=1'-0\"",
+              }),
+              signal: AbortSignal.timeout(30000),
+            });
+            if (polyRes.ok) {
+              const pd = await polyRes.json();
+              job.polygons_by_page[p] = pd.polygons || [];
+              job.page_dims_by_page[p] = { width: pd.page_width, height: pd.page_height };
+              jobLog(job, "  Page " + p + ": " + (pd.polygons || []).length + " surface polygons extracted", "dim");
+            }
+          } catch(e) { /* polygon extraction is non-critical */ }
+
         } catch(samErr) {
           jobLog(job, "  Page " + p + ": SAM call failed (" + samErr.message + ") — keeping Claude estimates", "warn");
         }
@@ -621,6 +646,37 @@ app.get("/evidence-pdf/:jobId", (req, res) => {
   res.setHeader("Content-Type", "application/pdf");
   res.setHeader("Content-Disposition", "attachment; filename=BPS_Takeoff_Evidence.pdf");
   fs.createReadStream(job.evidencePdfPath).pipe(res);
+});
+
+// Serve rendered page image on demand (for interactive takeoff view)
+app.get("/page-image/:jobId/:pageNum", async (req, res) => {
+  const job = jobs[req.params.jobId];
+  if (!job?.pdfPath || !fs.existsSync(job.pdfPath)) {
+    return res.status(404).json({ error: "PDF not available" });
+  }
+  const pageNum = parseInt(req.params.pageNum);
+  try {
+    const pdfDoc = await getDocument({ url: "file://" + job.pdfPath }).promise;
+    const { b64 } = await renderPageOnce(pdfDoc, pageNum, 1.5);
+    pdfDoc.cleanup();
+    res.setHeader("Content-Type", "image/jpeg");
+    res.setHeader("Cache-Control", "public, max-age=3600");
+    res.send(Buffer.from(b64, "base64"));
+  } catch(e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Return polygon contours for a page (populated during analysis)
+app.get("/polygons/:jobId/:pageNum", (req, res) => {
+  const job = jobs[req.params.jobId];
+  if (!job) return res.status(404).json({ error: "Job not found" });
+  const pn = parseInt(req.params.pageNum);
+  res.json({
+    polygons: job.polygons_by_page?.[pn] || [],
+    width: job.page_dims_by_page?.[pn]?.width || 612,
+    height: job.page_dims_by_page?.[pn]?.height || 792,
+  });
 });
 
 app.get("/health", (req, res) => res.json({ status: "ok" }));
