@@ -8,6 +8,7 @@ import fs from "fs";
 import pkg from "pdfjs-dist/legacy/build/pdf.js";
 const { getDocument, GlobalWorkerOptions } = pkg;
 GlobalWorkerOptions.workerSrc = "";
+import { initDb, recordRun, learnHatch, recallHatches, stats, dbEnabled } from "./db.js";
 
 const app = express();
 const upload = multer({
@@ -705,6 +706,14 @@ async function runAnalysis(job, pdfPath, originalName) {
     job.progress = { label: "Complete", pct: 100 };
     jobLog(job, "Done — " + job.takeoffData.length + " elevations analyzed — Excel + PDF ready", "success");
 
+    // Remember this run (no-op if no database connected)
+    try {
+      const elevs = job.takeoffData.filter(e=>(e.zones||[]).some(z=>(z.netArea||0)>0));
+      const totalSf = job.takeoffData.reduce((s,e)=>s+(e.zones||[]).reduce((a,z)=>a+(z.netArea||0),0),0);
+      recordRun({ projectName: originalName, pages: total, elevations: elevs.length,
+        totalSf: Math.round(totalSf), scaleSource: job.takeoffData.find(e=>e.scaleSource)?.scaleSource });
+    } catch {}
+
   } catch (err) {
     job.status = "error";
     job.error = err.message;
@@ -772,8 +781,22 @@ app.get("/polygons/:jobId/:pageNum", (req, res) => {
   });
 });
 
-app.get("/health", (req, res) => res.json({ status: "ok" }));
+// ─── Learning store endpoints ───────────────────────────────────────────────
+// Estimator tags a hatch → remember it (shared across all machines via the DB)
+app.post("/learn", async (req, res) => {
+  const { firm, hatches } = req.body || {};
+  if (Array.isArray(hatches)) { for (const h of hatches) { if (h && h.signature) await learnHatch({ firm, ...h }); } }
+  res.json({ ok: true, stored: dbEnabled });
+});
+// New drawing → recall everything we've learned (so repeats are pre-identified)
+app.get("/recall", async (req, res) => {
+  res.json({ hatches: await recallHatches(req.query.firm), enabled: dbEnabled });
+});
+app.get("/learn-status", async (req, res) => res.json(await stats()));
+
+app.get("/health", (req, res) => res.json({ status: "ok", learning: dbEnabled }));
 
 const PORT = process.env.PORT || 3001;
+initDb();
 app.listen(PORT, () => console.log("BPS Estimator backend running on port " + PORT));
 
