@@ -79,6 +79,10 @@ class AnalyzeRequest(BaseModel):
     pdf_b64: str
     page_number: int = 1
 
+class ScheduleRequest(BaseModel):
+    pdf_b64: str
+    page_number: int = 1
+
 class MeasureRequest(BaseModel):
     image_b64: str
     pdf_b64: Optional[str] = None
@@ -875,6 +879,13 @@ def get_page_polygons(req: PolygonRequest):
 
     print(f"/polygons: no surfaces detected on page {req.page_number}")
     return {"polygons": [], "width": pw, "height": ph, "count": 0, "method": "none"}
+
+
+@app.post("/schedules")
+def get_schedules(req: ScheduleRequest):
+    """Lightweight pdfplumber-only window/door schedule extraction for one page (no Claude cost)."""
+    pdf_bytes = base64.b64decode(req.pdf_b64)
+    return extract_schedules(pdf_bytes, req.page_number)
 
 
 @app.post("/analyze")
