@@ -1,4 +1,4 @@
-import express from "express";
+﻿import express from "express";
 import multer from "multer";
 import cors from "cors";
 import fetch from "node-fetch";
@@ -80,24 +80,46 @@ async function getPageText(pdfDoc, pageNum) {
   } catch(e) { return ""; }
 }
 
-async function claude(content, system) {
-  const res = await fetch("https://api.anthropic.com/v1/messages", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "x-api-key": API_KEY,
-      "anthropic-version": "2023-06-01",
-    },
-    body: JSON.stringify({
-      model: "claude-opus-4-5",
-      max_tokens: 4000,
-      system,
-      messages: [{ role: "user", content }],
-    }),
-  });
-  const data = await res.json();
-  if (data.error) throw new Error(data.error.message);
-  return data.content?.find(b => b.type === "text")?.text || "";
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+async function claude(content, system, retries = 6) {
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    const res = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": API_KEY,
+        "anthropic-version": "2023-06-01",
+      },
+      body: JSON.stringify({
+        model: "claude-sonnet-4-6",
+        max_tokens: 4000,
+        system,
+        messages: [{ role: "user", content }],
+      }),
+    });
+
+    // Overloaded or rate limited — wait and retry
+    if (res.status === 529 || res.status === 429) {
+      const wait = Math.min(5000 * Math.pow(2, attempt), 60000);
+      console.log(`Claude overloaded (attempt ${attempt+1}) — retrying in ${wait/1000}s`);
+      await sleep(wait);
+      continue;
+    }
+
+    const data = await res.json();
+    if (data.error) {
+      if (data.error.type === "overloaded_error" && attempt < retries) {
+        const wait = Math.min(5000 * Math.pow(2, attempt), 60000);
+        console.log(`Claude overloaded (attempt ${attempt+1}) — retrying in ${wait/1000}s`);
+        await sleep(wait);
+        continue;
+      }
+      throw new Error(data.error.message);
+    }
+    return data.content?.find(b => b.type === "text")?.text || "";
+  }
+  throw new Error("Claude API overloaded after max retries — please try again in a minute");
 }
 
 function parseJSON(text) {
@@ -261,6 +283,7 @@ async function runAnalysis(job, pdfPath, originalName) {
 
       content.push({ type: "text", text: "Look at the BOTTOM RIGHT corner title block of each page. Read the sheet number shown there (e.g. A1-1, A1-2, A-200, A2.1 etc). We are looking for these specific sheet numbers: " + sheetNums.join(", ") + ". Return ONLY JSON: {\"matches\":[{\"page\":1,\"sheetNumber\":\"A1-1\"}]}. Only include pages where the sheet number in the bottom right matches one from our list exactly." });
 
+      await sleep(1000); // avoid hammering Claude API across batches
       const matchResult = parseJSON(await claude(content, "Match PDF pages to sheet numbers by reading title blocks. Return ONLY valid JSON."));
 
       if (matchResult && matchResult.matches) {
@@ -598,3 +621,4 @@ app.get("/health", (req, res) => res.json({ status: "ok" }));
 
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => console.log("BPS Estimator backend running on port " + PORT));
+
