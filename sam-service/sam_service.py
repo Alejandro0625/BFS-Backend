@@ -75,6 +75,10 @@ class PolygonRequest(BaseModel):
     page_number: int = 1
     scale_str: Optional[str] = None
 
+class AnalyzeRequest(BaseModel):
+    pdf_b64: str
+    page_number: int = 1
+
 class MeasureRequest(BaseModel):
     image_b64: str
     pdf_b64: Optional[str] = None
@@ -214,6 +218,149 @@ def pdf_pts_to_sf(area_pts: float, ft_per_inch: float) -> float:
 def px_to_sf(px: int, ft_per_inch: float, dpi: int) -> float:
     ppf = dpi / ft_per_inch
     return px / (ppf * ppf)
+
+
+# ── Feet-inches parsing (for reading schedules & dimensions) ──────────────────
+def parse_ft_in(s) -> float:
+    """Parse architectural dimension strings → decimal feet.
+    Handles: 4'-0\"  3'-6\"  4'  48\"  4.0  4'-6  etc."""
+    if s is None:
+        return 0.0
+    s = str(s).strip().replace("”", '"').replace("’", "'").replace("''", '"')
+    # feet + inches: 4'-0", 4' 6", 4'-6
+    m = re.search(r"(\d+)\s*'\s*[-\s]?\s*(\d+(?:\.\d+)?)?\s*\"?", s)
+    if m and "'" in s:
+        ft   = float(m.group(1))
+        inch = float(m.group(2)) if m.group(2) else 0.0
+        return round(ft + inch / 12.0, 3)
+    # inches only: 48"
+    m = re.search(r"(\d+(?:\.\d+)?)\s*\"", s)
+    if m:
+        return round(float(m.group(1)) / 12.0, 3)
+    # bare number = feet
+    m = re.search(r"(\d+(?:\.\d+)?)", s)
+    if m:
+        return float(m.group(1))
+    return 0.0
+
+
+# ── Window/Door schedule extraction (pdfplumber) ──────────────────────────────
+def extract_schedules(pdf_bytes: bytes, page_number: int) -> dict:
+    """
+    Locate window/door schedule tables and parse EXACT opening sizes.
+    This is far more accurate than tracing rectangles on the elevation.
+    Returns {"windows":[...], "doors":[...], "total_opening_sf": float}
+    """
+    import pdfplumber
+    windows, doors = [], []
+    try:
+        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+            if page_number - 1 >= len(pdf.pages):
+                return {"windows": [], "doors": [], "total_opening_sf": 0.0}
+            page  = pdf.pages[page_number - 1]
+            text  = (page.extract_text() or "").upper()
+            tables = page.extract_tables() or []
+
+            for table in tables:
+                if not table or len(table) < 2:
+                    continue
+                cols = [str(c or "").upper().strip() for c in table[0]]
+                header = " ".join(cols)
+
+                def find_col(*names):
+                    for i, c in enumerate(cols):
+                        if any(n in c for n in names):
+                            return i
+                    return None
+
+                ci_mark = find_col("MARK", "TYPE", "TAG", "ID", "NO")
+                ci_w    = find_col("WIDTH", "WIDE", "'W", "W.")
+                ci_h    = find_col("HEIGHT", "HGT", "HEIG", "HIGH", "HT")
+                ci_qty  = find_col("QTY", "QUANTITY", "COUNT")
+                ci_size = find_col("SIZE", "DIMENSION", "ROUGH OPENING", "R.O.")
+
+                # Decide window vs door for this table
+                is_door = "DOOR" in header
+                is_win  = "WINDOW" in header or "WINDOW SCHEDULE" in text
+
+                # Need either explicit W/H columns, or a combined SIZE column
+                if ci_w is None and ci_h is None and ci_size is None:
+                    continue
+
+                for row in table[1:]:
+                    if not row:
+                        continue
+                    w_ft = h_ft = 0.0
+                    if ci_w is not None and ci_h is not None:
+                        if max(ci_w, ci_h) >= len(row):
+                            continue
+                        w_ft = parse_ft_in(row[ci_w])
+                        h_ft = parse_ft_in(row[ci_h])
+                    elif ci_size is not None and ci_size < len(row):
+                        # combined "4'-0" x 6'-0"" style
+                        parts = re.split(r"[xX×]", str(row[ci_size] or ""))
+                        if len(parts) == 2:
+                            w_ft = parse_ft_in(parts[0])
+                            h_ft = parse_ft_in(parts[1])
+                    if w_ft <= 0 or h_ft <= 0 or w_ft > 60 or h_ft > 60:
+                        continue
+
+                    qty = 1
+                    if ci_qty is not None and ci_qty < len(row):
+                        qm = re.search(r"\d+", str(row[ci_qty] or ""))
+                        if qm:
+                            qty = int(qm.group(0))
+                    mark = "?"
+                    if ci_mark is not None and ci_mark < len(row) and row[ci_mark]:
+                        mark = str(row[ci_mark]).strip()[:12]
+
+                    entry = {"mark": mark, "width_ft": round(w_ft, 2), "height_ft": round(h_ft, 2),
+                             "qty": qty, "area_sf": round(w_ft * h_ft * qty, 1)}
+                    (doors if is_door else windows).append(entry)
+    except Exception as e:
+        print(f"  Schedule extraction failed: {e}")
+
+    total = sum(e["area_sf"] for e in windows) + sum(e["area_sf"] for e in doors)
+    return {"windows": windows, "doors": doors, "total_opening_sf": round(total, 1)}
+
+
+# ── YOLO opening detection (optional — needs a custom-trained model) ──────────
+_yolo_model = None
+def detect_openings_yolo(pdf_bytes: bytes, page_number: int) -> list:
+    """
+    Detect windows/doors with a YOLO model.
+    IMPORTANT: stock COCO YOLO does NOT recognize drawing windows/doors, so this
+    is a no-op until YOLO_OPENING_MODEL points to a model trained on elevations.
+    Until then, opening detection comes from the schedule + Claude Vision, which
+    are more accurate anyway.
+    """
+    global _yolo_model
+    model_path = os.environ.get("YOLO_OPENING_MODEL")
+    if not model_path or not os.path.exists(model_path):
+        return []
+    try:
+        from ultralytics import YOLO
+        if _yolo_model is None:
+            _yolo_model = YOLO(model_path)
+        doc  = fitz.open(stream=pdf_bytes, filetype="pdf")
+        page = doc[page_number - 1]
+        pw, ph = page.rect.width, page.rect.height
+        pix  = page.get_pixmap(matrix=fitz.Matrix(2, 2))
+        img  = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)
+        if pix.n == 4:
+            img = cv2.cvtColor(img, cv2.COLOR_RGBA2RGB)
+        doc.close()
+        out = []
+        for r in _yolo_model(img, verbose=False):
+            for b in r.boxes:
+                x0, y0, x1, y1 = b.xyxyn[0].tolist()
+                cls = int(b.cls[0]); conf = float(b.conf[0])
+                out.append({"bbox": [round(x0,4), round(y0,4), round(x1,4), round(y1,4)],
+                            "type": _yolo_model.names.get(cls, "opening"), "confidence": round(conf,3)})
+        return out
+    except Exception as e:
+        print(f"  YOLO opening detection failed: {e}")
+        return []
 
 
 # ── Coordinate helpers ────────────────────────────────────────────────────────
@@ -470,6 +617,64 @@ Allowed material_type values: brick, metal_panel, acm_panel, glass, door, concre
         return []
 
 
+# ── Comprehensive drawing reader (Claude Vision) ──────────────────────────────
+def claude_read_drawing(pdf_bytes: bytes, page_number: int) -> dict:
+    """
+    One smart 'understand this sheet' pass. Returns structured metadata:
+    sheet type, elevation name, scale, building dimensions, material legend.
+    This is what makes the system READ a drawing instead of just measuring pixels.
+    """
+    import anthropic
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    if not api_key:
+        return {}
+
+    doc  = fitz.open(stream=pdf_bytes, filetype="pdf")
+    page = doc[page_number - 1]
+    pix  = page.get_pixmap(matrix=fitz.Matrix(2, 2))
+    img_b64 = base64.b64encode(pix.tobytes("jpeg", jpg_quality=88)).decode()
+    doc.close()
+
+    client = anthropic.Anthropic(api_key=api_key)
+    prompt = """You are reading ONE sheet from an architectural drawing set for a facade/siding estimator.
+Read the sheet like an experienced estimator and extract structured metadata. Return ONLY JSON.
+
+Extract:
+1. sheet_type: one of "elevation","floor_plan","section","detail","schedule","cover","site","other"
+2. elevation_name: if an elevation, which face (e.g. "North Elevation","South","Front","Rear","East","West") else null
+3. scale: the drawing scale EXACTLY as printed in the title block, e.g. "1/8\\"=1'-0\\"" or "3/16\\"=1'-0\\"". null if none.
+4. building_dimensions: read PRINTED dimension strings. Give overall_width_ft, overall_height_ft, floor_to_floor_ft as numbers (decimal feet). Use null for any you cannot read.
+5. material_legend: from any legend / keynotes / material notes, list {key, description} mapping a tag or hatch to a material (e.g. {"key":"3","description":"ACM Panel, silver"}).
+6. has_window_door_schedule: true if a window or door schedule TABLE is on this sheet.
+7. confidence: 0.0-1.0 overall.
+8. notes: one short sentence.
+
+Return ONLY this JSON (no markdown):
+{"sheet_type":"...","elevation_name":null,"scale":null,
+ "building_dimensions":{"overall_width_ft":null,"overall_height_ft":null,"floor_to_floor_ft":null},
+ "material_legend":[],"has_window_door_schedule":false,"confidence":0.0,"notes":""}"""
+
+    try:
+        resp = client.messages.create(
+            model=CLAUDE_MODEL, max_tokens=1536,
+            messages=[{"role": "user", "content": [
+                {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": img_b64}},
+                {"type": "text", "text": prompt},
+            ]}])
+        text = resp.content[0].text.strip()
+        m = re.search(r"```(?:json)?\s*([\s\S]+?)\s*```", text)
+        if m: text = m.group(1)
+        m = re.search(r"\{[\s\S]+\}", text)
+        if m: text = m.group(0)
+        data = json.loads(text)
+        print(f"  Drawing read: type={data.get('sheet_type')} scale={data.get('scale')} "
+              f"elev={data.get('elevation_name')} conf={data.get('confidence')}")
+        return data
+    except Exception as e:
+        print(f"  Drawing read failed: {e}")
+        return {}
+
+
 # ── SAM fallback (raster/scanned PDFs) ───────────────────────────────────────
 def decode_image(b64: str) -> np.ndarray:
     data = base64.b64decode(b64)
@@ -672,10 +877,68 @@ def get_page_polygons(req: PolygonRequest):
     return {"polygons": [], "width": pw, "height": ph, "count": 0, "method": "none"}
 
 
+@app.post("/analyze")
+def analyze_drawing(req: AnalyzeRequest):
+    """
+    Smart Drawing Reader — one comprehensive 'understand this sheet' call.
+    Combines:
+      - Claude Vision read   → sheet type, elevation name, scale, dimensions, legend
+      - pdfplumber schedules → exact window/door opening sizes
+      - EasyOCR fallback     → scale if Vision missed it
+    Returns everything the estimator needs to set up an accurate takeoff.
+    """
+    pdf_bytes = base64.b64decode(req.pdf_b64)
+    page_number = req.page_number
+
+    # 1. Comprehensive Claude Vision read
+    meta = claude_read_drawing(pdf_bytes, page_number)
+
+    # 2. Exact opening sizes from schedules
+    schedules = extract_schedules(pdf_bytes, page_number)
+
+    # 3. Resolve scale: Vision → EasyOCR → default
+    scale_str = meta.get("scale")
+    scale_source = "claude_vision"
+    if not scale_str:
+        scale_str = detect_scale_ocr(pdf_bytes, page_number)
+        scale_source = "easyocr" if scale_str else "default"
+    ft_per_inch = parse_scale_str(scale_str) if scale_str else 8.0
+
+    # 4. Optional YOLO openings (no-op unless a trained model is configured)
+    yolo_openings = detect_openings_yolo(pdf_bytes, page_number)
+
+    bd = meta.get("building_dimensions") or {}
+    # Sanity estimate of facade area from printed dims (for cross-checking later)
+    expected_facade_sf = None
+    if bd.get("overall_width_ft") and bd.get("overall_height_ft"):
+        try:
+            expected_facade_sf = round(float(bd["overall_width_ft"]) * float(bd["overall_height_ft"]), 1)
+        except (TypeError, ValueError):
+            pass
+
+    return {
+        "sheet_type":          meta.get("sheet_type"),
+        "is_elevation":        meta.get("sheet_type") == "elevation",
+        "elevation_name":      meta.get("elevation_name"),
+        "scale":               scale_str,
+        "scale_source":        scale_source,
+        "ft_per_inch":         round(ft_per_inch, 3),
+        "building_dimensions": bd,
+        "expected_facade_sf":  expected_facade_sf,
+        "material_legend":     meta.get("material_legend", []),
+        "schedules":           schedules,
+        "schedule_opening_sf": schedules.get("total_opening_sf", 0.0),
+        "yolo_openings":       yolo_openings,
+        "confidence":          meta.get("confidence"),
+        "notes":               meta.get("notes"),
+    }
+
+
 @app.get("/health")
 def health():
     return {"status": "ok", "device": device, "claude_model": CLAUDE_MODEL,
-            "capabilities": ["bluebeam", "vector_cluster", "claude_vision", "sam", "easyocr_scale", "shapely"]}
+            "capabilities": ["bluebeam", "vector_cluster", "claude_vision", "sam",
+                             "easyocr_scale", "shapely", "drawing_reader", "schedule_extract", "yolo_ready"]}
 
 
 if __name__ == "__main__":
