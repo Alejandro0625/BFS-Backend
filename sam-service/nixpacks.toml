@@ -1,0 +1,17 @@
+[phases.setup]
+nixPkgs = ["python312", "libgl1", "libglib2.0-0", "wget"]
+
+[phases.install]
+cmds = [
+  "pip install -r requirements.txt",
+  "mkdir -p /data/sam",
+  "wget -q -O /data/sam/sam_vit_b_01ec64.pth https://dl.fbaipublicfiles.com/segment_anything/sam_vit_b_01ec64.pth"
+]
+
+[start]
+cmd = "python sam_service.py"
+
+[variables]
+SAM_CHECKPOINT = "/data/sam/sam_vit_b_01ec64.pth"
+SAM_MEMORY = "/data/sam_memory.json"
+PORT = "8001"
