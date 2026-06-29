@@ -13,3 +13,4 @@ pillow==12.2.0
 requests==2.34.2
 shapely==2.0.6
 ultralytics==8.3.40
+easyocr==1.7.2
