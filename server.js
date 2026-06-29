@@ -95,7 +95,7 @@ async function claude(content, system, retries = 6) {
         "anthropic-version": "2023-06-01",
       },
       body: JSON.stringify({
-        model: "claude-opus-4-5",
+        model: "claude-opus-4-8",
         max_tokens: 4000,
         system,
         messages: [{ role: "user", content }],
@@ -404,12 +404,38 @@ async function runAnalysis(job, pdfPath, originalName) {
       jobLog(job, "SAM service not reachable — using Claude estimates (less accurate)", "warn");
     }
 
+    // Read the PDF bytes once for the Smart Drawing Reader + SAM measurement
+    const pdfB64Full = fs.readFileSync(pdfPath).toString("base64");
+
     for (let i = 0; i < elevPages.length; i++) {
       const { p, type } = elevPages[i];
       job.progress = { label: "Page " + (i + 1) + " of " + elevPages.length, pct: 32 + Math.round((i / elevPages.length) * 60) };
 
       // Render at 1.5x for Claude reading, and separately at SAM DPI if needed
       const { canvas, b64 } = await renderPageOnce(pdfDoc, p, 1.5);
+
+      // ── Smart Drawing Reader: verified scale, dimensions, exact schedule openings ──
+      let drawingMeta = null;
+      if (samAvailable) {
+        try {
+          const aRes = await fetch(SAM_URL + "/analyze", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ pdf_b64: pdfB64Full, page_number: p }),
+            signal: AbortSignal.timeout(120000),
+          });
+          if (aRes.ok) {
+            drawingMeta = await aRes.json();
+            const sc = drawingMeta.scale ? drawingMeta.scale + " [" + drawingMeta.scale_source + "]" : "not found";
+            jobLog(job, "  Page " + p + ": drawing read — scale " + sc +
+              (drawingMeta.elevation_name ? ", " + drawingMeta.elevation_name : "") +
+              (drawingMeta.expected_facade_sf ? ", ~" + drawingMeta.expected_facade_sf + " SF gross face" : ""), "dim");
+            if (drawingMeta.schedule_opening_sf > 0) {
+              jobLog(job, "  Page " + p + ": window/door schedule = " + drawingMeta.schedule_opening_sf + " SF exact openings", "ok");
+            }
+          }
+        } catch(e) { /* drawing reader is non-critical */ }
+      }
 
       // Claude identifies WHERE materials are + bounding boxes (not SF — SAM handles that)
       const prompt = [
@@ -474,6 +500,18 @@ async function runAnalysis(job, pdfPath, originalName) {
         });
       });
 
+      // Attach drawing intelligence for measurement + sanity checks
+      if (drawingMeta) {
+        parsed.elevations.forEach(e => {
+          e.verifiedScale      = drawingMeta.scale;
+          e.scaleSource        = drawingMeta.scale_source;
+          e.buildingDimensions = drawingMeta.building_dimensions;
+          e.expectedFacadeSF   = drawingMeta.expected_facade_sf;
+          e.scheduleOpenings   = drawingMeta.schedules;
+          e.scheduleOpeningSF  = drawingMeta.schedule_opening_sf;
+        });
+      }
+
       // ── SAM measurement: replace Claude SF estimates with pixel-accurate values ──
       if (samAvailable) {
         try {
@@ -498,11 +536,11 @@ async function runAnalysis(job, pdfPath, originalName) {
 
           if (allZones.length > 0) {
             jobLog(job, "  Page " + p + ": measuring zones (vector-first)...", "dim");
-            const scale = parsed.elevations[0]?.scale || "1/8\"=1'-0\"";
+            // Prefer the verified scale from the Smart Drawing Reader
+            const scale = drawingMeta?.scale || parsed.elevations[0]?.scale || "1/8\"=1'-0\"";
 
-            // Send raw PDF page bytes so the service can extract vector geometry
-            const pdfPageBytes = fs.readFileSync(pdfPath);
-            const pdfB64 = pdfPageBytes.toString("base64");
+            // Reuse the PDF bytes read once above (service extracts vector geometry)
+            const pdfB64 = pdfB64Full;
 
             const samRes = await fetch(SAM_URL + "/measure", {
               method: "POST",
@@ -545,7 +583,7 @@ async function runAnalysis(job, pdfPath, originalName) {
               body: JSON.stringify({
                 pdf_b64: pdfB64,
                 page_number: p,
-                scale_str: parsed.elevations[0]?.scale || "1/8\"=1'-0\"",
+                scale_str: drawingMeta?.scale || parsed.elevations[0]?.scale || "1/8\"=1'-0\"",
               }),
               signal: AbortSignal.timeout(30000),
             });
@@ -559,6 +597,18 @@ async function runAnalysis(job, pdfPath, originalName) {
 
         } catch(samErr) {
           jobLog(job, "  Page " + p + ": SAM call failed (" + samErr.message + ") — keeping Claude estimates", "warn");
+        }
+      }
+
+      // Sanity check: measured panel SF must not EXCEED the whole building face
+      // (panel is a subset of the facade, so over-shooting it signals a scale error)
+      if (drawingMeta?.expected_facade_sf) {
+        const measuredNet = parsed.elevations.reduce((s, e) =>
+          s + (e.zones || []).reduce((a, z) => a + (z.netArea || 0), 0), 0);
+        if (measuredNet > drawingMeta.expected_facade_sf * 1.4) {
+          jobLog(job, "  ⚠ Page " + p + ": measured " + Math.round(measuredNet) +
+            " SF panel exceeds ~" + drawingMeta.expected_facade_sf +
+            " SF building face — likely a SCALE error, verify before bidding", "warn");
         }
       }
 
