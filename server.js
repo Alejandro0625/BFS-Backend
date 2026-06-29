@@ -22,6 +22,7 @@ app.use(cors());
 app.use(express.json({ limit: "10mb" }));
 
 const API_KEY = process.env.ANTHROPIC_API_KEY;
+const SAM_URL = process.env.SAM_SERVICE_URL || "http://localhost:8001";
 const jobs = {};
 
 function createJob(id) {
@@ -353,6 +354,8 @@ async function runAnalysis(job, pdfPath, originalName) {
     job.soffitNotes = soffitNotes;
 
     // ── STEP 5: Analyze each elevation ───────────────────────────────────────
+    // Claude identifies WHERE materials are (bounding boxes).
+    // SAM measures HOW MUCH (pixel-accurate SF). This is the accuracy fix.
     job.phase = "analyzing";
     const elevPages = [
       ...relevant.exteriorElevations.map(p => ({ p, type: "elevation" })),
@@ -364,44 +367,60 @@ async function runAnalysis(job, pdfPath, originalName) {
     const legendCtx = legend.length ? "PANEL MATERIAL LEGEND: " + JSON.stringify(legend) : "Identify panel materials from callouts and labels on the drawing.";
     const soffitCtx = soffitNotes.length ? "\nSOFFIT/RETURN NOTES FROM FLOOR PLANS: " + JSON.stringify(soffitNotes) : "";
 
+    // Check if SAM service is available
+    let samAvailable = false;
+    try {
+      const healthRes = await fetch(SAM_URL + "/health", { signal: AbortSignal.timeout(5000) });
+      samAvailable = healthRes.ok;
+      if (samAvailable) jobLog(job, "SAM measurement service connected ✓", "ok");
+    } catch(e) {
+      jobLog(job, "SAM service not reachable — using Claude estimates (less accurate)", "warn");
+    }
+
     for (let i = 0; i < elevPages.length; i++) {
       const { p, type } = elevPages[i];
       job.progress = { label: "Page " + (i + 1) + " of " + elevPages.length, pct: 32 + Math.round((i / elevPages.length) * 60) };
 
+      // Render at 1.5x for Claude reading, and separately at SAM DPI if needed
       const { canvas, b64 } = await renderPageOnce(pdfDoc, p, 1.5);
 
+      // Claude identifies WHERE materials are + bounding boxes (not SF — SAM handles that)
       const prompt = [
-        "You are a senior commercial PANEL SIDING estimator performing a precise material takeoff.",
+        "You are a senior commercial PANEL SIDING estimator identifying material zones.",
         "",
         legendCtx,
         soffitCtx,
         "",
         "Page " + p + " — " + type + ".",
         "",
-        "CRITICAL RULE: Only measure areas where panel material is ACTUALLY SHOWN on the drawing.",
-        "Do NOT measure the entire wall. Look for material callouts, hatch patterns, or labeled zones.",
-        "If the lower half of a wall has overhead doors and no panel callout — do NOT include it.",
+        "TASK: Identify every zone where panel material is shown. For each zone give an APPROXIMATE BOUNDING BOX as % of the image (0-100).",
+        "Do NOT calculate SF — our measurement system will handle that precisely.",
+        "Focus on WHERE each material zone is located and WHAT material it is.",
         "",
-        "TAKEOFF PROCESS:",
-        "1. Read the drawing TITLE and SHEET REFERENCE from the title block",
-        "2. Read the SCALE printed on the drawing:",
-        "   - 1/8 inch = 1 foot: every inch on paper = 8 real feet",
-        "   - 1/4 inch = 1 foot: every inch on paper = 4 real feet",
-        "   - 1/16 inch = 1 foot: every inch on paper = 16 real feet",
-        "3. Find each zone where panel material is CALLED OUT or SHOWN:",
-        "   - Look for material labels/callouts pointing to specific wall areas",
-        "   - Look for hatch patterns or shading indicating panel material",
-        "   - Measure ONLY those specific zones using the scale",
-        "   - GROSS = width x height of that specific zone in SF",
-        "   - Subtract openings WITHIN that zone: windows, doors, louvers",
-        "   - NET = Gross minus openings",
-        "4. OVERHEAD/GARAGE DOORS: large openings typically 10x10 to 14x14 feet — always deduct",
-        "5. SOFFITS: underside of overhangs — width x depth = SF",
-        "6. RETURNS: corner wraps — height x depth = SF",
-        "7. IGNORE: brick, masonry, stone, EIFS, stucco, concrete, glass, curtainwall, roofing",
-        "8. BUILDING SECTION or WALL SECTION — return 0 zones",
+        "RULES:",
+        "- Only zones with a material callout, label, hatch pattern, or clear indicator",
+        "- IGNORE: brick, masonry, stone, EIFS, stucco, concrete, glass, curtainwall, roofing",
+        "- BUILDING SECTION or WALL SECTION → return 0 zones",
+        "- Read the SCALE from the title block (e.g. 1/8\"=1'-0\")",
+        "- Each separate elevation view on the page = separate entry in elevations array",
+        "- Soffits and returns get their own zone with category 'Soffit Panel' or 'Return/Trim'",
         "",
-        'Return ONLY valid JSON: {"pageNumber":' + p + ',"elevations":[{"title":"","sheetRef":"","scale":"","building":"","direction":"","zones":[{"materialId":"","materialName":"","category":"","description":"","grossArea":0,"totalOpeningArea":0,"netArea":0}],"flags":[]}]}'
+        'Return ONLY valid JSON:',
+        '{"pageNumber":' + p + ',"elevations":[{',
+        '  "title":"South Elevation",',
+        '  "sheetRef":"A2.1",',
+        '  "scale":"1/8\\"=1\'-0\\"",',
+        '  "building":"",',
+        '  "zones":[{',
+        '    "zoneId":0,',
+        '    "materialId":"P-1",',
+        '    "materialName":"ACM Panel",',
+        '    "category":"ACM Panel",',
+        '    "description":"Upper wall panels",',
+        '    "x0pct":5,"y0pct":10,"x1pct":68,"y1pct":55',
+        '  }],',
+        '  "flags":[]',
+        '}]}',
       ].join("\n");
 
       const raw = await claude(
@@ -409,35 +428,99 @@ async function runAnalysis(job, pdfPath, originalName) {
           { type: "image", source: { type: "base64", media_type: "image/jpeg", data: b64 } },
           { type: "text", text: prompt },
         ],
-        "Senior commercial panel siding estimator. Precise Bluebeam-style takeoffs. Focus ONLY on panel cladding materials. Return ONLY valid JSON."
+        "Senior commercial panel siding estimator. Identify material zones with bounding boxes. Return ONLY valid JSON."
       );
 
       const parsed = parseJSON(raw);
-      if (parsed && parsed.elevations && parsed.elevations.length) {
-        parsed.elevations.forEach(e => {
-          e.pageNumber = p;
-          e.zones = (e.zones || []).filter(z => {
-            const n = (z.materialName || "").toLowerCase();
-            return !IGNORE_MATERIALS.some(ig => n.includes(ig));
-          });
+      if (!parsed || !parsed.elevations || !parsed.elevations.length) {
+        jobLog(job, "  Page " + p + ": could not read — manual review needed", "warn");
+        canvas.width = 0; canvas.height = 0;
+        continue;
+      }
+
+      // Filter ignored materials
+      parsed.elevations.forEach(e => {
+        e.pageNumber = p;
+        e.zones = (e.zones || []).filter(z => {
+          const n = (z.materialName || "").toLowerCase();
+          return !IGNORE_MATERIALS.some(ig => n.includes(ig));
         });
+      });
 
-        job.takeoffData.push(...parsed.elevations);
+      // ── SAM measurement: replace Claude SF estimates with pixel-accurate values ──
+      if (samAvailable) {
+        try {
+          // Render at 150 DPI for SAM (consistent with sam_service.py)
+          const { canvas: samCanvas, b64: samB64 } = await renderPageOnce(pdfDoc, p, 150 / 72);
 
-        for (const elev of parsed.elevations) {
-          const sf = (elev.zones || []).reduce((s, z) => s + (z.netArea || 0), 0);
-          if (sf > 0) {
-            try {
-              await addEvidencePage(outputPdf, canvas, elev);
-              jobLog(job, "  ✓ " + elev.title + " (" + elev.sheetRef + ") — " + Math.round(sf) + " SF", "ok");
-            } catch(e) {
-              jobLog(job, "  ✓ " + elev.title + " — " + Math.round(sf) + " SF", "ok");
+          // Collect all zones across all elevations on this page
+          const allZones = [];
+          parsed.elevations.forEach(elev => {
+            (elev.zones || []).forEach((z, zi) => {
+              if (z.x0pct !== undefined) {
+                allZones.push({
+                  id: allZones.length,
+                  elevIdx: parsed.elevations.indexOf(elev),
+                  zoneIdx: zi,
+                  x0pct: z.x0pct, y0pct: z.y0pct,
+                  x1pct: z.x1pct, y1pct: z.y1pct,
+                });
+              }
+            });
+          });
+
+          if (allZones.length > 0) {
+            jobLog(job, "  Page " + p + ": sending " + allZones.length + " zone(s) to SAM...", "dim");
+            const scale = parsed.elevations[0]?.scale || "1/8\"=1'-0\"";
+
+            const samRes = await fetch(SAM_URL + "/measure", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                image_b64: samB64,
+                zones: allZones.map(z => ({ id: z.id, x0pct: z.x0pct, y0pct: z.y0pct, x1pct: z.x1pct, y1pct: z.y1pct })),
+                scale_str: scale,
+                dpi: 150,
+              }),
+              signal: AbortSignal.timeout(300000), // 5 min — SAM takes time
+            });
+
+            if (samRes.ok) {
+              const samData = await samRes.json();
+              // Write accurate SF back into parsed zones
+              samData.zones.forEach(sz => {
+                const mapping = allZones[sz.id];
+                if (!mapping) return;
+                const zone = parsed.elevations[mapping.elevIdx].zones[mapping.zoneIdx];
+                zone.grossArea       = sz.gross_sf;
+                zone.totalOpeningArea = sz.opening_sf;
+                zone.netArea         = sz.net_sf;
+              });
+              jobLog(job, "  Page " + p + ": SAM measurement complete ✓", "ok");
+            } else {
+              jobLog(job, "  Page " + p + ": SAM returned error — keeping Claude estimates", "warn");
             }
           }
-          (elev.flags || []).filter(Boolean).forEach(f => jobLog(job, "    ⚠ " + f, "warn"));
+
+          samCanvas.width = 0; samCanvas.height = 0;
+        } catch(samErr) {
+          jobLog(job, "  Page " + p + ": SAM call failed (" + samErr.message + ") — keeping Claude estimates", "warn");
         }
-      } else {
-        jobLog(job, "  Page " + p + ": could not read — manual review needed", "warn");
+      }
+
+      job.takeoffData.push(...parsed.elevations);
+
+      for (const elev of parsed.elevations) {
+        const sf = (elev.zones || []).reduce((s, z) => s + (z.netArea || 0), 0);
+        if (sf > 0) {
+          try {
+            await addEvidencePage(outputPdf, canvas, elev);
+            jobLog(job, "  ✓ " + elev.title + " (" + (elev.sheetRef || "p." + p) + ") — " + Math.round(sf) + " SF net" + (samAvailable ? " [SAM]" : " [est]"), "ok");
+          } catch(e) {
+            jobLog(job, "  ✓ " + elev.title + " — " + Math.round(sf) + " SF", "ok");
+          }
+        }
+        (elev.flags || []).filter(Boolean).forEach(f => jobLog(job, "    ⚠ " + f, "warn"));
       }
 
       canvas.width = 0; canvas.height = 0;
