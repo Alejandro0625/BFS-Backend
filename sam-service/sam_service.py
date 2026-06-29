@@ -67,6 +67,11 @@ class ZoneBox(BaseModel):
     x1pct: float
     y1pct: float
 
+class PolygonRequest(BaseModel):
+    pdf_b64: str
+    page_number: int = 1
+    scale_str: Optional[str] = "1/8\"=1'-0\""
+
 class MeasureRequest(BaseModel):
     image_b64: str
     pdf_b64: Optional[str] = None   # raw PDF bytes base64 — enables vector extraction
@@ -366,6 +371,77 @@ def measure(req: MeasureRequest):
         out.append(ZoneResult(id=z.id, method=method, **r))
 
     return MeasureResponse(zones=out, method=method)
+
+
+@app.post("/polygons")
+def get_page_polygons(req: PolygonRequest):
+    """
+    Extract all significant closed vector shapes from a PDF page.
+    Returns polygon contours as normalized [0-1] coords so the frontend
+    can draw SVG overlays aligned to the rendered page image.
+    """
+    pdf_bytes = base64.b64decode(req.pdf_b64)
+    ft_per_inch = scale_to_ft_per_inch(req.scale_str or "")
+
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    page = doc[req.page_number - 1]
+    pw, ph = page.rect.width, page.rect.height
+    drawings = page.get_drawings()
+    doc.close()
+
+    MIN_AREA_PTS = 300  # ~4 SF at 1/8"=1'-0" — filters dimension lines & text boxes
+
+    raw = []
+    for d in drawings:
+        r = d.get("rect")
+        if r is None:
+            continue
+        r = fitz.Rect(r)
+        if r.is_empty or r.width < 12 or r.height < 12:
+            continue
+
+        # Build polygon vertices from drawing path items
+        pts = []
+        for item in d.get("items", []):
+            if item[0] == "l":
+                pts.append([float(item[1].x), float(item[1].y)])
+            elif item[0] == "c":   # bezier curve — use endpoint
+                pts.append([float(item[3].x), float(item[3].y)])
+            elif item[0] == "re":  # rectangle item
+                rr = fitz.Rect(item[1])
+                pts = [[rr.x0, rr.y0], [rr.x1, rr.y0], [rr.x1, rr.y1], [rr.x0, rr.y1]]
+                break
+
+        if len(pts) < 3:
+            # Fall back to bounding rect
+            pts = [[r.x0, r.y0], [r.x1, r.y0], [r.x1, r.y1], [r.x0, r.y1]]
+
+        poly_area = polygon_area(pts)
+        if poly_area < MIN_AREA_PTS:
+            continue
+
+        area_sf = round(pdf_pts_to_sf(poly_area, ft_per_inch), 1)
+        # Normalize coords to 0-1 range
+        norm = [[round(x / pw, 4), round(y / ph, 4)] for x, y in pts]
+        cx = round(sum(p[0] for p in norm) / len(norm), 4)
+        cy = round(sum(p[1] for p in norm) / len(norm), 4)
+
+        raw.append({
+            "id": len(raw),
+            "points": norm,
+            "area_sf": area_sf,
+            "cx": cx, "cy": cy,
+            "bbox": [round(r.x0/pw,4), round(r.y0/ph,4), round(r.x1/pw,4), round(r.y1/ph,4)],
+        })
+
+    # Largest shapes first; cap at 60 (title blocks, dim lines already filtered by size)
+    raw.sort(key=lambda p: p["area_sf"], reverse=True)
+    raw = raw[:60]
+    for i, p in enumerate(raw):
+        p["id"] = i
+
+    print(f"/polygons: page {req.page_number} → {len(raw)} polygons  (pw={pw:.0f} ph={ph:.0f})")
+    return {"polygons": raw, "page_width": pw, "page_height": ph, "count": len(raw)}
 
 
 @app.get("/health")
