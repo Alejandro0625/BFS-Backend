@@ -554,14 +554,140 @@ def extract_bluebeam_polygons(pdf_bytes: bytes, page_number: int, ft_per_inch: f
     return results
 
 
+def claude_vision_segment(pdf_bytes: bytes, page_number: int, ft_per_inch: float) -> list:
+    """
+    Use Claude Vision to identify distinct surface material regions in an architectural elevation.
+    Works on any PDF — blank, raster, scanned. Claude reads the visual hatching patterns.
+    Returns polygon list in the same format as other methods.
+    """
+    import anthropic, re as _re
+
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    if not api_key:
+        return []
+
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    page = doc[page_number - 1]
+    pw, ph = page.rect.width, page.rect.height
+    mat = fitz.Matrix(2, 2)  # ~144 DPI render
+    pix = page.get_pixmap(matrix=mat)
+    img_b64 = base64.b64encode(pix.tobytes("jpeg", jpg_quality=85)).decode()
+    doc.close()
+
+    client = anthropic.Anthropic(api_key=api_key)
+
+    prompt = """This is an architectural exterior elevation drawing. Identify every distinct surface material region visible in the ELEVATION VIEWS only (ignore title block, notes column, revision box, scale bar, north arrow).
+
+Common material patterns in architectural drawings:
+- Brick / masonry: horizontal lines with staggered vertical joints (classic brick hatching)
+- Metal panels / ACM: smooth rectangles divided by thin panel joint lines
+- Glass / windows / doors: rectangular cutouts, often shown with diagonal lines or simply outlined
+- Concrete / EIFS / stucco: plain, lightly textured, or stippled fill
+- Ribbed / corrugated metal: closely spaced parallel horizontal or vertical lines
+- Soffit: horizontal underside surfaces, often a separate material
+
+For each distinct material region, trace its full boundary as a polygon.
+
+Return ONLY valid JSON, no other text:
+{
+  "regions": [
+    {
+      "material_type": "brick",
+      "polygon": [[0.05,0.10],[0.45,0.10],[0.45,0.80],[0.05,0.80]],
+      "confidence": 0.9
+    },
+    {
+      "material_type": "metal_panel",
+      "polygon": [[0.46,0.10],[0.90,0.10],[0.90,0.80],[0.46,0.80]],
+      "confidence": 0.85
+    }
+  ]
+}
+
+Coordinate rules:
+- (0,0) = top-left corner of the IMAGE, (1,1) = bottom-right corner
+- Cover the FULL height and width of each material area — roof line to ground line
+- Multiple disconnected areas of the same material = separate polygon entries
+- Minimum 4 vertices per polygon; use more for L-shapes or complex outlines
+- If an elevation has clearly separate upper/lower material bands, trace each band separately"""
+
+    try:
+        resp = client.messages.create(
+            model="claude-opus-4-5",
+            max_tokens=3000,
+            messages=[{
+                "role": "user",
+                "content": [
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": img_b64}},
+                    {"type": "text", "text": prompt}
+                ]
+            }]
+        )
+
+        text = resp.content[0].text.strip()
+        m = _re.search(r"```(?:json)?\s*([\s\S]+?)\s*```", text)
+        if m:
+            text = m.group(1)
+
+        data = json.loads(text)
+        regions = data.get("regions", [])
+        if not regions:
+            return []
+
+        mat_to_cluster: dict = {}
+        cluster_counter = 0
+        result = []
+
+        for region in regions:
+            mat_type = region.get("material_type", "unknown").lower().strip()
+            poly = region.get("polygon", [])
+            if len(poly) < 3:
+                continue
+
+            if mat_type not in mat_to_cluster:
+                mat_to_cluster[mat_type] = cluster_counter
+                cluster_counter += 1
+            cluster_id = mat_to_cluster[mat_type]
+
+            # Area: normalized coords × page area in pts²
+            norm_area = polygon_area(poly)
+            area_sf = round(pdf_pts_to_sf(norm_area * pw * ph, ft_per_inch), 1)
+
+            cx = round(sum(p[0] for p in poly) / len(poly), 4)
+            cy = round(sum(p[1] for p in poly) / len(poly), 4)
+
+            result.append({
+                "id":            len(result),
+                "points":        [[round(x, 4), round(y, 4)] for x, y in poly],
+                "area_sf":       area_sf,
+                "cx":            cx,
+                "cy":            cy,
+                "bbox":          [round(min(p[0] for p in poly), 4),
+                                  round(min(p[1] for p in poly), 4),
+                                  round(max(p[0] for p in poly), 4),
+                                  round(max(p[1] for p in poly), 4)],
+                "source":        "claude_vision",
+                "cluster_id":    cluster_id,
+                "material_type": mat_type,
+            })
+
+        print(f"  Claude Vision: {len(result)} regions across {len(mat_to_cluster)} material types")
+        return result
+
+    except Exception as e:
+        print(f"  Claude Vision segmentation failed: {e}")
+        return []
+
+
 @app.post("/polygons")
 def get_page_polygons(req: PolygonRequest):
     """
     Extract surface polygons from a PDF page.
 
     Priority:
-      1. Bluebeam/PDF polygon annotations  — exact shapes + SF from estimator's markup
-      2. Vector paths from CAD PDF          — exact geometry, SF from scale
+      1. Bluebeam/PDF polygon annotations  — exact shapes + SF from estimator markup
+      2. CAD vector fill clustering         — exact geometry, SF from scale
+      3. Claude Vision segmentation         — reads hatching patterns, works on any PDF
     """
     pdf_bytes = base64.b64decode(req.pdf_b64)
     ft_per_inch = scale_to_ft_per_inch(req.scale_str or "")
@@ -593,53 +719,18 @@ def get_page_polygons(req: PolygonRequest):
                 "count": len(clustered), "method": "vector_cluster",
                 "num_clusters": n_clusters}
 
-    # ── Priority 3: Large-polygon fallback ────────────────────────────────────
-    raw = []
-    for d in drawings:
-        r = d.get("rect")
-        if r is None:
-            continue
-        r = fitz.Rect(r)
-        if r.is_empty or r.width < 12 or r.height < 12:
-            continue
+    # ── Priority 3: Claude Vision — reads hatching patterns on blank PDFs ───
+    print(f"/polygons [claude-vision]: page {req.page_number} — sending to Claude Vision")
+    vision = claude_vision_segment(pdf_bytes, req.page_number, ft_per_inch)
+    if vision:
+        n_clusters = len(set(p["cluster_id"] for p in vision))
+        return {"polygons": vision, "page_width": pw, "page_height": ph,
+                "count": len(vision), "method": "claude_vision",
+                "num_clusters": n_clusters}
 
-        pts = []
-        for item in d.get("items", []):
-            if item[0] == "l":
-                pts.append([float(item[1].x), float(item[1].y)])
-            elif item[0] == "c":
-                pts.append([float(item[3].x), float(item[3].y)])
-            elif item[0] == "re":
-                rr = fitz.Rect(item[1])
-                pts = [[rr.x0, rr.y0], [rr.x1, rr.y0], [rr.x1, rr.y1], [rr.x0, rr.y1]]
-                break
-
-        if len(pts) < 3:
-            pts = [[r.x0, r.y0], [r.x1, r.y0], [r.x1, r.y1], [r.x0, r.y1]]
-
-        poly_area = polygon_area(pts)
-        if poly_area < 300:
-            continue
-
-        area_sf = round(pdf_pts_to_sf(poly_area, ft_per_inch), 1)
-        norm = [[round(x / pw, 4), round(y / ph, 4)] for x, y in pts]
-        cx   = round(sum(p[0] for p in norm) / len(norm), 4)
-        cy   = round(sum(p[1] for p in norm) / len(norm), 4)
-        raw.append({
-            "id": len(raw), "points": norm, "area_sf": area_sf,
-            "cx": cx, "cy": cy,
-            "bbox": [round(r.x0/pw,4), round(r.y0/ph,4), round(r.x1/pw,4), round(r.y1/ph,4)],
-            "source": "vector", "cluster_id": 0,
-        })
-
-    raw.sort(key=lambda p: p["area_sf"], reverse=True)
-    raw = raw[:60]
-    for i, p in enumerate(raw):
-        p["id"] = i
-
-    print(f"/polygons [vector-fallback]: page {req.page_number} → {len(raw)} polygons")
-    return {"polygons": raw, "page_width": pw, "page_height": ph,
-            "count": len(raw), "method": "vector"}
+    print(f"/polygons: page {req.page_number} — no surfaces detected")
+    return {"polygons": [], "page_width": pw, "page_height": ph,
+            "count": 0, "method": "none"}
 
 
 @app.get("/health")
