@@ -1,86 +1,61 @@
 """
-BPS SAM Measurement Microservice — v2
----------------------------------------
-Uses SamPredictor (box-prompted mode) instead of automatic generation.
-Much more consistent on architectural drawings because:
-  - Claude's bounding box tells SAM exactly WHERE to look
-  - SAM focuses on that region instead of guessing across the whole image
-  - Post-processing snaps mask edges to detected straight lines (walls are rectangles)
-  - Learning: confirmed masks are saved and reused as prompts on similar future pages
+BPS Measurement Service — Vector-First (Bluebeam-level accuracy)
+-----------------------------------------------------------------
+Architectural PDFs from CAD software contain actual vector geometry —
+the same data Bluebeam reads. We extract those paths directly and
+calculate SF from real coordinates, not pixels.
+
+Measurement priority:
+  1. Vector paths from PDF (exact — same as Bluebeam)
+  2. SAM pixel segmentation (fallback for scanned/raster PDFs)
 
 POST /measure
   body: {
-    image_b64: string,
+    image_b64:  string,          # base64 JPEG of rendered page (for SAM fallback)
+    pdf_b64:    string,          # base64 of the raw PDF page bytes (for vector extraction)
+    page_number: int,            # 1-based page number
     zones: [{ id, x0pct, y0pct, x1pct, y1pct }],
-    scale_str: "1/8\"=1'-0\"",
-    dpi: 150
+    scale_str:  "1/8\"=1'-0\"",
+    dpi:        150
   }
-  returns: { zones: [{ id, gross_sf, opening_sf, net_sf }] }
-
-POST /confirm   — call this when estimator confirms a takeoff (trains the system)
-  body: {
-    page_hash: string,       # md5 of the page image — identifies the drawing
-    zones: [{ id, x0pct, y0pct, x1pct, y1pct, gross_sf, net_sf, material_id }]
+  returns: {
+    zones: [{ id, gross_sf, opening_sf, net_sf, method }],
+    method: "vector" | "sam"
   }
 
 GET /health
 """
 
-import os, base64, hashlib, json, math
-from collections import defaultdict
+import os, base64, json, math, io
 from pathlib import Path
+from typing import List, Optional
 import numpy as np
 import cv2
 import torch
+import fitz  # PyMuPDF
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import List, Optional
 from segment_anything import sam_model_registry, SamPredictor, SamAutomaticMaskGenerator
 
-CHECKPOINT   = os.environ.get("SAM_CHECKPOINT", r"C:\Users\User\Downloads\sam_vit_b_01ec64.pth")
-MEMORY_FILE  = os.environ.get("SAM_MEMORY", r"C:\Users\User\Downloads\sam_memory.json")
-DPI_DEFAULT  = 150
-MIN_AREA_PX  = 5_000
-CHILD_THRESH = 0.65  # fraction of child mask inside parent = it's an opening
+CHECKPOINT  = os.environ.get("SAM_CHECKPOINT", r"C:\Users\User\Downloads\sam_vit_b_01ec64.pth")
+MEMORY_FILE = os.environ.get("SAM_MEMORY", r"C:\Users\User\Downloads\sam_memory.json")
+DPI_DEFAULT = 150
 
-# ── Load SAM once ─────────────────────────────────────────────────────────────
+# ── Load SAM (used as fallback for raster PDFs) ───────────────────────────────
 print("Loading SAM...")
 device = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"Device: {device}")
 sam = sam_model_registry["vit_b"](checkpoint=CHECKPOINT)
 sam.to(device)
-
-# SamPredictor: box-prompted mode — much more accurate for known zones
 predictor = SamPredictor(sam)
-
-# SamAutomaticMaskGenerator: used ONLY for finding openings inside a zone
 auto_gen = SamAutomaticMaskGenerator(
-    sam,
-    points_per_side=32,
-    pred_iou_thresh=0.88,
-    stability_score_thresh=0.90,
-    min_mask_region_area=500,
-    box_nms_thresh=0.50,
+    sam, points_per_side=32, pred_iou_thresh=0.88,
+    stability_score_thresh=0.90, min_mask_region_area=500,
 )
 print("SAM ready.")
 
-# ── Memory: confirmed measurements ────────────────────────────────────────────
-def load_memory():
-    if Path(MEMORY_FILE).exists():
-        with open(MEMORY_FILE) as f:
-            return json.load(f)
-    return {"confirmed_zones": []}
-
-def save_memory(mem):
-    with open(MEMORY_FILE, "w") as f:
-        json.dump(mem, f)
-
-memory = load_memory()
-print(f"Memory: {len(memory.get('confirmed_zones', []))} confirmed zones loaded")
-
-# ── FastAPI ───────────────────────────────────────────────────────────────────
-app = FastAPI(title="BPS SAM Service v2")
+app = FastAPI(title="BPS Measurement Service")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 
@@ -94,6 +69,8 @@ class ZoneBox(BaseModel):
 
 class MeasureRequest(BaseModel):
     image_b64: str
+    pdf_b64: Optional[str] = None   # raw PDF bytes base64 — enables vector extraction
+    page_number: Optional[int] = 1
     zones: List[ZoneBox]
     scale_str: Optional[str] = "1/8\"=1'-0\""
     dpi: Optional[int] = DPI_DEFAULT
@@ -103,38 +80,16 @@ class ZoneResult(BaseModel):
     gross_sf: float
     opening_sf: float
     net_sf: float
+    method: str  # "vector" or "sam"
 
 class MeasureResponse(BaseModel):
     zones: List[ZoneResult]
-
-class ConfirmedZone(BaseModel):
-    id: int
-    x0pct: float
-    y0pct: float
-    x1pct: float
-    y1pct: float
-    gross_sf: float
-    net_sf: float
-    material_id: Optional[str] = ""
-
-class ConfirmRequest(BaseModel):
-    page_hash: str
-    zones: List[ConfirmedZone]
+    method: str
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
-def decode_image(b64: str) -> np.ndarray:
-    data = base64.b64decode(b64)
-    arr = np.frombuffer(data, dtype=np.uint8)
-    img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-    return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-
-def image_hash(img_rgb: np.ndarray) -> str:
-    # Fast hash: downsample then md5
-    small = cv2.resize(img_rgb, (64, 64))
-    return hashlib.md5(small.tobytes()).hexdigest()
-
+# ── Scale helpers ─────────────────────────────────────────────────────────────
 def scale_to_ft_per_inch(s: str) -> float:
+    """'1/8\"=1\'-0\"' → 8.0 (feet per inch on paper)"""
     import re
     m = re.search(r'(\d+)/(\d+)', s)
     if m:
@@ -148,9 +103,28 @@ def scale_to_ft_per_inch(s: str) -> float:
             return 1.0 / v
     return 8.0
 
+def pdf_pts_to_sf(area_pts: float, ft_per_inch: float) -> float:
+    """
+    Convert area in PDF points² to square feet.
+    1 PDF point = 1/72 inch.
+    At scale ft_per_inch: 1 point on paper = ft_per_inch/72 real feet.
+    1 pt² = (ft_per_inch/72)² sq ft.
+    """
+    ft_per_pt = ft_per_inch / 72.0
+    return area_pts * (ft_per_pt ** 2)
+
 def px_to_sf(px: int, ft_per_inch: float, dpi: int) -> float:
     ppf = dpi / ft_per_inch
     return px / (ppf * ppf)
+
+def pct_to_pts(x0pct, y0pct, x1pct, y1pct, page_width, page_height):
+    """Convert % bounds to PDF point bounds."""
+    return (
+        page_width  * x0pct / 100,
+        page_height * y0pct / 100,
+        page_width  * x1pct / 100,
+        page_height * y1pct / 100,
+    )
 
 def pct_to_px(x0pct, y0pct, x1pct, y1pct, w, h):
     return (
@@ -160,230 +134,243 @@ def pct_to_px(x0pct, y0pct, x1pct, y1pct, w, h):
         min(h, int(h * y1pct / 100)),
     )
 
-def snap_mask_to_lines(mask: np.ndarray, img_gray: np.ndarray) -> np.ndarray:
+
+# ── Polygon area (shoelace formula) ───────────────────────────────────────────
+def polygon_area(points) -> float:
+    """Exact area of a polygon given its vertices. Units = input units²."""
+    n = len(points)
+    if n < 3:
+        return 0.0
+    area = 0.0
+    for i in range(n):
+        j = (i + 1) % n
+        area += points[i][0] * points[j][1]
+        area -= points[j][0] * points[i][1]
+    return abs(area) / 2.0
+
+def rect_area(rect) -> float:
+    """Area of a fitz.Rect."""
+    return abs(rect.width * rect.height)
+
+
+# ── Vector extraction from PDF ────────────────────────────────────────────────
+def extract_vector_zones(pdf_bytes: bytes, page_number: int, zone_boxes: list, ft_per_inch: float) -> dict:
     """
-    Post-process: snap the mask boundary to detected straight lines.
-    Architectural drawings have straight walls — this makes masks precise.
+    Extract closed vector paths from the PDF page.
+    For each zone box, find the largest closed polygon whose centroid
+    falls within the box — that's the wall surface.
+    Also find smaller enclosed paths inside it — those are openings.
+
+    Returns: { zone_id: { gross_sf, opening_sf, net_sf } }
     """
-    h, w = mask.shape
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    page = doc[page_number - 1]
+    pw, ph = page.rect.width, page.rect.height  # page dimensions in PDF points
 
-    # Detect straight lines using Hough
-    edges = cv2.Canny(img_gray, 50, 150)
-    lines = cv2.HoughLinesP(edges, 1, np.pi/180, threshold=60,
-                             minLineLength=40, maxLineGap=10)
-    if lines is None:
-        return mask
+    # Extract all drawing paths
+    drawings = page.get_drawings()
+    doc.close()
 
-    # Draw detected lines on a blank image
-    line_img = np.zeros((h, w), dtype=np.uint8)
-    for x1, y1, x2, y2 in lines[:, 0]:
-        cv2.line(line_img, (x1, y1), (x2, y2), 255, 2)
-
-    # Dilate lines slightly so they form closed regions
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-    line_img = cv2.dilate(line_img, kernel, iterations=1)
-
-    # Use watershed or contour snapping: find contour of mask, snap points to nearest line
-    cnts, _ = cv2.findContours(mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not cnts:
-        return mask
-
-    snapped = np.zeros_like(mask)
-    for c in cnts:
-        approx = cv2.approxPolyDP(c, 8, True)
-        new_pts = []
-        for pt in approx:
-            x, y = pt[0]
-            # Search in a small radius for the nearest strong line pixel
-            r = 12
-            x0c, y0c = max(0, x-r), max(0, y-r)
-            x1c, y1c = min(w, x+r), min(h, y+r)
-            region = line_img[y0c:y1c, x0c:x1c]
-            ys_l, xs_l = np.where(region > 0)
-            if len(xs_l) > 0:
-                # Find closest line pixel
-                dists = (xs_l - r)**2 + (ys_l - r)**2
-                best = np.argmin(dists)
-                x = x0c + xs_l[best]
-                y = y0c + ys_l[best]
-            new_pts.append([[x, y]])
-
-        new_pts = np.array(new_pts, dtype=np.int32)
-        cv2.fillPoly(snapped, [new_pts], True)
-
-    # Only keep the snapped region if it's close to the original (don't over-snap)
-    original_area = mask.sum()
-    snapped_area  = snapped.sum()
-    if snapped_area == 0 or abs(snapped_area - original_area) / max(original_area, 1) > 0.30:
-        return mask  # snapping went too far, keep original
-
-    return snapped.astype(bool)
-
-def find_openings_in_zone(zone_mask: np.ndarray, img_rgb: np.ndarray) -> list:
-    """
-    Find openings (windows, doors) inside a zone by running SAM on just the zone crop.
-    Returns list of masks (each is an opening).
-    """
-    h, w = zone_mask.shape
-    ys, xs = np.where(zone_mask)
-    if len(xs) == 0:
-        return []
-
-    y0, y1 = max(0, ys.min() - 10), min(h, ys.max() + 10)
-    x0, x1 = max(0, xs.min() - 10), min(w, xs.max() + 10)
-
-    crop = img_rgb[y0:y1, x0:x1]
-    ch, cw = crop.shape[:2]
-    if ch < 50 or cw < 50:
-        return []
-
-    # Only run auto SAM if the zone is large enough to have openings
-    zone_area = zone_mask.sum()
-    if zone_area < 30_000:
-        return []
-
-    raw = auto_gen.generate(crop)
-
-    openings = []
-    zone_crop_mask = zone_mask[y0:y1, x0:x1]
-
-    for m in raw:
-        seg = m["segmentation"]
-        if seg.shape != (ch, cw):
-            continue
-        area = m["area"]
-        if area < MIN_AREA_PX or area > zone_area * 0.40:
+    # Build list of closed polygons with their areas and centroids
+    polygons = []
+    for d in drawings:
+        # Skip very thin lines (dimension lines, annotation lines)
+        if d.get("width", 0) > 0 and d.get("fill") is None and d.get("width", 0) < 2:
             continue
 
-        # Must be mostly inside the zone
-        overlap = np.logical_and(seg, zone_crop_mask).sum()
-        if overlap / max(area, 1) < 0.75:
+        # Use the rect as a proxy for area when path is complex
+        r = d.get("rect")
+        if r is None:
             continue
 
-        # Must NOT be the zone itself (avoid selecting the parent)
-        if area / max(zone_area, 1) > 0.50:
+        r = fitz.Rect(r)
+        if r.is_empty or r.width < 10 or r.height < 10:
             continue
 
-        # Inflate back to full image coords
-        full_mask = np.zeros((h, w), dtype=bool)
-        full_mask[y0:y1, x0:x1] = seg
-        openings.append(full_mask)
+        area = rect_area(r)
+        if area < 500:  # too small — dimension annotation etc.
+            continue
 
-    # Deduplicate by overlap
-    final = []
-    for op in sorted(openings, key=lambda m: m.sum(), reverse=True):
-        dominated = False
-        for kept in final:
-            inter = np.logical_and(op, kept).sum()
-            if inter / max(op.sum(), 1) > 0.70:
-                dominated = True
+        cx = (r.x0 + r.x1) / 2
+        cy = (r.y0 + r.y1) / 2
+
+        # Try to get precise polygon area from path items
+        precise_area = area  # default to rect area
+        pts = []
+        for item in d.get("items", []):
+            if item[0] == "l":   # line segment
+                pts.append(item[1])
+            elif item[0] == "re": # rectangle
+                rr = fitz.Rect(item[1])
+                precise_area = rect_area(rr)
+                pts = [rr.tl, rr.tr, rr.br, rr.bl]
+                cx = (rr.x0 + rr.x1) / 2
+                cy = (rr.y0 + rr.y1) / 2
                 break
-        if not dominated:
-            final.append(op)
 
-    return final
+        if len(pts) >= 3:
+            pa = polygon_area([(p.x, p.y) for p in pts])
+            if pa > 100:
+                precise_area = pa
+                cx = sum(p.x for p in pts) / len(pts)
+                cy = sum(p.y for p in pts) / len(pts)
+
+        polygons.append({
+            "area": precise_area,
+            "cx": cx, "cy": cy,
+            "rect": r,
+        })
+
+    if not polygons:
+        return {}
+
+    # Sort largest first
+    polygons.sort(key=lambda p: p["area"], reverse=True)
+
+    results = {}
+    for zbox in zone_boxes:
+        bx0, by0, bx1, by1 = pct_to_pts(zbox.x0pct, zbox.y0pct, zbox.x1pct, zbox.y1pct, pw, ph)
+
+        # Find polygons whose centroid is inside the zone box
+        in_zone = [p for p in polygons
+                   if bx0 <= p["cx"] <= bx1 and by0 <= p["cy"] <= by1]
+
+        if not in_zone:
+            continue
+
+        # Largest = the wall surface
+        wall = in_zone[0]
+        gross_sf = pdf_pts_to_sf(wall["area"], ft_per_inch)
+
+        # Smaller polygons inside the wall rect = openings (windows, doors)
+        wr = wall["rect"]
+        openings = [
+            p for p in in_zone[1:]
+            if p["area"] < wall["area"] * 0.5
+            and wr.contains(fitz.Point(p["cx"], p["cy"]))
+        ]
+        opening_sf = sum(pdf_pts_to_sf(o["area"], ft_per_inch) for o in openings)
+        opening_sf = min(opening_sf, gross_sf * 0.85)  # sanity cap
+
+        net_sf = max(gross_sf - opening_sf, 0)
+
+        results[zbox.id] = {
+            "gross_sf":   round(gross_sf, 1),
+            "opening_sf": round(opening_sf, 1),
+            "net_sf":     round(net_sf, 1),
+        }
+
+    return results
 
 
-# ── Core measurement ──────────────────────────────────────────────────────────
-def segment_zone(img_rgb: np.ndarray, img_gray: np.ndarray, box_px, ft_per_inch: float, dpi: int) -> dict:
-    """
-    Use SamPredictor with a bounding box to get the wall mask.
-    Then find openings inside using auto-gen on the crop.
-    Returns { gross_sf, opening_sf, net_sf }
-    """
-    x0, y0, x1, y1 = box_px
-    if x1 <= x0 or y1 <= y0:
-        return {"gross_sf": 0, "opening_sf": 0, "net_sf": 0}
+# ── SAM fallback (raster PDFs / scanned drawings) ────────────────────────────
+def decode_image(b64: str) -> np.ndarray:
+    data = base64.b64decode(b64)
+    arr = np.frombuffer(data, dtype=np.uint8)
+    img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
-    # SamPredictor takes [x0, y0, x1, y1] as a numpy array
-    box = np.array([x0, y0, x1, y1])
-    masks, scores, _ = predictor.predict(
-        box=box,
-        multimask_output=True,
-    )
+def sam_measure_zones(img_rgb, zone_boxes, ft_per_inch, dpi):
+    """Box-prompted SAM segmentation for each zone."""
+    h, w = img_rgb.shape[:2]
+    predictor.set_image(img_rgb)
+    results = {}
+    for z in zone_boxes:
+        x0, y0, x1, y1 = pct_to_px(z.x0pct, z.y0pct, z.x1pct, z.y1pct, w, h)
+        if x1 <= x0 or y1 <= y0:
+            continue
+        box = np.array([x0, y0, x1, y1])
+        masks, scores, _ = predictor.predict(box=box, multimask_output=True)
+        if masks is None or len(masks) == 0:
+            continue
+        wall_mask = masks[int(np.argmax(scores))]
+        gross_px = int(wall_mask.sum())
 
-    if masks is None or len(masks) == 0:
-        return {"gross_sf": 0, "opening_sf": 0, "net_sf": 0}
+        # Find openings by running auto-gen on the crop
+        ys, xs = np.where(wall_mask)
+        if len(xs) == 0: continue
+        cy0, cy1 = max(0, ys.min()-10), min(h, ys.max()+10)
+        cx0, cx1 = max(0, xs.min()-10), min(w, xs.max()+10)
+        crop = img_rgb[cy0:cy1, cx0:cx1]
 
-    # Pick the mask with the highest score
-    best_idx = int(np.argmax(scores))
-    wall_mask = masks[best_idx]
+        opening_px = 0
+        if crop.shape[0] > 80 and crop.shape[1] > 80 and gross_px > 30000:
+            zone_crop = wall_mask[cy0:cy1, cx0:cx1]
+            raw = auto_gen.generate(crop)
+            for m in raw:
+                seg = m["segmentation"]
+                area = m["area"]
+                if area < 3000 or area > gross_px * 0.40: continue
+                overlap = np.logical_and(seg, zone_crop).sum()
+                if overlap / max(area, 1) > 0.75 and area / max(gross_px, 1) < 0.50:
+                    opening_px += area
 
-    # Snap to architectural lines for precision
-    wall_mask = snap_mask_to_lines(wall_mask, img_gray)
+        opening_px = min(opening_px, int(gross_px * 0.85))
+        net_px = max(gross_px - opening_px, 0)
+        results[z.id] = {
+            "gross_sf":   round(px_to_sf(gross_px,   ft_per_inch, dpi), 1),
+            "opening_sf": round(px_to_sf(opening_px, ft_per_inch, dpi), 1),
+            "net_sf":     round(px_to_sf(net_px,     ft_per_inch, dpi), 1),
+        }
+    return results
 
-    gross_px = int(wall_mask.sum())
-
-    # Find openings (windows, doors) inside the wall zone
-    openings = find_openings_in_zone(wall_mask, img_rgb)
-    opening_px = sum(int(op.sum()) for op in openings)
-    opening_px = min(opening_px, int(gross_px * 0.85))  # sanity cap
-
-    net_px = max(gross_px - opening_px, 0)
-
-    return {
-        "gross_sf":   round(px_to_sf(gross_px,   ft_per_inch, dpi), 1),
-        "opening_sf": round(px_to_sf(opening_px, ft_per_inch, dpi), 1),
-        "net_sf":     round(px_to_sf(net_px,     ft_per_inch, dpi), 1),
-    }
+def is_vector_pdf(pdf_bytes: bytes, page_number: int) -> bool:
+    """Check if this PDF page has meaningful vector geometry."""
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    page = doc[page_number - 1]
+    drawings = page.get_drawings()
+    doc.close()
+    # If there are large closed paths, it's a vector PDF
+    large = [d for d in drawings
+             if d.get("rect") and fitz.Rect(d["rect"]).get_area() > 1000]
+    return len(large) > 5
 
 
-# ── Endpoints ─────────────────────────────────────────────────────────────────
+# ── Endpoint ──────────────────────────────────────────────────────────────────
 @app.post("/measure", response_model=MeasureResponse)
 def measure(req: MeasureRequest):
-    img_rgb = decode_image(req.image_b64)
-    h, w = img_rgb.shape[:2]
-    img_gray = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2GRAY)
     ft_per_inch = scale_to_ft_per_inch(req.scale_str or "")
     dpi = req.dpi or DPI_DEFAULT
+    print(f"/measure: {len(req.zones)} zones  scale={req.scale_str} ({ft_per_inch} ft/in)")
 
-    print(f"/measure: {len(req.zones)} zones  scale={req.scale_str} ({ft_per_inch} ft/in)  DPI={dpi}  img={w}x{h}")
+    method = "sam"
+    raw_results = {}
 
-    # Set image in predictor once — reused for all zones on this page
-    predictor.set_image(img_rgb)
+    # ── Try vector extraction first ──
+    if req.pdf_b64:
+        try:
+            pdf_bytes = base64.b64decode(req.pdf_b64)
+            if is_vector_pdf(pdf_bytes, req.page_number or 1):
+                print("  Vector PDF detected — using exact coordinate measurement")
+                raw_results = extract_vector_zones(pdf_bytes, req.page_number or 1, req.zones, ft_per_inch)
+                if raw_results:
+                    method = "vector"
+                    print(f"  Vector measurement complete: {len(raw_results)} zones")
+                else:
+                    print("  Vector extraction found no matching polygons — falling back to SAM")
+            else:
+                print("  Raster PDF — using SAM pixel measurement")
+        except Exception as e:
+            print(f"  Vector extraction failed ({e}) — falling back to SAM")
 
-    results = []
+    # ── SAM fallback ──
+    if method == "sam":
+        img_rgb = decode_image(req.image_b64)
+        raw_results = sam_measure_zones(img_rgb, req.zones, ft_per_inch, dpi)
+
+    # Build response
+    out = []
     for z in req.zones:
-        box_px = pct_to_px(z.x0pct, z.y0pct, z.x1pct, z.y1pct, w, h)
-        r = segment_zone(img_rgb, img_gray, box_px, ft_per_inch, dpi)
-        print(f"  Zone {z.id}: gross={r['gross_sf']} opening={r['opening_sf']} net={r['net_sf']} SF")
-        results.append(ZoneResult(id=z.id, **r))
+        r = raw_results.get(z.id, {"gross_sf": 0, "opening_sf": 0, "net_sf": 0})
+        print(f"  Zone {z.id} [{method}]: gross={r['gross_sf']} opening={r['opening_sf']} net={r['net_sf']} SF")
+        out.append(ZoneResult(id=z.id, method=method, **r))
 
-    return MeasureResponse(zones=results)
-
-
-@app.post("/confirm")
-def confirm(req: ConfirmRequest):
-    """
-    Estimator confirmed a takeoff — save zone measurements to memory.
-    Future calls use this to validate and improve accuracy.
-    """
-    mem = load_memory()
-    new_count = 0
-    for z in req.zones:
-        mem["confirmed_zones"].append({
-            "page_hash":   req.page_hash,
-            "x0pct": z.x0pct, "y0pct": z.y0pct,
-            "x1pct": z.x1pct, "y1pct": z.y1pct,
-            "gross_sf":    z.gross_sf,
-            "net_sf":      z.net_sf,
-            "material_id": z.material_id,
-        })
-        new_count += 1
-    save_memory(mem)
-    memory["confirmed_zones"] = mem["confirmed_zones"]
-    print(f"/confirm: saved {new_count} zones (total: {len(mem['confirmed_zones'])})")
-    return {"saved": new_count, "total": len(mem["confirmed_zones"])}
+    return MeasureResponse(zones=out, method=method)
 
 
 @app.get("/health")
 def health():
-    return {
-        "status": "ok",
-        "device": device,
-        "model": "vit_b — SamPredictor (box-prompted)",
-        "confirmed_zones": len(memory.get("confirmed_zones", [])),
-    }
+    return {"status": "ok", "device": device, "model": "vector-first + SAM fallback"}
 
 
 if __name__ == "__main__":
