@@ -373,6 +373,115 @@ def measure(req: MeasureRequest):
     return MeasureResponse(zones=out, method=method)
 
 
+def cluster_by_texture(drawings, pw, ph, ft_per_inch: float, min_cluster_sf: float = 10.0) -> list:
+    """
+    Group CAD vector paths by fill-color/pattern to detect distinct material zones.
+    Each unique fill = one material type (brick hatch, ACM solid, fiber cement, etc).
+    Returns polygon list with cluster_id so the frontend can color-code by texture.
+    """
+    # Build clusters keyed by rounded fill color
+    clusters: dict = {}
+
+    for d in drawings:
+        fill = d.get("fill")
+        if fill is None or len(fill) < 3:
+            continue
+
+        r_val = d.get("rect")
+        if r_val is None:
+            continue
+        rect = fitz.Rect(r_val)
+        if rect.is_empty or rect.width < 10 or rect.height < 10:
+            continue
+
+        area_pts = rect.get_area()
+        if area_pts < 200:
+            continue  # too small — dimension tick, text
+
+        # Round fill to 1 decimal so nearly-identical colors cluster together
+        key = tuple(round(c, 1) for c in fill[:3])
+
+        # Skip pure black (building outline, title block) and near-white (background)
+        if key == (0.0, 0.0, 0.0):
+            continue
+        if all(c >= 0.95 for c in key):
+            continue
+        # Skip very dark grays (outline strokes rendered as thin fills)
+        if all(c < 0.15 for c in key):
+            continue
+
+        # Extract polygon vertices
+        pts: list = []
+        for item in d.get("items", []):
+            if item[0] == "l":
+                pts.append([float(item[1].x), float(item[1].y)])
+            elif item[0] == "c":
+                pts.append([float(item[3].x), float(item[3].y)])
+            elif item[0] == "re":
+                rr = fitz.Rect(item[1])
+                pts = [[rr.x0, rr.y0], [rr.x1, rr.y0],
+                       [rr.x1, rr.y1], [rr.x0, rr.y1]]
+                break
+
+        if len(pts) < 3:
+            pts = [[rect.x0, rect.y0], [rect.x1, rect.y0],
+                   [rect.x1, rect.y1], [rect.x0, rect.y1]]
+
+        poly_area = polygon_area(pts)
+        if poly_area < 200:
+            continue
+
+        area_sf = pdf_pts_to_sf(poly_area, ft_per_inch)
+        norm = [[round(x / pw, 4), round(y / ph, 4)] for x, y in pts]
+        cx = sum(v[0] for v in norm) / len(norm)
+        cy = sum(v[1] for v in norm) / len(norm)
+
+        if key not in clusters:
+            clusters[key] = []
+        clusters[key].append({
+            "points":   norm,
+            "area_sf":  round(area_sf, 1),
+            "cx":       round(cx, 4),
+            "cy":       round(cy, 4),
+            "bbox":     [round(rect.x0/pw,4), round(rect.y0/ph,4),
+                         round(rect.x1/pw,4), round(rect.y1/ph,4)],
+        })
+
+    # Filter clusters whose total area is too small to matter
+    significant = {k: v for k, v in clusters.items()
+                   if sum(p["area_sf"] for p in v) >= min_cluster_sf}
+
+    # Sort clusters by total area descending (largest texture area first)
+    sorted_clusters = sorted(
+        significant.items(),
+        key=lambda x: sum(p["area_sf"] for p in x[1]),
+        reverse=True
+    )
+
+    # Cap at 8 texture clusters (more than that = noise)
+    sorted_clusters = sorted_clusters[:8]
+
+    result: list = []
+    for cluster_id, (fill_key, polys) in enumerate(sorted_clusters):
+        # Sort individual polygons in this cluster largest-first
+        polys_sorted = sorted(polys, key=lambda p: p["area_sf"], reverse=True)
+        # Cap per-cluster polygons at 30 (hatch patterns can have thousands)
+        for poly in polys_sorted[:30]:
+            result.append({
+                "id":         len(result),
+                "points":     poly["points"],
+                "area_sf":    poly["area_sf"],
+                "cx":         poly["cx"],
+                "cy":         poly["cy"],
+                "bbox":       poly["bbox"],
+                "source":     "vector_cluster",
+                "cluster_id": cluster_id,
+                "fill_color": list(fill_key),
+            })
+
+    return result
+
+
 def _normalize_verts(verts, pw, ph):
     """Convert PyMuPDF vertices (Points or tuples) to normalized [0-1] coord pairs."""
     out = []
@@ -469,13 +578,22 @@ def get_page_polygons(req: PolygonRequest):
         return {"polygons": bb, "page_width": pw, "page_height": ph,
                 "count": len(bb), "method": "bluebeam"}
 
-    # ── Priority 2: Vector path extraction ──────────────────────────────────
+    # ── Priority 2: Texture clustering — group CAD fills by color/pattern ───
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     page = doc[req.page_number - 1]
     drawings = page.get_drawings()
     doc.close()
 
-    MIN_AREA_PTS = 300
+    clustered = cluster_by_texture(drawings, pw, ph, ft_per_inch)
+    if clustered:
+        n_clusters = len(set(p["cluster_id"] for p in clustered))
+        print(f"/polygons [texture-cluster]: page {req.page_number} → "
+              f"{len(clustered)} polygons in {n_clusters} texture groups")
+        return {"polygons": clustered, "page_width": pw, "page_height": ph,
+                "count": len(clustered), "method": "vector_cluster",
+                "num_clusters": n_clusters}
+
+    # ── Priority 3: Large-polygon fallback ────────────────────────────────────
     raw = []
     for d in drawings:
         r = d.get("rect")
@@ -500,19 +618,18 @@ def get_page_polygons(req: PolygonRequest):
             pts = [[r.x0, r.y0], [r.x1, r.y0], [r.x1, r.y1], [r.x0, r.y1]]
 
         poly_area = polygon_area(pts)
-        if poly_area < MIN_AREA_PTS:
+        if poly_area < 300:
             continue
 
         area_sf = round(pdf_pts_to_sf(poly_area, ft_per_inch), 1)
         norm = [[round(x / pw, 4), round(y / ph, 4)] for x, y in pts]
         cx   = round(sum(p[0] for p in norm) / len(norm), 4)
         cy   = round(sum(p[1] for p in norm) / len(norm), 4)
-
         raw.append({
             "id": len(raw), "points": norm, "area_sf": area_sf,
             "cx": cx, "cy": cy,
             "bbox": [round(r.x0/pw,4), round(r.y0/ph,4), round(r.x1/pw,4), round(r.y1/ph,4)],
-            "source": "vector",
+            "source": "vector", "cluster_id": 0,
         })
 
     raw.sort(key=lambda p: p["area_sf"], reverse=True)
@@ -520,7 +637,7 @@ def get_page_polygons(req: PolygonRequest):
     for i, p in enumerate(raw):
         p["id"] = i
 
-    print(f"/polygons [vector]: page {req.page_number} → {len(raw)} polygons")
+    print(f"/polygons [vector-fallback]: page {req.page_number} → {len(raw)} polygons")
     return {"polygons": raw, "page_width": pw, "page_height": ph,
             "count": len(raw), "method": "vector"}
 
