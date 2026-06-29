@@ -31,6 +31,7 @@ function createJob(id) {
     log: [], progress: { label: "", pct: 0 },
     phase: "filtering",
     takeoffData: [], legend: [], soffitNotes: [],
+    scheduleData: { windows: [], doors: [], total_opening_sf: 0 },
     evidencePdfPath: null, error: null,
     pdfPath: null,
     polygons_by_page: {},
@@ -238,7 +239,7 @@ async function runAnalysis(job, pdfPath, originalName) {
     const sheetListResult = parseJSON(await claude(
       [
         ...indexPageImages,
-        { type: "text", text: "These are the first pages of a commercial architectural blueprint set with " + total + " total pages.\n\nFind the DRAWING INDEX, SHEET INDEX, DRAWING LIST, or TABLE OF CONTENTS — it is a table listing every drawing with a sheet number and description.\n\nWe are a PANEL SIDING contractor. We ONLY care about ARCHITECTURAL sheets (sheets starting with 'A' or labeled as architectural). Ignore all civil, structural, mechanical, plumbing, electrical, landscape sheets.\n\nFrom the architectural sheets, identify which ones are:\n- EXTERIOR ELEVATIONS: outside building faces showing panel cladding (e.g. 'Exterior Elevations', 'Building Elevations', 'Enlarged Elevations')\n- RETURN ELEVATIONS: corner/return details (e.g. 'Return Elevations', 'Corner Details')\n- MATERIAL LEGEND or FINISH SCHEDULE: exterior material key\n- FLOOR PLANS: building floor plans\n- 3D VIEWS: exterior renderings or perspective views\n\nReturn ONLY JSON:\n{\n  \"sheets\": [\n    {\"number\": \"A1-1\", \"name\": \"Exterior Elevations\", \"type\": \"EXTERIOR_ELEVATION|RETURN_ELEVATION|MATERIAL_LEGEND|FLOOR_PLAN|3D_VIEW|IRRELEVANT\"}\n  ]\n}" }
+        { type: "text", text: "These are the first pages of a commercial architectural blueprint set with " + total + " total pages.\n\nFind the DRAWING INDEX, SHEET INDEX, DRAWING LIST, or TABLE OF CONTENTS — it is a table listing every drawing with a sheet number and description.\n\nWe are a PANEL SIDING contractor. We ONLY care about ARCHITECTURAL sheets (sheets starting with 'A' or labeled as architectural). Ignore all civil, structural, mechanical, plumbing, electrical, landscape sheets.\n\nFrom the architectural sheets, identify which ones are:\n- EXTERIOR ELEVATIONS: outside building faces showing panel cladding (e.g. 'Exterior Elevations', 'Building Elevations', 'Enlarged Elevations')\n- RETURN ELEVATIONS: corner/return details (e.g. 'Return Elevations', 'Corner Details')\n- MATERIAL LEGEND or FINISH SCHEDULE: exterior material key\n- WINDOW/DOOR SCHEDULE: a table listing windows or doors with their sizes and quantities (e.g. 'Window Schedule', 'Door Schedule', 'Glazing Schedule')\n- FLOOR PLANS: building floor plans\n- 3D VIEWS: exterior renderings or perspective views\n\nReturn ONLY JSON:\n{\n  \"sheets\": [\n    {\"number\": \"A1-1\", \"name\": \"Exterior Elevations\", \"type\": \"EXTERIOR_ELEVATION|RETURN_ELEVATION|MATERIAL_LEGEND|WINDOW_DOOR_SCHEDULE|FLOOR_PLAN|3D_VIEW|IRRELEVANT\"}\n  ]\n}" }
       ],
       "You are reading an architectural drawing index to extract a complete sheet list. Read carefully — the index may have small text. Return ONLY valid JSON."
     ));
@@ -259,6 +260,7 @@ async function runAnalysis(job, pdfPath, originalName) {
       exteriorElevations: [],
       returnElevations: [],
       materialLegend: [],
+      schedules: [],
       floorPlans: [],
       views3d: [],
     };
@@ -298,6 +300,7 @@ async function runAnalysis(job, pdfPath, originalName) {
             if (sheet.type === "EXTERIOR_ELEVATION") relevant.exteriorElevations.push(match.page);
             else if (sheet.type === "RETURN_ELEVATION") relevant.returnElevations.push(match.page);
             else if (sheet.type === "MATERIAL_LEGEND") relevant.materialLegend.push(match.page);
+            else if (sheet.type === "WINDOW_DOOR_SCHEDULE") relevant.schedules.push(match.page);
             else if (sheet.type === "FLOOR_PLAN") relevant.floorPlans.push(match.page);
             else if (sheet.type === "3D_VIEW") relevant.views3d.push(match.page);
           }
@@ -320,10 +323,20 @@ async function runAnalysis(job, pdfPath, originalName) {
       }
     }
 
+    // If no schedule sheets matched from the index, scan page text for them
+    if (!relevant.schedules.length) {
+      for (let p = 1; p <= total; p++) {
+        const text = (await getPageText(pdfDoc, p)).toUpperCase();
+        if (text.includes("WINDOW SCHEDULE") || text.includes("DOOR SCHEDULE") || text.includes("GLAZING SCHEDULE")) {
+          relevant.schedules.push(p);
+        }
+      }
+    }
+
     // Remove duplicates and sort
     Object.keys(relevant).forEach(k => { relevant[k] = [...new Set(relevant[k])].sort((a, b) => a - b); });
 
-    jobLog(job, "Found: " + relevant.exteriorElevations.length + " elevations | " + relevant.returnElevations.length + " returns | " + relevant.materialLegend.length + " legend | " + relevant.floorPlans.length + " floor plans | " + relevant.views3d.length + " 3D views", "ok");
+    jobLog(job, "Found: " + relevant.exteriorElevations.length + " elevations | " + relevant.returnElevations.length + " returns | " + relevant.materialLegend.length + " legend | " + relevant.schedules.length + " schedules | " + relevant.floorPlans.length + " floor plans | " + relevant.views3d.length + " 3D views", "ok");
 
     if (!relevant.exteriorElevations.length && !relevant.returnElevations.length) {
       throw new Error("No exterior elevation pages found. The drawing index may not be readable or may be on a later page.");
@@ -406,6 +419,35 @@ async function runAnalysis(job, pdfPath, originalName) {
 
     // Read the PDF bytes once for the Smart Drawing Reader + SAM measurement
     const pdfB64Full = fs.readFileSync(pdfPath).toString("base64");
+
+    // ── Read window/door schedules from their dedicated sheets (exact opening sizes) ──
+    if (samAvailable && relevant.schedules.length) {
+      jobLog(job, "Reading window/door schedules from " + relevant.schedules.length + " sheet(s)...", "info");
+      for (const sp of relevant.schedules) {
+        try {
+          const schRes = await fetch(SAM_URL + "/schedules", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ pdf_b64: pdfB64Full, page_number: sp }),
+            signal: AbortSignal.timeout(60000),
+          });
+          if (schRes.ok) {
+            const sd = await schRes.json();
+            job.scheduleData.windows.push(...(sd.windows || []));
+            job.scheduleData.doors.push(...(sd.doors || []));
+          }
+        } catch(e) { jobLog(job, "  Schedule sheet p." + sp + " read failed", "warn"); }
+      }
+      job.scheduleData.total_opening_sf = Math.round(
+        job.scheduleData.windows.reduce((s, w) => s + (w.area_sf || 0), 0) +
+        job.scheduleData.doors.reduce((s, d) => s + (d.area_sf || 0), 0));
+      if (job.scheduleData.total_opening_sf > 0) {
+        jobLog(job, "Schedules: " + job.scheduleData.windows.length + " window types · " +
+          job.scheduleData.doors.length + " door types — " + job.scheduleData.total_opening_sf.toLocaleString() + " SF total openings", "ok");
+      } else {
+        jobLog(job, "Schedule sheet(s) found but no parseable rows — openings will be estimated", "warn");
+      }
+    }
 
     for (let i = 0; i < elevPages.length; i++) {
       const { p, type } = elevPages[i];
@@ -684,7 +726,8 @@ app.get("/status/:jobId", (req, res) => {
   res.json({
     status: job.status, phase: job.phase, progress: job.progress,
     log: job.log, legend: job.legend, takeoffData: job.takeoffData,
-    soffitNotes: job.soffitNotes, evidenceReady: !!job.evidencePdfPath, error: job.error,
+    soffitNotes: job.soffitNotes, scheduleData: job.scheduleData,
+    evidenceReady: !!job.evidencePdfPath, error: job.error,
   });
 });
 
