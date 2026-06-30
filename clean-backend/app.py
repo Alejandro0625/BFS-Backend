@@ -12,6 +12,7 @@ Matches the existing React frontend contract:
 import os, io, re, uuid, threading
 from collections import defaultdict
 import fitz  # PyMuPDF
+import texture  # full-res texture auto-detection for unmarked drawings
 from fastapi import FastAPI, UploadFile, File, BackgroundTasks, HTTPException
 from fastapi.responses import Response
 from fastapi.middleware.cors import CORSMiddleware
@@ -96,30 +97,42 @@ def process(jid, pdf_bytes):
             pg = doc[pi]; pw, ph = pg.rect.width, pg.rect.height
             ft = 8.0  # scale fallback; digitize SF comes from the markup's own labels
             polys = extract_page_polygons(pg, pw, ph, ft)
+            auto = False
+            if not polys:
+                # no estimator markup on this page -> texture auto-detect (suggestions)
+                try:
+                    tpolys, _, _ = texture.detect(pdf_bytes, pi, ft_per_in=ft, zoom=2.0)
+                    if tpolys:
+                        polys = tpolys; auto = True
+                except Exception as te:
+                    jlog(job, f"Page {pi+1}: auto-detect skipped ({te})", "warn")
             job["polygons_by_page"][pi + 1] = polys
             job["dims_by_page"][pi + 1] = {"width": pw, "height": ph}
             if not polys:
                 continue
             bymat = defaultdict(lambda: {"sf": 0.0, "n": 0, "category": None})
             for p in polys:
-                key = p["material"] or "Unlabeled"
+                key = p.get("material") or p.get("category") or "Unlabeled"
                 bymat[key]["sf"] += p["area_sf"]; bymat[key]["n"] += 1
-                bymat[key]["category"] = p["category"]
+                bymat[key]["category"] = p.get("category")
             zones = []
+            src_txt = "AI texture (confirm)" if auto else "markup"
             for mat, d in bymat.items():
                 cat = d["category"] or "Other"
                 zones.append({
                     "materialName": mat, "material_type": mat, "category": cat,
                     "netArea": round(d["sf"], 1), "grossArea": round(d["sf"], 1),
-                    "totalOpeningArea": 0, "description": f"{d['n']} region(s) from markup",
+                    "totalOpeningArea": 0, "description": f"{d['n']} region(s) from {src_txt}",
                 })
                 legend[mat] = {"id": mat, "name": mat, "category": cat}
             job["takeoffData"].append({
                 "pageNumber": pi + 1, "title": f"Sheet page {pi+1}", "sheetRef": f"p{pi+1}",
-                "scale": "from markup", "scaleSource": "estimator markup", "building": "Building",
-                "zones": zones, "flags": [], "source": "digitize",
+                "scale": "auto (calibrate)" if auto else "from markup",
+                "scaleSource": "AI auto — verify" if auto else "estimator markup", "building": "Building",
+                "zones": zones, "flags": (["AI suggestion — verify SF before bidding"] if auto else []),
+                "source": "texture-auto" if auto else "digitize",
             })
-            jlog(job, f"Page {pi+1}: {len(polys)} marked region(s), {len(zones)} material(s)", "ok")
+            jlog(job, f"Page {pi+1}: " + (f"{len(polys)} AI-suggested zone(s)" if auto else f"{len(polys)} marked region(s)") + f", {len(zones)} material(s)", "warn" if auto else "ok")
         doc.close()
         job["legend"] = list(legend.values())
         total = sum(z["netArea"] for e in job["takeoffData"] for z in e["zones"])
