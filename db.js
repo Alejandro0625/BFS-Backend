@@ -13,7 +13,7 @@ const pool = url
 // Never let a dropped DB connection crash the backend — learning is best-effort
 if (pool) pool.on("error", (e) => console.log("pg pool error (ignored):", e.message));
 
-export async function initDb() {
+export async function initDb(attempt = 1) {
   if (!pool) { console.log("No DATABASE_URL — learning store disabled (analysis still works)"); return; }
   try {
     await pool.query(`
@@ -40,7 +40,10 @@ export async function initDb() {
       );
     `);
     console.log("Learning store ready (Postgres connected) ✓");
-  } catch (e) { console.log("DB init failed:", e.message); }
+  } catch (e) {
+    console.log(`DB init attempt ${attempt} failed:`, e.message);
+    if (attempt < 12) setTimeout(() => initDb(attempt + 1), 15000); // self-heal until Postgres is up
+  }
 }
 
 export async function recordRun(r) {
