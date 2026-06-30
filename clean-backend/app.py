@@ -1,5 +1,5 @@
 """
-BFS Estimator — clean lightweight backend.
+BFS Estimator — clean lightweight backend.  (deploy build: clean-backend v1)
 Reads the estimator's Bluebeam markup polygons (digitize-markup) → exact SF per material.
 Light deps only (PyMuPDF + OpenCV + numpy) → boots instantly, never OOMs.
 Matches the existing React frontend contract:
