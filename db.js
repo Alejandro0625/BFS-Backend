@@ -5,9 +5,13 @@ const { Pool } = pg;
 
 const url = process.env.DATABASE_URL;
 export const dbEnabled = !!url;
+// Railway's internal network ( *.railway.internal ) and localhost don't use SSL
+const noSsl = url && (url.includes("localhost") || url.includes(".railway.internal"));
 const pool = url
-  ? new Pool({ connectionString: url, ssl: url.includes("localhost") ? false : { rejectUnauthorized: false } })
+  ? new Pool({ connectionString: url, ssl: noSsl ? false : { rejectUnauthorized: false }, max: 5, connectionTimeoutMillis: 8000 })
   : null;
+// Never let a dropped DB connection crash the backend — learning is best-effort
+if (pool) pool.on("error", (e) => console.log("pg pool error (ignored):", e.message));
 
 export async function initDb() {
   if (!pool) { console.log("No DATABASE_URL — learning store disabled (analysis still works)"); return; }
