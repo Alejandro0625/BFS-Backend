@@ -19,7 +19,6 @@ import os, base64, json, re, io, threading
 from typing import List, Optional
 import numpy as np
 import cv2
-import torch
 import fitz  # PyMuPDF
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -27,35 +26,46 @@ from pydantic import BaseModel
 from shapely.geometry import Polygon as SPoly
 from shapely.ops import unary_union
 from shapely.validation import make_valid
-from segment_anything import sam_model_registry, SamPredictor, SamAutomaticMaskGenerator
+# NOTE: torch + segment_anything are imported lazily inside get_sam() so the
+# service boots on light deps (fastapi + fitz + shapely + cv2) and does not OOM.
 
 CHECKPOINT  = os.environ.get("SAM_CHECKPOINT", "/app/sam_vit_b_01ec64.pth")
 DPI_DEFAULT = 150
 CLAUDE_MODEL = "claude-opus-4-8"   # always use the latest
 
-# ── Load SAM ──────────────────────────────────────────────────────────────────
-print("Loading SAM...")
-device = "cuda" if torch.cuda.is_available() else "cpu"
-print(f"Device: {device}")
-sam = sam_model_registry["vit_b"](checkpoint=CHECKPOINT)
-sam.to(device)
-predictor   = SamPredictor(sam)
-auto_gen    = SamAutomaticMaskGenerator(
-    sam, points_per_side=32, pred_iou_thresh=0.88,
-    stability_score_thresh=0.90, min_mask_region_area=500,
-)
-print("SAM ready.")
+# ── Lazy heavy-model loaders ──────────────────────────────────────────────────
+# SAM (PyTorch, ~375MB) + EasyOCR load ONLY when a request actually needs them.
+# The common paths — Bluebeam polygon extraction (PyMuPDF) + Shapely measurement —
+# need none of this, so the service boots light and stays up (no boot OOM).
+_sam = None;        _sam_lock = threading.Lock()
+_ocr_reader = None; _ocr_lock = threading.Lock()
 
-# ── Lazy-load EasyOCR (heavy — only init on first use) ────────────────────────
-_ocr_reader = None
-_ocr_lock   = threading.Lock()
+def get_sam():
+    global _sam
+    if _sam is None:
+        with _sam_lock:
+            if _sam is None:
+                import torch
+                from segment_anything import sam_model_registry, SamPredictor, SamAutomaticMaskGenerator
+                dev = "cuda" if torch.cuda.is_available() else "cpu"
+                print(f"Loading SAM on {dev} ...")
+                m = sam_model_registry["vit_b"](checkpoint=CHECKPOINT); m.to(dev)
+                _sam = {
+                    "predictor": SamPredictor(m),
+                    "auto": SamAutomaticMaskGenerator(
+                        m, points_per_side=32, pred_iou_thresh=0.88,
+                        stability_score_thresh=0.90, min_mask_region_area=500),
+                    "device": dev,
+                }
+                print("SAM ready.")
+    return _sam
 
 def get_ocr_reader():
     global _ocr_reader
     if _ocr_reader is None:
         with _ocr_lock:
             if _ocr_reader is None:
-                import easyocr
+                import easyocr, torch
                 print("Loading EasyOCR...")
                 _ocr_reader = easyocr.Reader(["en"], gpu=torch.cuda.is_available())
                 print("EasyOCR ready.")
@@ -688,6 +698,7 @@ def decode_image(b64: str) -> np.ndarray:
 
 def sam_measure_zones(img_rgb, zone_boxes, ft_per_inch, dpi):
     h, w = img_rgb.shape[:2]
+    s = get_sam(); predictor = s["predictor"]; auto_gen = s["auto"]
     predictor.set_image(img_rgb)
     results = {}
     for z in zone_boxes:
@@ -947,7 +958,7 @@ def analyze_drawing(req: AnalyzeRequest):
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "device": device, "claude_model": CLAUDE_MODEL,
+    return {"status": "ok", "device": (_sam["device"] if _sam else "lazy"), "claude_model": CLAUDE_MODEL,
             "capabilities": ["bluebeam", "vector_cluster", "claude_vision", "sam",
                              "easyocr_scale", "shapely", "drawing_reader", "schedule_extract", "yolo_ready"]}
 
