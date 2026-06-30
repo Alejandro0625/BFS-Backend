@@ -2,3 +2,5 @@ fastapi
 uvicorn[standard]
 pymupdf
 python-multipart
+numpy
+opencv-python-headless
