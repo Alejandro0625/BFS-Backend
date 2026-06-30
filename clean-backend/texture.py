@@ -9,9 +9,10 @@ import numpy as np
 import cv2
 import fitz
 
+# Neutral group names — the estimator renames them in the app (flows to the Excel).
 GROUPS = [
-    ("Smooth zone (panel-type)",   [0.0, 0.80, 0.90]),   # cyan
-    ("Textured zone (brick/lap)",  [0.95, 0.45, 0.55]),   # pink/red
+    ("Group 1", [0.0, 0.80, 0.90]),   # cyan  (smooth / panel-type texture)
+    ("Group 2", [0.95, 0.45, 0.55]),  # pink  (dense grid / brick-lap texture)
 ]
 
 
