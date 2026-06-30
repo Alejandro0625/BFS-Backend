@@ -9,13 +9,16 @@ Matches the existing React frontend contract:
   GET  /page-image/{jobId}/{page} -> PNG
   GET  /health
 """
-import os, io, re, uuid, threading
+import os, io, re, uuid, threading, json, time
 from collections import defaultdict
 import fitz  # PyMuPDF
 import texture  # full-res texture auto-detection for unmarked drawings
-from fastapi import FastAPI, UploadFile, File, BackgroundTasks, HTTPException
+from fastapi import FastAPI, UploadFile, File, BackgroundTasks, HTTPException, Body
 from fastapi.responses import Response
 from fastapi.middleware.cors import CORSMiddleware
+
+# Where corrections accumulate as training data (mount a Railway volume here to persist).
+CORR_DIR = os.environ.get("CORRECTIONS_DIR", "/data/corrections")
 
 app = FastAPI(title="BFS Clean Backend")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -184,6 +187,36 @@ def page_image(jid: str, page: int):
     pix = doc[page - 1].get_pixmap(matrix=fitz.Matrix(2, 2))  # ~144 dpi
     png = pix.tobytes("png"); doc.close()
     return Response(content=png, media_type="image/png")
+
+@app.post("/learn")
+def learn(payload: dict = Body(...)):
+    """Capture a manual/corrected takeoff as labeled training data (the flywheel).
+    payload: {jobId, page, shapes:[{points,name,color,type}], source}"""
+    jid = payload.get("jobId")
+    job = jobs.get(jid)
+    try:
+        os.makedirs(CORR_DIR, exist_ok=True)
+        ts = str(int(time.time() * 1000))
+        d = os.path.join(CORR_DIR, ts)
+        os.makedirs(d, exist_ok=True)
+        if job and job.get("pdf"):
+            with open(os.path.join(d, "drawing.pdf"), "wb") as fh:
+                fh.write(job["pdf"])
+        with open(os.path.join(d, "labels.json"), "w", encoding="utf-8") as fh:
+            json.dump({"jobId": jid, "page": payload.get("page"), "source": payload.get("source", "manual"),
+                       "shapes": payload.get("shapes", []), "at": ts}, fh)
+        n = len([x for x in os.listdir(CORR_DIR) if os.path.isdir(os.path.join(CORR_DIR, x))])
+        return {"ok": True, "saved": ts, "total": n}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+@app.get("/learn-status")
+def learn_status():
+    try:
+        n = len([x for x in os.listdir(CORR_DIR) if os.path.isdir(os.path.join(CORR_DIR, x))]) if os.path.isdir(CORR_DIR) else 0
+    except Exception:
+        n = 0
+    return {"corrections": n}
 
 @app.get("/health")
 def health():
