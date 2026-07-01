@@ -10,13 +10,18 @@ import cv2
 import fitz
 
 # Neutral group names — the estimator renames them in the app (flows to the Excel).
+# G1 smooth (panel), G2 looser texture (lap/FC), G3 dense texture (brick) — split so the
+# estimator selects only the materials in their scope (e.g. skip brick).
 GROUPS = [
-    ("Group 1", [0.0, 0.80, 0.90]),   # cyan  (smooth / panel-type texture)
-    ("Group 2", [0.95, 0.45, 0.55]),  # pink  (dense grid / brick-lap texture)
+    ("Group 1", [0.0, 0.80, 0.90]),   # cyan  — smooth / panel-type
+    ("Group 2", [0.35, 0.78, 0.45]),  # green — looser texture (lap / fiber-cement)
+    ("Group 3", [0.95, 0.45, 0.55]),  # pink  — dense texture (brick / masonry)
 ]
 
 
 def _read_scale(doc, pi):
+    """Read the drawing scale as feet-per-inch, robustly. Returns (ft_per_in, confirmed).
+    confirmed=False means we could not read it → caller must FLAG (never trust a defaulted SF)."""
     txt = ""
     try:
         txt += doc[pi].get_text() or ""
@@ -27,10 +32,31 @@ def _read_scale(doc, pi):
             txt += " " + (a.info.get("content", "") or "")
     except Exception:
         pass
-    m = re.search(r'(\d+)\s*/\s*(\d+)\s*"?\s*=\s*1\s*\'', txt)
-    if m and int(m.group(1)) > 0:
-        return int(m.group(2)) / int(m.group(1))
-    return None
+    # normalize smart quotes / primes to plain " and '
+    t = txt.replace("’", "'").replace("‘", "'").replace("”", '"').replace("“", '"').replace("″", '"').replace("′", "'")
+    found = []
+    # architectural fraction:  A/B" = 1'   (e.g. 1/8"=1'-0", 3/16" = 1'-0")  -> ft_per_in = B/A
+    for m in re.finditer(r'(\d+)\s*/\s*(\d+)\s*"?\s*(?:in\.?)?\s*=\s*1\s*\'', t, re.I):
+        a, b = int(m.group(1)), int(m.group(2))
+        if a > 0:
+            found.append(b / a)
+    # engineering:  1" = N'   (one inch = N feet)  -> ft_per_in = N
+    for m in re.finditer(r'\b1\s*"\s*=\s*(\d+)\s*\'', t, re.I):
+        n = int(m.group(1))
+        if n > 0:
+            found.append(float(n))
+    # whole-inch architectural (detail scales): N" = 1'  -> ft_per_in = 1/N (only if no fraction matched)
+    if not found:
+        for m in re.finditer(r'\b(\d+)\s*"\s*=\s*1\s*\'', t, re.I):
+            a = int(m.group(1))
+            if a > 0:
+                found.append(1.0 / a)
+    if not found:
+        return 8.0, False  # could not read — default, but flagged as unconfirmed
+    # if multiple scale strings agree, high confidence; if they conflict, take the most common
+    vals = sorted(found)
+    best = max(set(found), key=found.count)
+    return best, True
 
 
 def _fill_holes(mask):
@@ -44,9 +70,8 @@ def _fill_holes(mask):
 def detect(pdf_bytes, page_index, ft_per_in=8.0, zoom=2.0):
     render_dpi = 72 * zoom
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    sc = _read_scale(doc, page_index)
-    if sc:
-        ft_per_in = sc
+    sc, sc_confirmed = _read_scale(doc, page_index)
+    ft_per_in = sc  # read scale, or 8.0 default (sc_confirmed=False → caller flags it)
     pix = doc[page_index].get_pixmap(matrix=fitz.Matrix(zoom, zoom))
     img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)
     doc.close()
@@ -60,6 +85,8 @@ def detect(pdf_bytes, page_index, ft_per_in=8.0, zoom=2.0):
     kd = max(21, (W // 80) | 1)
     edges = cv2.Canny(g, 40, 120).astype(np.float32)
     dens = cv2.boxFilter(edges, -1, (kd, kd)); dens = dens / (dens.max() + 1e-6) * 255
+    gf = g.astype(np.float32)
+    syy = cv2.boxFilter(np.abs(cv2.Sobel(gf, cv2.CV_32F, 0, 1, 3)), -1, (kd, kd))  # horizontal-line energy
 
     dark = (g < 165).astype(np.uint8)
     foot = cv2.morphologyEx(cv2.dilate(dark, np.ones((9, 9), np.uint8), 1), cv2.MORPH_CLOSE, np.ones((41, 41), np.uint8))
@@ -82,12 +109,30 @@ def detect(pdf_bytes, page_index, ft_per_in=8.0, zoom=2.0):
     for i in range(1, pn):
         if ps[i, cv2.CC_STAT_AREA] > 0.003 * smooth.size:
             smooth[pl == i] = True
-    textured = tidy(foot & (dens > 110)) & ~smooth
+
+    # all textured area, then split by LINE DENSITY (looser lap vs denser brick) via adaptive 2-means
+    textured = (foot & (dens > 60) & ~smooth)
+    tex_lo = np.zeros_like(textured); tex_hi = np.zeros_like(textured)
+    ys, xs = np.where(textured)
+    if len(xs) > 300:
+        vals = dens[ys, xs].reshape(-1, 1).astype(np.float32)
+        crit = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 12, 1.0)
+        _, lab, cen = cv2.kmeans(vals, 2, None, crit, 3, cv2.KMEANS_PP_CENTERS)
+        lab = lab.flatten(); hi = int(np.argmax(cen.flatten()))
+        # only split if the two texture modes are meaningfully apart (else it's one material)
+        if abs(cen[0, 0] - cen[1, 0]) > 22:
+            tex_lo[ys[lab != hi], xs[lab != hi]] = True
+            tex_hi[ys[lab == hi], xs[lab == hi]] = True
+        else:
+            tex_lo[ys, xs] = True
+    else:
+        tex_lo[ys, xs] = True
+    tex_lo = tidy(tex_lo); tex_hi = tidy(tex_hi) & ~tex_lo
 
     px2sf = (ft_per_in / render_dpi) ** 2
     polys = []
     pid = 0
-    for (name, color), mask in zip(GROUPS, [smooth, textured]):
+    for (name, color), mask in zip(GROUPS, [smooth, tex_lo, tex_hi]):
         col = [round(v, 3) for v in color]
         nc, clab, cst, _ = cv2.connectedComponentsWithStats(mask.astype(np.uint8), 8)
         for i in range(1, nc):
@@ -109,4 +154,4 @@ def detect(pdf_bytes, page_index, ft_per_in=8.0, zoom=2.0):
                           "fill_color": col, "source": "texture", "material": name,
                           "category": name, "label": f"~{round(sf):,} SF"})
             pid += 1
-    return polys, pix.width, pix.height
+    return polys, pix.width, pix.height, {"ft_per_in": round(ft_per_in, 3), "scale_confirmed": sc_confirmed}
