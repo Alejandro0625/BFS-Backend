@@ -9,7 +9,7 @@ Matches the existing React frontend contract:
   GET  /page-image/{jobId}/{page} -> PNG
   GET  /health
 """
-import os, io, re, uuid, threading, json, time
+import os, io, re, uuid, threading, json, time, shutil
 from collections import defaultdict
 import fitz  # PyMuPDF
 import texture  # full-res texture auto-detection for unmarked drawings
@@ -19,10 +19,78 @@ from fastapi.middleware.cors import CORSMiddleware
 
 # Where corrections accumulate as training data (mount a Railway volume here to persist).
 CORR_DIR = os.environ.get("CORRECTIONS_DIR", "/data/corrections")
+# Durable job store — jobs are also written here so takeoffs survive a restart/redeploy.
+JOBS_DIR = os.environ.get("JOBS_DIR", "/data/jobs")
+MAX_MEM_JOBS = int(os.environ.get("MAX_MEM_JOBS", "20"))   # cap RAM: never OOM (evicted jobs live on disk)
+MAX_DISK_JOBS = int(os.environ.get("MAX_DISK_JOBS", "200"))  # cap volume: prune oldest persisted jobs
+MAX_AUTO_PAGES = int(os.environ.get("MAX_AUTO_PAGES", "30"))  # cap texture auto-detect work per PDF
 
 app = FastAPI(title="BFS Clean Backend")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
-jobs = {}  # jobId -> dict
+jobs = {}  # jobId -> dict  (in-memory hot cache, bounded to MAX_MEM_JOBS)
+
+# ── durable, bounded job store ───────────────────────────────────────────────
+# The old code kept every uploaded PDF in `jobs` forever → unbounded RAM → OOM.
+# Now: keep a small hot set in RAM, persist each job to the volume, rehydrate on demand.
+def _job_dir(jid): return os.path.join(JOBS_DIR, str(jid))
+
+def _persist_job(jid):
+    """Snapshot a job to the volume so it survives eviction + restarts. Best-effort (no-op if no volume)."""
+    job = jobs.get(jid)
+    if not job: return
+    try:
+        d = _job_dir(jid); os.makedirs(d, exist_ok=True)
+        if job.get("pdf") and not os.path.exists(os.path.join(d, "input.pdf")):
+            with open(os.path.join(d, "input.pdf"), "wb") as fh: fh.write(job["pdf"])
+        meta = {k: job.get(k) for k in ("status", "phase", "progress", "legend", "takeoffData",
+                "scheduleData", "error", "polygons_by_page", "dims_by_page", "log", "projName")}
+        with open(os.path.join(d, "job.json"), "w", encoding="utf-8") as fh:
+            json.dump(meta, fh)
+    except Exception:
+        pass  # persistence is a bonus; the app still works from RAM without a volume
+
+def _load_job(jid):
+    d = _job_dir(jid)
+    if not os.path.isdir(d): return None
+    try:
+        with open(os.path.join(d, "job.json"), encoding="utf-8") as fh:
+            meta = json.load(fh)
+        for k in ("polygons_by_page", "dims_by_page"):  # JSON stringifies int page keys → restore them
+            meta[k] = {int(kk): vv for kk, vv in (meta.get(k) or {}).items()}
+        p = os.path.join(d, "input.pdf")
+        meta["pdf"] = open(p, "rb").read() if os.path.exists(p) else None
+        return meta
+    except Exception:
+        return None
+
+def get_job(jid):
+    """Hot cache first, else rehydrate the job from the durable store (survives restart/eviction)."""
+    j = jobs.get(jid)
+    if j is None:
+        j = _load_job(jid)
+        if j is not None: jobs[jid] = j
+    return j
+
+def _evict_mem():
+    """Keep RAM bounded — drop oldest *finished* jobs (they persist on disk, rehydrate on access)."""
+    if len(jobs) <= MAX_MEM_JOBS: return
+    for jid in list(jobs.keys()):
+        if len(jobs) <= MAX_MEM_JOBS: break
+        if jobs[jid].get("status") in ("done", "error"):
+            _persist_job(jid); jobs.pop(jid, None)
+
+def _gc_disk():
+    """Keep the volume bounded — prune the oldest persisted job folders."""
+    try:
+        if not os.path.isdir(JOBS_DIR): return
+        dirs = [os.path.join(JOBS_DIR, d) for d in os.listdir(JOBS_DIR)]
+        dirs = [d for d in dirs if os.path.isdir(d)]
+        if len(dirs) <= MAX_DISK_JOBS: return
+        dirs.sort(key=lambda d: os.path.getmtime(d))
+        for d in dirs[:-MAX_DISK_JOBS]:
+            shutil.rmtree(d, ignore_errors=True)
+    except Exception:
+        pass
 
 # ── helpers ────────────────────────────────────────────────────────────────
 def shoelace(pts):
@@ -94,6 +162,7 @@ def process(jid, pdf_bytes):
         n = doc.page_count
         jlog(job, f"PDF loaded — {n} page(s)", "ok")
         legend = {}
+        auto_used = 0  # cap expensive texture renders so a big unmarked PDF can't blow memory
         for pi in range(n):
             job["progress"] = {"label": f"Reading page {pi+1} of {n}", "pct": 5 + int(90 * pi / max(n, 1))}
             job["phase"] = "analyzing"
@@ -101,12 +170,12 @@ def process(jid, pdf_bytes):
             ft = 8.0  # scale fallback; digitize SF comes from the markup's own labels
             polys = extract_page_polygons(pg, pw, ph, ft)
             auto = False
-            if not polys:
+            if not polys and auto_used < MAX_AUTO_PAGES:
                 # no estimator markup on this page -> texture auto-detect (suggestions)
                 try:
                     tpolys, _, _ = texture.detect(pdf_bytes, pi, ft_per_in=ft, zoom=2.0)
                     if tpolys:
-                        polys = tpolys; auto = True
+                        polys = tpolys; auto = True; auto_used += 1
                 except Exception as te:
                     jlog(job, f"Page {pi+1}: auto-detect skipped ({te})", "warn")
             job["polygons_by_page"][pi + 1] = polys
@@ -145,25 +214,28 @@ def process(jid, pdf_bytes):
             jlog(job, f"Done — {len(job['takeoffData'])} page(s), {round(total):,} SF total", "success")
         job["status"] = "done"; job["phase"] = "done"
         job["progress"] = {"label": "Complete", "pct": 100}
+        _persist_job(jid)  # durable: this takeoff now survives a restart/redeploy
     except Exception as e:
         import traceback; traceback.print_exc()
         job["status"] = "error"; job["phase"] = "error"; job["error"] = str(e)
         jlog(job, f"Error: {e}", "error")
+        _persist_job(jid)
 
 # ── endpoints ──────────────────────────────────────────────────────────────
 @app.post("/analyze")
 async def analyze(background_tasks: BackgroundTasks, pdf: UploadFile = File(...)):
     data = await pdf.read()
-    jid = str(int(__import__("time").time() * 1000))
+    jid = f"{int(time.time() * 1000)}-{uuid.uuid4().hex[:6]}"  # collision-proof (no same-ms overwrite)
     jobs[jid] = {"status": "queued", "phase": "idle", "log": [], "progress": {"label": "Queued", "pct": 0},
                  "legend": [], "takeoffData": [], "scheduleData": None, "error": None,
                  "polygons_by_page": {}, "dims_by_page": {}, "pdf": data}
+    _persist_job(jid); _evict_mem(); _gc_disk()  # durable + bounded RAM + bounded disk
     background_tasks.add_task(process, jid, data)
     return {"jobId": jid}
 
 @app.get("/status/{jid}")
 def status(jid: str):
-    j = jobs.get(jid)
+    j = get_job(jid)
     if not j: raise HTTPException(404, "job not found")
     return {"status": j["status"], "phase": j.get("phase", ""), "log": j["log"], "progress": j["progress"],
             "legend": j.get("legend", []), "takeoffData": j.get("takeoffData", []),
@@ -171,7 +243,7 @@ def status(jid: str):
 
 @app.get("/polygons/{jid}/{page}")
 def polygons(jid: str, page: int):
-    j = jobs.get(jid)
+    j = get_job(jid)
     if not j: raise HTTPException(404, "job not found")
     dims = j.get("dims_by_page", {}).get(page) or {"width": 612, "height": 792}
     return {"polygons": j.get("polygons_by_page", {}).get(page, []),
@@ -179,8 +251,8 @@ def polygons(jid: str, page: int):
 
 @app.get("/page-image/{jid}/{page}")
 def page_image(jid: str, page: int):
-    j = jobs.get(jid)
-    if not j: raise HTTPException(404, "job not found")
+    j = get_job(jid)
+    if not j or not j.get("pdf"): raise HTTPException(404, "job not found")
     doc = fitz.open(stream=j["pdf"], filetype="pdf")
     if page < 1 or page > doc.page_count:
         doc.close(); raise HTTPException(404, "page out of range")
@@ -193,7 +265,7 @@ def learn(payload: dict = Body(...)):
     """Capture a manual/corrected takeoff as labeled training data (the flywheel).
     payload: {jobId, page, shapes:[{points,name,color,type}], source}"""
     jid = payload.get("jobId")
-    job = jobs.get(jid)
+    job = get_job(jid)
     try:
         os.makedirs(CORR_DIR, exist_ok=True)
         ts = str(int(time.time() * 1000))
@@ -220,7 +292,7 @@ def learn_status():
 
 @app.get("/evidence-pdf/{jid}")
 def evidence_pdf(jid: str):
-    j = jobs.get(jid)
+    j = get_job(jid)
     if not j or not j.get("pdf"):
         raise HTTPException(404, "job not found")
     src = fitz.open(stream=j["pdf"], filetype="pdf")
@@ -281,4 +353,9 @@ async def scope_read(pdf: UploadFile = File(...)):
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "engine": "digitize-markup", "deps": "pymupdf-light"}
+    try:
+        on_disk = len([d for d in os.listdir(JOBS_DIR) if os.path.isdir(os.path.join(JOBS_DIR, d))]) if os.path.isdir(JOBS_DIR) else 0
+    except Exception:
+        on_disk = 0
+    return {"status": "ok", "engine": "digitize-markup", "deps": "pymupdf-light",
+            "jobs_in_mem": len(jobs), "jobs_on_disk": on_disk, "mem_cap": MAX_MEM_JOBS}
