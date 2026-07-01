@@ -12,7 +12,8 @@ Matches the existing React frontend contract:
 import os, io, re, uuid, threading, json, time, shutil
 from collections import defaultdict
 import fitz  # PyMuPDF
-import texture  # full-res texture auto-detection for unmarked drawings
+import texture  # classical-CV texture fallback for unmarked drawings
+import model_infer  # trained cladding-extent model (ONNX) — the real auto-markup for RAW drawings
 from fastapi import FastAPI, UploadFile, File, BackgroundTasks, HTTPException, Body
 from fastapi.responses import Response
 from fastapi.middleware.cors import CORSMiddleware
@@ -265,11 +266,16 @@ def process(jid, pdf_bytes):
             polys = polys + lin_sf_polys
             for i, p in enumerate(polys):
                 p["id"] = i  # unique ids across polygons + linear runs
-            auto = False; scale_conf = True; scale_val = None
+            auto = False; scale_conf = True; scale_val = None; auto_engine = None
             if not polys and not doc_has_markup and auto_used < MAX_AUTO_PAGES:
-                # no estimator markup on this page -> texture auto-detect (suggestions)
+                # RAW/clean page -> auto-markup. Prefer the trained MODEL; fall back to texture heuristics.
                 try:
-                    tpolys, _, _, sinfo = texture.detect(pdf_bytes, pi, ft_per_in=ft, zoom=2.0)
+                    if model_infer.available():
+                        tpolys, _, _, sinfo = model_infer.detect(pdf_bytes, pi, zoom=2.0)
+                        auto_engine = "model"
+                    else:
+                        tpolys, _, _, sinfo = texture.detect(pdf_bytes, pi, ft_per_in=ft, zoom=2.0)
+                        auto_engine = "texture"
                     if tpolys:
                         polys = tpolys; auto = True; auto_used += 1
                         scale_conf = bool(sinfo.get("scale_confirmed")); scale_val = sinfo.get("ft_per_in")
@@ -286,7 +292,7 @@ def process(jid, pdf_bytes):
                 bymat[key]["sf"] += p["area_sf"]; bymat[key]["n"] += 1
                 bymat[key]["category"] = p.get("category")
             zones = []
-            src_txt = "AI texture (confirm)" if auto else "markup"
+            src_txt = ("AI model (confirm)" if auto_engine == "model" else "AI texture (confirm)") if auto else "markup"
             for mat, d in bymat.items():
                 cat = d["category"] or "Other"
                 zones.append({
@@ -470,11 +476,26 @@ async def scope_read(pdf: UploadFile = File(...)):
     txt = "\n\n".join(parts)
     return {"text": txt, "chars": len(txt), "pages": len(parts)}
 
+@app.post("/admin/upload-model")
+async def upload_model(model: UploadFile = File(...), key: str = ""):
+    """One-time: load the trained ONNX model onto the volume so RAW drawings get model auto-markup.
+    Guarded by ADMIN_KEY. Persists to /data (survives redeploys)."""
+    if key != os.environ.get("ADMIN_KEY", "bfs-model-load"):
+        raise HTTPException(403, "bad key")
+    data = await model.read()
+    path = os.environ.get("MODEL_ONNX", "/data/model.onnx")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "wb") as fh:
+        fh.write(data)
+    model_infer.reset()
+    return {"ok": True, "bytes": len(data), "model_available": model_infer.available()}
+
 @app.get("/health")
 def health():
     try:
         on_disk = len([d for d in os.listdir(JOBS_DIR) if os.path.isdir(os.path.join(JOBS_DIR, d))]) if os.path.isdir(JOBS_DIR) else 0
     except Exception:
         on_disk = 0
-    return {"status": "ok", "engine": "digitize-markup", "deps": "pymupdf-light",
+    return {"status": "ok", "engine": "digitize-markup", "deps": "pymupdf+onnx",
+            "auto_engine": "model" if model_infer.available() else "texture",
             "jobs_in_mem": len(jobs), "jobs_on_disk": on_disk, "mem_cap": MAX_MEM_JOBS}
