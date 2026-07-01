@@ -427,16 +427,29 @@ def learn_status():
     return {"corrections": n}
 
 @app.get("/evidence-pdf/{jid}")
-def evidence_pdf(jid: str):
+def evidence_pdf(jid: str, materials: str = ""):
+    """Marked-up evidence PDF: cover summary + each page with the regions OUTLINED in their color and
+    labeled with SF. Optional ?materials=A,B filters to only what the estimator selected."""
     j = get_job(jid)
     if not j or not j.get("pdf"):
         raise HTTPException(404, "job not found")
+    sel = set(m.strip().lower() for m in materials.split(",") if m.strip()) if materials else None
+    def _match(name, cat):
+        return (str(name or "").lower() in sel) or (str(cat or "").lower() in sel)
+    # safety: if the selection matches nothing (e.g. renamed groups), mark everything — never a blank PDF
+    if sel is not None and not any(_match(z.get("materialName"), z.get("category"))
+                                   for el in j.get("takeoffData", []) for z in el.get("zones", [])):
+        sel = None
+    def keep(name, cat):
+        return True if sel is None else _match(name, cat)
     src = fitz.open(stream=j["pdf"], filetype="pdf")
     out = fitz.open()
-    # summary cover page
+    # summary cover page (filtered to her selection when given)
     mats = {}; tot = 0.0
     for el in j.get("takeoffData", []):
         for z in el.get("zones", []):
+            if not keep(z.get("materialName"), z.get("category")):
+                continue
             k = z.get("materialName", "Material"); mats[k] = mats.get(k, 0) + z.get("netArea", 0); tot += z.get("netArea", 0)
     cov = out.new_page(width=612, height=792)
     cov.insert_text((50, 60), "Boston Facade Systems — Takeoff Evidence", fontsize=17, color=(0.05, 0.11, 0.18))
@@ -451,16 +464,24 @@ def evidence_pdf(jid: str):
     y += 6; cov.draw_line((50, y), (500, y), color=(0.8, 0.83, 0.87)); y += 22
     cov.insert_text((50, y), "TOTAL", fontsize=12, color=(0.05, 0.11, 0.18))
     cov.insert_text((360, y), f"{tot:,.0f} SF", fontsize=12, color=(0.05, 0.11, 0.18))
-    # append each measured page with SF labels at each region
+    # each page: OUTLINE each kept region in its color + label the SF (a real marked-up sheet)
     for el in j.get("takeoffData", []):
         pn = el.get("pageNumber")
-        if not pn or pn < 1 or pn > src.page_count: continue
+        if not pn or pn < 1 or pn > src.page_count:
+            continue
+        page_polys = [p for p in j.get("polygons_by_page", {}).get(pn, []) if keep(p.get("material"), p.get("category"))]
+        if not page_polys:
+            continue
         out.insert_pdf(src, from_page=pn - 1, to_page=pn - 1)
         pg = out[-1]; pw, ph = pg.rect.width, pg.rect.height
-        for p in j.get("polygons_by_page", {}).get(pn, []):
+        for p in page_polys:
+            col = p.get("fill_color") or [0.85, 0.1, 0.1]
+            col = tuple(float(c) for c in col[:3])
+            pts = [(float(x) * pw, float(y) * ph) for x, y in (p.get("points") or [])]
+            if len(pts) >= 3:
+                pg.draw_polyline(pts + [pts[0]], color=col, width=1.3)
             cx, cy = p.get("cx", 0.5) * pw, p.get("cy", 0.5) * ph
-            lbl = f"{p.get('area_sf', 0):,.0f} SF"
-            pg.insert_text((cx - 18, cy), lbl, fontsize=8, color=(0.6, 0.0, 0.0))
+            pg.insert_text((cx - 18, cy), f"{p.get('area_sf', 0):,.0f} SF", fontsize=8, color=(0.55, 0.0, 0.0))
     data = out.tobytes(); out.close(); src.close()
     return Response(content=data, media_type="application/pdf",
                     headers={"Content-Disposition": f'attachment; filename="BFS_Evidence_{jid}.pdf"'})
