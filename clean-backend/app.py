@@ -218,6 +218,45 @@ def learn_status():
         n = 0
     return {"corrections": n}
 
+@app.get("/evidence-pdf/{jid}")
+def evidence_pdf(jid: str):
+    j = jobs.get(jid)
+    if not j or not j.get("pdf"):
+        raise HTTPException(404, "job not found")
+    src = fitz.open(stream=j["pdf"], filetype="pdf")
+    out = fitz.open()
+    # summary cover page
+    mats = {}; tot = 0.0
+    for el in j.get("takeoffData", []):
+        for z in el.get("zones", []):
+            k = z.get("materialName", "Material"); mats[k] = mats.get(k, 0) + z.get("netArea", 0); tot += z.get("netArea", 0)
+    cov = out.new_page(width=612, height=792)
+    cov.insert_text((50, 60), "Boston Facade Systems — Takeoff Evidence", fontsize=17, color=(0.05, 0.11, 0.18))
+    cov.insert_text((50, 84), (j.get("projName") or "Project"), fontsize=11, color=(0.4, 0.45, 0.5))
+    y = 130
+    cov.insert_text((50, y), "Material", fontsize=10, color=(0.4, 0.45, 0.5))
+    cov.insert_text((360, y), "Net SF", fontsize=10, color=(0.4, 0.45, 0.5)); y += 8
+    cov.draw_line((50, y), (500, y), color=(0.8, 0.83, 0.87)); y += 20
+    for k, sf in sorted(mats.items(), key=lambda x: -x[1]):
+        cov.insert_text((50, y), str(k)[:48], fontsize=11)
+        cov.insert_text((360, y), f"{sf:,.0f}", fontsize=11); y += 22
+    y += 6; cov.draw_line((50, y), (500, y), color=(0.8, 0.83, 0.87)); y += 22
+    cov.insert_text((50, y), "TOTAL", fontsize=12, color=(0.05, 0.11, 0.18))
+    cov.insert_text((360, y), f"{tot:,.0f} SF", fontsize=12, color=(0.05, 0.11, 0.18))
+    # append each measured page with SF labels at each region
+    for el in j.get("takeoffData", []):
+        pn = el.get("pageNumber")
+        if not pn or pn < 1 or pn > src.page_count: continue
+        out.insert_pdf(src, from_page=pn - 1, to_page=pn - 1)
+        pg = out[-1]; pw, ph = pg.rect.width, pg.rect.height
+        for p in j.get("polygons_by_page", {}).get(pn, []):
+            cx, cy = p.get("cx", 0.5) * pw, p.get("cy", 0.5) * ph
+            lbl = f"{p.get('area_sf', 0):,.0f} SF"
+            pg.insert_text((cx - 18, cy), lbl, fontsize=8, color=(0.6, 0.0, 0.0))
+    data = out.tobytes(); out.close(); src.close()
+    return Response(content=data, media_type="application/pdf",
+                    headers={"Content-Disposition": f'attachment; filename="BFS_Evidence_{jid}.pdf"'})
+
 @app.get("/health")
 def health():
     return {"status": "ok", "engine": "digitize-markup", "deps": "pymupdf-light"}
