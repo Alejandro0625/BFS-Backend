@@ -139,9 +139,9 @@ def extract_page_polygons(pg, pw, ph, ft_per_in):
         pts_pdf = [(v[0], v[1]) if isinstance(v, (list, tuple)) else (v.x, v.y) for v in verts]
         m = re.search(r"([\d,]+(?:\.\d+)?)\s*sf", content, re.I)
         if m:
-            sf = float(m.group(1).replace(",", ""))
+            sf = float(m.group(1).replace(",", "")); sf_exact = True   # estimator's own measured SF — ground truth
         else:
-            sf = round(shoelace(pts_pdf) * (ft_per_in / 72.0) ** 2, 1)
+            sf = round(shoelace(pts_pdf) * (ft_per_in / 72.0) ** 2, 1); sf_exact = False  # geometry estimate (needs scale)
         norm = [[round(x / pw, 5), round(y / ph, 5)] for (x, y) in pts_pdf]
         cx = round(sum(p[0] for p in norm) / len(norm), 5)
         cy = round(sum(p[1] for p in norm) / len(norm), 5)
@@ -149,7 +149,7 @@ def extract_page_polygons(pg, pw, ph, ft_per_in):
             "id": len(polys), "points": norm, "area_sf": sf, "cx": cx, "cy": cy,
             "fill_color": [round(c, 3) for c in fill] if fill else None,
             "source": "bluebeam", "material": subject or None,
-            "category": categorize(subject), "label": content,
+            "category": categorize(subject), "label": content, "sf_exact": sf_exact,
         })
     return polys
 
