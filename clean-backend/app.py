@@ -238,12 +238,15 @@ def flag_label_outliers(polys, pw, ph):
     return warns
 
 def is_elevation_page(pg):
-    """Auto-crop: in a long blank set, only ELEVATION pages carry cladding to mark (skip plans/details/cover)."""
+    """Auto-crop to the pages the estimator actually measures = elevations, returns, soffits
+    (her step 4-5). Skip plans/details/schedules/cover so we don't invent cladding there."""
     try:
         t = (pg.get_text() or "").lower()
     except Exception:
         return False
-    return ("elevation" in t) and ("roof plan" not in t) and ("floor plan" not in t)
+    if ("roof plan" in t) or ("floor plan" in t):
+        return False
+    return ("elevation" in t) or ("return" in t) or ("soffit" in t)
 
 def process(jid, pdf_bytes):
     job = jobs[jid]
