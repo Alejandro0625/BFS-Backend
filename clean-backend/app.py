@@ -257,6 +257,28 @@ def evidence_pdf(jid: str):
     return Response(content=data, media_type="application/pdf",
                     headers={"Content-Disposition": f'attachment; filename="BFS_Evidence_{jid}.pdf"'})
 
+@app.post("/scope-read")
+async def scope_read(pdf: UploadFile = File(...)):
+    """Extract text (+ estimator's checkmarks/notes) from a scope PDF so the Scope tab can read PDFs, not just Excel."""
+    data = await pdf.read()
+    try:
+        doc = fitz.open(stream=data, filetype="pdf")
+    except Exception:
+        raise HTTPException(400, "not a readable PDF")
+    npages = doc.page_count
+    parts = []
+    for i in range(min(npages, 40)):
+        t = doc[i].get_text() or ""
+        anns = [a.info.get("content", "") for a in (doc[i].annots() or []) if a.info.get("content", "")]
+        block = t
+        if anns:
+            block += "\n[estimator marks/notes on page: " + " | ".join(anns[:60]) + "]"
+        if block.strip():
+            parts.append(f"# Page {i+1}\n{block}")
+    doc.close()
+    txt = "\n\n".join(parts)
+    return {"text": txt, "chars": len(txt), "pages": len(parts)}
+
 @app.get("/health")
 def health():
     return {"status": "ok", "engine": "digitize-markup", "deps": "pymupdf-light"}
