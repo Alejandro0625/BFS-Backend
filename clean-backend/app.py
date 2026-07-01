@@ -237,6 +237,14 @@ def flag_label_outliers(polys, pw, ph):
             warns.append(f"{p.get('material') or p.get('category') or 'A region'}: " + p["sf_warn_msg"])
     return warns
 
+def is_elevation_page(pg):
+    """Auto-crop: in a long blank set, only ELEVATION pages carry cladding to mark (skip plans/details/cover)."""
+    try:
+        t = (pg.get_text() or "").lower()
+    except Exception:
+        return False
+    return ("elevation" in t) and ("roof plan" not in t) and ("floor plan" not in t)
+
 def process(jid, pdf_bytes):
     job = jobs[jid]
     try:
@@ -256,6 +264,8 @@ def process(jid, pdf_bytes):
                     doc_has_markup = True; break
             except Exception:
                 pass
+        # auto-crop: which pages are elevations? (only mark those; if none detectable, fall back to all)
+        doc_any_elevation = any(is_elevation_page(doc[pi]) for pi in range(n))
         for pi in range(n):
             job["progress"] = {"label": f"Reading page {pi+1} of {n}", "pct": 5 + int(90 * pi / max(n, 1))}
             job["phase"] = "analyzing"
@@ -267,7 +277,8 @@ def process(jid, pdf_bytes):
             for i, p in enumerate(polys):
                 p["id"] = i  # unique ids across polygons + linear runs
             auto = False; scale_conf = True; scale_val = None; auto_engine = None
-            if not polys and not doc_has_markup and auto_used < MAX_AUTO_PAGES:
+            page_is_elev = is_elevation_page(pg) or not doc_any_elevation  # only auto-mark elevations (or all if none detectable)
+            if not polys and not doc_has_markup and page_is_elev and auto_used < MAX_AUTO_PAGES:
                 # RAW/clean page -> auto-markup. Prefer the trained MODEL; fall back to texture heuristics.
                 try:
                     if model_infer.available():
