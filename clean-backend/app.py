@@ -196,13 +196,14 @@ def process(jid, pdf_bytes):
             pg = doc[pi]; pw, ph = pg.rect.width, pg.rect.height
             ft = 8.0  # scale fallback; digitize SF comes from the markup's own labels
             polys = extract_page_polygons(pg, pw, ph, ft)
-            auto = False
+            auto = False; scale_conf = True; scale_val = None
             if not polys and auto_used < MAX_AUTO_PAGES:
                 # no estimator markup on this page -> texture auto-detect (suggestions)
                 try:
-                    tpolys, _, _ = texture.detect(pdf_bytes, pi, ft_per_in=ft, zoom=2.0)
+                    tpolys, _, _, sinfo = texture.detect(pdf_bytes, pi, ft_per_in=ft, zoom=2.0)
                     if tpolys:
                         polys = tpolys; auto = True; auto_used += 1
+                        scale_conf = bool(sinfo.get("scale_confirmed")); scale_val = sinfo.get("ft_per_in")
                 except Exception as te:
                     jlog(job, f"Page {pi+1}: auto-detect skipped ({te})", "warn")
             sf_warns = flag_label_outliers(polys, pw, ph) if not auto else []  # catch typo'd markup labels
@@ -225,12 +226,22 @@ def process(jid, pdf_bytes):
                     "totalOpeningArea": 0, "description": f"{d['n']} region(s) from {src_txt}",
                 })
                 legend[mat] = {"id": mat, "name": mat, "category": cat}
+            auto_flags = []
+            if auto:
+                auto_flags.append("AI suggestion — verify SF before bidding")
+                if not scale_conf:
+                    # scale could NOT be read → SF used a default 8.0 and is unreliable. Force a calibrate.
+                    auto_flags.append("Scale could not be read on this sheet — calibrate before trusting SF (SF may be off several ×)")
+                else:
+                    auto_flags.append(f"Scale read as 1\"={scale_val}' — verify")
             job["takeoffData"].append({
                 "pageNumber": pi + 1, "title": f"Sheet page {pi+1}", "sheetRef": f"p{pi+1}",
-                "scale": "auto (calibrate)" if auto else "from markup",
-                "scaleSource": "AI auto — verify" if auto else "estimator markup", "building": "Building",
+                "scale": (f"1\"={scale_val}'" if (auto and scale_conf) else "auto (calibrate)") if auto else "from markup",
+                "scaleSource": ("default" if (auto and not scale_conf) else ("AI auto — verify" if auto else "estimator markup")),
+                "verifiedScale": bool(auto and scale_conf),
+                "building": "Building",
                 "zones": zones,
-                "flags": (["AI suggestion — verify SF before bidding"] if auto else []) + sf_warns,
+                "flags": auto_flags + sf_warns,
                 "source": "texture-auto" if auto else "digitize",
             })
             jlog(job, f"Page {pi+1}: " + (f"{len(polys)} AI-suggested zone(s)" if auto else f"{len(polys)} marked region(s)") + f", {len(zones)} material(s)", "warn" if auto else "ok")
