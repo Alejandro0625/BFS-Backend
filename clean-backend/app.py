@@ -153,6 +153,33 @@ def extract_page_polygons(pg, pw, ph, ft_per_in):
         })
     return polys
 
+def flag_label_outliers(polys, pw, ph):
+    """Money-safety: catch a typo'd/mislabeled SF before it reaches a bid.
+    Every marked polygon on ONE sheet shares ONE scale, so back it out per-poly and flag any
+    whose typed SF label disagrees with its geometry (area is rotation-invariant → safe).
+    Non-destructive: only sets a warning, never changes an SF. Returns page-level warning strings."""
+    scales = []
+    for p in polys:
+        if not p.get("sf_exact") or p.get("area_sf", 0) <= 0:
+            continue
+        sh = shoelace(p["points"]) * pw * ph  # normalized-shoelace → PDF points^2
+        if sh > 0:
+            scales.append(((72.0 * (p["area_sf"] / sh) ** 0.5), p))  # implied ft-per-inch
+    if len(scales) < 3:  # need a few labeled regions to establish the sheet's true scale
+        return []
+    med = sorted(s for s, _ in scales)[len(scales) // 2]
+    if med <= 0:
+        return []
+    warns = []
+    for s, p in scales:
+        r = s / med
+        if r > 1.32 or r < 0.76:  # area off by >~1.75x vs the sheet's consistent scale = almost certainly a mistake
+            implied = p["area_sf"] * (med / s) ** 2
+            p["sf_warn"] = True
+            p["sf_warn_msg"] = f"labeled {p['area_sf']:,.0f} SF but this sheet's scale implies ≈{implied:,.0f} SF — verify"
+            warns.append(f"{p.get('material') or p.get('category') or 'A region'}: " + p["sf_warn_msg"])
+    return warns
+
 def process(jid, pdf_bytes):
     job = jobs[jid]
     try:
@@ -178,6 +205,7 @@ def process(jid, pdf_bytes):
                         polys = tpolys; auto = True; auto_used += 1
                 except Exception as te:
                     jlog(job, f"Page {pi+1}: auto-detect skipped ({te})", "warn")
+            sf_warns = flag_label_outliers(polys, pw, ph) if not auto else []  # catch typo'd markup labels
             job["polygons_by_page"][pi + 1] = polys
             job["dims_by_page"][pi + 1] = {"width": pw, "height": ph}
             if not polys:
@@ -201,10 +229,13 @@ def process(jid, pdf_bytes):
                 "pageNumber": pi + 1, "title": f"Sheet page {pi+1}", "sheetRef": f"p{pi+1}",
                 "scale": "auto (calibrate)" if auto else "from markup",
                 "scaleSource": "AI auto — verify" if auto else "estimator markup", "building": "Building",
-                "zones": zones, "flags": (["AI suggestion — verify SF before bidding"] if auto else []),
+                "zones": zones,
+                "flags": (["AI suggestion — verify SF before bidding"] if auto else []) + sf_warns,
                 "source": "texture-auto" if auto else "digitize",
             })
             jlog(job, f"Page {pi+1}: " + (f"{len(polys)} AI-suggested zone(s)" if auto else f"{len(polys)} marked region(s)") + f", {len(zones)} material(s)", "warn" if auto else "ok")
+            for w in sf_warns:
+                jlog(job, f"Page {pi+1}: ⚠ {w}", "warn")
         doc.close()
         job["legend"] = list(legend.values())
         total = sum(z["netArea"] for e in job["takeoffData"] for z in e["zones"])
