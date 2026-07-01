@@ -153,6 +153,62 @@ def extract_page_polygons(pg, pw, ph, ft_per_in):
         })
     return polys
 
+def _feet(s):
+    """Parse feet-inches ('43\\'-3\"', '12\\'-0', '7\\'-2\"') → float feet."""
+    m = re.search(r"(\d+)\s*'\s*-?\s*(\d+)?", s or "")
+    if not m:
+        return None
+    return int(m.group(1)) + (int(m.group(2)) if m.group(2) else 0) / 12.0
+
+def _height_of(subj):
+    m = re.search(r"H\s*[:=]\s*(\d+)\s*'\s*-?\s*(\d+)?", subj or "", re.I)
+    if not m:
+        return None
+    return int(m.group(1)) + (int(m.group(2)) if m.group(2) else 0) / 12.0
+
+def _explicit_sf(s):
+    m = re.search(r"-?\s*([\d,]+(?:\.\d+)?)\s*sf", s or "", re.I)
+    return float(m.group(1).replace(",", "")) if m else None
+
+def _clean_material(subj):
+    return re.sub(r"\s*\(.*?\)\s*", " ", re.sub(r"-?\d+sf", "", subj or "", flags=re.I)).strip(" -:") or "Unlabeled"
+
+def extract_page_polylines(pg, pw, ph):
+    """Capture the estimator's LINEAR measurements (Bluebeam type-7 polylines) that the polygon path misses.
+    Length is exact (in the label). Height in the subject '(H:..)' → SF for cladding runs; else LF (trim/soffit).
+    Returns (sf_polys, lf_items): sf_polys look like polygon dicts (added to the takeoff SF total); lf_items are {material, lf}."""
+    sf_polys, lf_items = [], []
+    for a in (pg.annots() or []):
+        if a.type[0] != 7:  # 7 = PolyLine (length measurement)
+            continue
+        info = a.info or {}
+        content = info.get("content", "") or ""
+        subject = info.get("subject", "") or ""
+        length_ft = _feet(content)
+        if not length_ft:  # not a length measurement (e.g. a plain leader line) → skip
+            continue
+        mat = _clean_material(subject)
+        esf = _explicit_sf(subject) or _explicit_sf(content)
+        h = _height_of(subject)
+        stroke = a.colors.get("stroke") if a.colors else None
+        if esf or h:  # a CLADDING run → SF (explicit, else length × wall height)
+            sf = round(esf if esf else length_ft * h, 1)
+            verts = a.vertices or []
+            pts_pdf = [(v[0], v[1]) if isinstance(v, (list, tuple)) else (v.x, v.y) for v in verts]
+            norm = [[round(x / pw, 5), round(y / ph, 5)] for (x, y) in pts_pdf] or [[0, 0]]
+            cx = round(sum(p[0] for p in norm) / len(norm), 5)
+            cy = round(sum(p[1] for p in norm) / len(norm), 5)
+            sf_polys.append({
+                "points": norm, "area_sf": sf, "cx": cx, "cy": cy,
+                "fill_color": [round(c, 3) for c in stroke] if stroke else None,
+                "source": "bluebeam-linear", "material": mat, "category": categorize(subject),
+                "label": f"{content} × {round(h,1) if h else '?'}' = {sf:,.0f} SF", "sf_exact": True,
+                "length_ft": round(length_ft, 1),
+            })
+        else:  # trim / soffit / fascia → LINEAR feet (priced per LF, no SF)
+            lf_items.append({"material": mat, "lf": round(length_ft, 1)})
+    return sf_polys, lf_items
+
 def flag_label_outliers(polys, pw, ph):
     """Money-safety: catch a typo'd/mislabeled SF before it reaches a bid.
     Every marked polygon on ONE sheet shares ONE scale, so back it out per-poly and flag any
@@ -160,8 +216,8 @@ def flag_label_outliers(polys, pw, ph):
     Non-destructive: only sets a warning, never changes an SF. Returns page-level warning strings."""
     scales = []
     for p in polys:
-        if not p.get("sf_exact") or p.get("area_sf", 0) <= 0:
-            continue
+        if p.get("source") != "bluebeam" or not p.get("sf_exact") or p.get("area_sf", 0) <= 0:
+            continue  # only true area polygons — linear runs have no meaningful shoelace area
         sh = shoelace(p["points"]) * pw * ph  # normalized-shoelace → PDF points^2
         if sh > 0:
             scales.append(((72.0 * (p["area_sf"] / sh) ** 0.5), p))  # implied ft-per-inch
@@ -190,14 +246,27 @@ def process(jid, pdf_bytes):
         jlog(job, f"PDF loaded — {n} page(s)", "ok")
         legend = {}
         auto_used = 0  # cap expensive texture renders so a big unmarked PDF can't blow memory
+        # If the estimator marked ANY page, this is a DIGITIZE job — don't texture-auto the other
+        # pages (they're plans/details, not cladding) or we inflate the bid with invented SF.
+        doc_has_markup = False
+        for pi in range(n):
+            try:
+                if any(a.type[0] in (6, 7) for a in (doc[pi].annots() or [])):
+                    doc_has_markup = True; break
+            except Exception:
+                pass
         for pi in range(n):
             job["progress"] = {"label": f"Reading page {pi+1} of {n}", "pct": 5 + int(90 * pi / max(n, 1))}
             job["phase"] = "analyzing"
             pg = doc[pi]; pw, ph = pg.rect.width, pg.rect.height
             ft = 8.0  # scale fallback; digitize SF comes from the markup's own labels
             polys = extract_page_polygons(pg, pw, ph, ft)
+            lin_sf_polys, lin_lf_items = extract_page_polylines(pg, pw, ph)  # estimator's linear measurements
+            polys = polys + lin_sf_polys
+            for i, p in enumerate(polys):
+                p["id"] = i  # unique ids across polygons + linear runs
             auto = False; scale_conf = True; scale_val = None
-            if not polys and auto_used < MAX_AUTO_PAGES:
+            if not polys and not doc_has_markup and auto_used < MAX_AUTO_PAGES:
                 # no estimator markup on this page -> texture auto-detect (suggestions)
                 try:
                     tpolys, _, _, sinfo = texture.detect(pdf_bytes, pi, ft_per_in=ft, zoom=2.0)
@@ -209,7 +278,7 @@ def process(jid, pdf_bytes):
             sf_warns = flag_label_outliers(polys, pw, ph) if not auto else []  # catch typo'd markup labels
             job["polygons_by_page"][pi + 1] = polys
             job["dims_by_page"][pi + 1] = {"width": pw, "height": ph}
-            if not polys:
+            if not polys and not lin_lf_items:  # keep pages that have linear (trim/LF) measurements even with no area polygons
                 continue
             bymat = defaultdict(lambda: {"sf": 0.0, "n": 0, "category": None})
             for p in polys:
@@ -234,6 +303,12 @@ def process(jid, pdf_bytes):
                     auto_flags.append("Scale could not be read on this sheet — calibrate before trusting SF (SF may be off several ×)")
                 else:
                     auto_flags.append(f"Scale read as 1\"={scale_val}' — verify")
+            # aggregate the estimator's LINEAR (LF) measurements — trim/soffit/fascia (priced per LF)
+            lin_by_mat = defaultdict(float)
+            for it in lin_lf_items:
+                lin_by_mat[it["material"]] += it["lf"]
+            linear_items = [{"material": m, "lf": round(v, 1)} for m, v in sorted(lin_by_mat.items(), key=lambda x: -x[1])]
+            n_lin_sf = len(lin_sf_polys)
             job["takeoffData"].append({
                 "pageNumber": pi + 1, "title": f"Sheet page {pi+1}", "sheetRef": f"p{pi+1}",
                 "scale": (f"1\"={scale_val}'" if (auto and scale_conf) else "auto (calibrate)") if auto else "from markup",
@@ -241,10 +316,12 @@ def process(jid, pdf_bytes):
                 "verifiedScale": bool(auto and scale_conf),
                 "building": "Building",
                 "zones": zones,
+                "linearItems": linear_items,
                 "flags": auto_flags + sf_warns,
                 "source": "texture-auto" if auto else "digitize",
             })
-            jlog(job, f"Page {pi+1}: " + (f"{len(polys)} AI-suggested zone(s)" if auto else f"{len(polys)} marked region(s)") + f", {len(zones)} material(s)", "warn" if auto else "ok")
+            extra = (f" + {n_lin_sf} linear run(s)" if n_lin_sf else "") + (f", {len(linear_items)} trim/LF item(s)" if linear_items else "")
+            jlog(job, f"Page {pi+1}: " + (f"{len(polys)} AI-suggested zone(s)" if auto else f"{len(polys)} marked region(s){extra}") + f", {len(zones)} material(s)", "warn" if auto else "ok")
             for w in sf_warns:
                 jlog(job, f"Page {pi+1}: ⚠ {w}", "warn")
         doc.close()
