@@ -472,8 +472,13 @@ def evidence_pdf(jid: str, materials: str = ""):
         page_polys = [p for p in j.get("polygons_by_page", {}).get(pn, []) if keep(p.get("material"), p.get("category"))]
         if not page_polys:
             continue
-        out.insert_pdf(src, from_page=pn - 1, to_page=pn - 1)
-        pg = out[-1]; pw, ph = pg.rect.width, pg.rect.height
+        # RENDER the page to a size-capped JPEG background (not the huge vector page) → small, emailable.
+        # The region outlines + SF labels are drawn as crisp VECTOR on top, so they stay sharp.
+        srcpage = src[pn - 1]; pw, ph = srcpage.rect.width, srcpage.rect.height
+        zoom = min(2.5, 2400.0 / max(pw, ph, 1))  # cap long side ~2400px regardless of sheet size
+        pix = srcpage.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
+        pg = out.new_page(width=pw, height=ph)
+        pg.insert_image(pg.rect, stream=pix.tobytes("jpg", jpg_quality=80))  # JPEG → colored sheets shrink hugely
         for p in page_polys:
             col = p.get("fill_color") or [0.85, 0.1, 0.1]
             col = tuple(float(c) for c in col[:3])
