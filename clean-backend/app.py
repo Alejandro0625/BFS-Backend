@@ -487,6 +487,56 @@ async def scope_read(pdf: UploadFile = File(...)):
     txt = "\n\n".join(parts)
     return {"text": txt, "chars": len(txt), "pages": len(parts)}
 
+@app.get("/snap-points/{jid}/{page}")
+def snap_points(jid: str, page: int):
+    """Bluebeam-style corner snap: the drawing's real CAD geometry → structural snap corners (endpoints +
+    intersections of the LONG horizontal/vertical lines = building outline, floor lines, major openings).
+    The estimator's clicks snap to these (pixel-perfect like Bluebeam); auto-markup can snap its edges too."""
+    j = get_job(jid)
+    if not j or not j.get("pdf"):
+        raise HTTPException(404, "job not found")
+    doc = fitz.open(stream=j["pdf"], filetype="pdf")
+    if page < 1 or page > doc.page_count:
+        doc.close(); raise HTTPException(404, "page out of range")
+    pg = doc[page - 1]; W, H = pg.rect.width, pg.rect.height
+    Lmin = 0.06 * max(W, H)  # "long" = structural, not window-mullion/brick/detail noise
+    hlines = []; vlines = []
+    try:
+        for d in pg.get_drawings():
+            for it in d["items"]:
+                segs = []
+                if it[0] == "l":
+                    segs = [(it[1].x, it[1].y, it[2].x, it[2].y)]
+                elif it[0] == "re":
+                    r = it[1]; segs = [(r.x0, r.y0, r.x1, r.y0), (r.x1, r.y0, r.x1, r.y1),
+                                       (r.x1, r.y1, r.x0, r.y1), (r.x0, r.y1, r.x0, r.y0)]
+                for (x1, y1, x2, y2) in segs:
+                    if (x2 - x1) ** 2 + (y2 - y1) ** 2 < Lmin ** 2:
+                        continue
+                    if abs(y2 - y1) < abs(x2 - x1) * 0.02:
+                        hlines.append((min(x1, x2), max(x1, x2), (y1 + y2) / 2))
+                    elif abs(x2 - x1) < abs(y2 - y1) * 0.02:
+                        vlines.append((min(y1, y2), max(y1, y2), (x1 + x2) / 2))
+    except Exception:
+        pass
+    doc.close()
+    hlines = hlines[:600]; vlines = vlines[:600]  # bound compute
+    pts = []
+    for (xa, xb, y) in hlines: pts += [(xa, y), (xb, y)]
+    for (ya, yb, x) in vlines: pts += [(x, ya), (x, yb)]
+    for (xa, xb, yh) in hlines:  # H×V intersections = true corners
+        for (ya, yb, xv) in vlines:
+            if xa - 2 <= xv <= xb + 2 and ya - 2 <= yh <= yb + 2:
+                pts.append((xv, yh))
+    keep = []
+    for pt in pts[:9000]:
+        if not any(abs(pt[0] - k[0]) < 6 and abs(pt[1] - k[1]) < 6 for k in keep):
+            keep.append(pt)
+        if len(keep) >= 1500:
+            break
+    norm = [[round(x / W, 5), round(y / H, 5)] for (x, y) in keep]
+    return {"points": norm, "width": W, "height": H, "count": len(norm)}
+
 @app.post("/admin/upload-model")
 async def upload_model(model: UploadFile = File(...), key: str = ""):
     """One-time: load the trained ONNX model onto the volume so RAW drawings get model auto-markup.
