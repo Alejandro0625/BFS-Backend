@@ -14,6 +14,7 @@ from collections import defaultdict
 import fitz  # PyMuPDF
 import texture  # classical-CV texture fallback for unmarked drawings
 import model_infer  # trained cladding-extent model (ONNX) — the real auto-markup for RAW drawings
+import vector_hatch  # reads the DRAWN pattern vectors (seam trains + gray fills) — exact, preferred on clean pages
 import snap_fill  # coloring-book BUCKET fill + corner-snap → exact SF from vector geometry (assist layer)
 import material_groups  # within-job texture grouping → a selectable PREVIEW of material groups (assist layer)
 from fastapi import FastAPI, UploadFile, File, BackgroundTasks, HTTPException, Body
@@ -391,20 +392,29 @@ def process(jid, pdf_bytes):
             auto = False; scale_conf = True; scale_val = None; auto_engine = None
             page_is_elev = is_elevation_page(pg) or not doc_any_elevation  # only auto-mark elevations (or all if none detectable)
             if not polys and not doc_has_markup and page_is_elev and auto_used < MAX_AUTO_PAGES:
-                # RAW/clean page -> auto-markup. Prefer the trained MODEL; fall back to texture heuristics.
+                # RAW/clean page -> auto-markup. Engine order: VECTOR (reads the drawn pattern —
+                # exact geometry, openings netted) -> trained MODEL -> texture heuristics.
                 try:
                     auto_tried += 1
-                    if model_infer.available():
-                        tpolys, _, _, sinfo = model_infer.detect(pdf_bytes, pi, zoom=2.0)
-                        auto_engine = "model"
-                    else:
-                        tpolys, _, _, sinfo = texture.detect(pdf_bytes, pi, ft_per_in=ft, zoom=2.0)
-                        auto_engine = "texture"
+                    tpolys = []; sinfo = {}
+                    try:
+                        tpolys, _, _, sinfo = vector_hatch.detect(pdf_bytes, pi)
+                        auto_engine = "vector"
+                    except Exception:
+                        tpolys = []
+                    if not tpolys:
+                        if model_infer.available():
+                            tpolys, _, _, sinfo = model_infer.detect(pdf_bytes, pi, zoom=2.0)
+                            auto_engine = "model"
+                        else:
+                            tpolys, _, _, sinfo = texture.detect(pdf_bytes, pi, ft_per_in=ft, zoom=2.0)
+                            auto_engine = "texture"
+                        if tpolys:
+                            try:
+                                tpolys = snap_auto_polys(pg, tpolys, pw, ph)  # lock AI shapes to the drawing's real corners
+                            except Exception:
+                                pass
                     if tpolys:
-                        try:
-                            tpolys = snap_auto_polys(pg, tpolys, pw, ph)  # lock AI shapes to the drawing's real corners
-                        except Exception:
-                            pass
                         polys = tpolys; auto = True; auto_used += 1; auto_hits += 1
                         scale_conf = bool(sinfo.get("scale_confirmed")); scale_val = sinfo.get("ft_per_in")
                 except Exception as te:
@@ -420,7 +430,7 @@ def process(jid, pdf_bytes):
                 bymat[key]["sf"] += p["area_sf"]; bymat[key]["n"] += 1
                 bymat[key]["category"] = p.get("category")
             zones = []
-            src_txt = ("AI model (confirm)" if auto_engine == "model" else "AI texture (confirm)") if auto else "markup"
+            src_txt = ({"vector": "drawing vectors (exact geometry)", "model": "AI model (confirm)"}.get(auto_engine, "AI texture (confirm)")) if auto else "markup"
             for mat, d in bymat.items():
                 cat = d["category"] or "Other"
                 zones.append({
@@ -431,7 +441,8 @@ def process(jid, pdf_bytes):
                 legend[mat] = {"id": mat, "name": mat, "category": cat}
             auto_flags = []
             if auto:
-                auto_flags.append("AI suggestion — verify SF before bidding")
+                auto_flags.append("Read from the drawing's pattern vectors — confirm which walls are in your scope"
+                                  if auto_engine == "vector" else "AI suggestion — verify SF before bidding")
                 if not scale_conf:
                     # scale could NOT be read → SF used a default 8.0 and is unreliable. Force a calibrate.
                     auto_flags.append("Scale could not be read on this sheet — calibrate before trusting SF (SF may be off several ×)")
