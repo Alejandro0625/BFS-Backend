@@ -34,29 +34,31 @@ def _read_scale(doc, pi):
         pass
     # normalize smart quotes / primes to plain " and '
     t = txt.replace("’", "'").replace("‘", "'").replace("”", '"').replace("“", '"').replace("″", '"').replace("′", "'")
-    found = []
-    # architectural fraction:  A/B" = 1'   (e.g. 1/8"=1'-0", 3/16" = 1'-0")  -> ft_per_in = B/A
-    for m in re.finditer(r'(\d+)\s*/\s*(\d+)\s*"?\s*(?:in\.?)?\s*=\s*1\s*\'', t, re.I):
+    # ELEVATION/PLAN scale — architectural fraction:  A/B" = 1'  (1/8"=1'-0", 3/16"=1'-0")  -> ft_per_in = B/A
+    # (?<!\d ) skips the fraction part of a MIXED detail number like `1 1/2"=1'` (which is 0.667 ft/in, a
+    #  detail scale — NOT 2.0 as the bare "1/2" would parse). Elevation SF depends only on these fractions.
+    arch = []
+    for m in re.finditer(r"(?<!\d )(\d+)\s*/\s*(\d+)\s*\"?\s*(?:in\.?)?\s*=\s*1\s*'", t, re.I):
         a, b = int(m.group(1)), int(m.group(2))
         if a > 0:
-            found.append(b / a)
-    # engineering:  1" = N'   (one inch = N feet)  -> ft_per_in = N
-    for m in re.finditer(r'\b1\s*"\s*=\s*(\d+)\s*\'', t, re.I):
+            arch.append(b / a)
+    # engineering:  1" = N'   -> ft_per_in = N  (site/civil)
+    eng = []
+    for m in re.finditer(r"\b1\s*\"\s*=\s*(\d+)\s*'", t, re.I):
         n = int(m.group(1))
         if n > 0:
-            found.append(float(n))
-    # whole-inch architectural (detail scales): N" = 1'  -> ft_per_in = 1/N (only if no fraction matched)
-    if not found:
-        for m in re.finditer(r'\b(\d+)\s*"\s*=\s*1\s*\'', t, re.I):
-            a = int(m.group(1))
-            if a > 0:
-                found.append(1.0 / a)
-    if not found:
-        return 8.0, False  # could not read — default, but flagged as unconfirmed
-    # if multiple scale strings agree, high confidence; if they conflict, take the most common
-    vals = sorted(found)
-    best = max(set(found), key=found.count)
-    return best, True
+            eng.append(float(n))
+    cands = arch or eng
+    if not cands:
+        return 8.0, False  # could not read — default, but flagged as unconfirmed (caller must force calibrate)
+    from collections import Counter
+    cnt = Counter(round(c, 4) for c in cands); best, bn = cnt.most_common(1)[0]
+    others = sum(v for k, v in cnt.items() if k != best)
+    # confirmed only if the scale is UNAMBIGUOUS: one value, or a clearly dominant one (repeated + outnumbers
+    # the rest). A sheet with an elevation scale AND a lone detail scale that don't agree → NOT confirmed →
+    # force calibrate, because a wrong scale squares into the SF (a 1/4" read as 1/8" = 4x the money).
+    confirmed = (len(cnt) == 1) or (bn >= 2 and bn > others)
+    return best, confirmed
 
 
 def _fill_holes(mask):
