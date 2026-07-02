@@ -436,7 +436,8 @@ def snap_fill_route(payload: dict = Body(...)):
     dims = j.get("dims_by_page", {}).get(page + 1) or {"width": 612, "height": 792}
     try:
         if payload.get("corners"):
-            r = snap_fill.corners(j["pdf"], page, payload["corners"])
+            r = snap_fill.corners(j["pdf"], page, payload["corners"],
+                                  min_opening_sf=float(payload.get("min_opening_sf") or 0))
         else:
             r = snap_fill.bucket(j["pdf"], page, payload.get("point", [0.5, 0.5]))
     except Exception as e:
