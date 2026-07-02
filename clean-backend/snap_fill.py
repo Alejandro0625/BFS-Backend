@@ -15,7 +15,7 @@ import texture
 
 RENDER_LS = 4000          # high-res so the linework is crisp
 DARK = 170                # a pixel darker than this is "line/ink"
-LEAK_FRAC = 0.18          # a single wall shouldn't be >18% of the whole sheet → treat as a leak
+LEAK_FRAC = 0.10          # a single wall on a multi-view sheet shouldn't exceed ~10% → treat as a leak (tightened: at 0.18 a fill could leak into an adjacent elevation and still pass)
 SNAP_MARGIN = 0.012       # corner snap search window, fraction of the long side
 
 
@@ -116,23 +116,26 @@ def corners(pdf_bytes, page_index, pts):
         snapped.append([round(sx / W, 5), round(sy / H, 5)])
     poly_px = np.array([[int(x * W), int(y * H)] for x, y in snapped], np.int32)
     gross = abs(cv2.contourArea(poly_px)) * ftpx ** 2
-    op_sf, op_polys = _detect_openings(struct, poly_px, ftpx, W, H)
+    op_sf, op_polys, review = _detect_openings(struct, poly_px, ftpx, W, H)
     net = max(0.0, gross - op_sf)
     return {"status": "ok", "points": snapped, "area_sf": round(net, 1), "gross_sf": round(gross, 1),
             "opening_sf": round(op_sf, 1), "openings": op_polys, "n_openings": len(op_polys),
-            "scale_confirmed": conf, "source": "corners"}
+            "openings_review": review, "scale_confirmed": conf, "source": "corners"}
 
 
 def _detect_openings(struct, poly_px, ftpx, W, H):
-    """Inside a wall polygon, find rectangular window/door openings (closed rectangles of the STRUCTURAL
-    vector lines — hatch is excluded upstream) and return their total SF + polygons to deduct.
-    CONSERVATIVE by design: it under-detects rather than over-detects, so a miss over-states area
-    (over-bid = lose the bid) instead of under-stating it (under-bid = lose money). The estimator
-    confirms/adds — it's a suggested deduction, not a silent one."""
+    """Inside a wall polygon, find rectangular window/door openings to deduct → (opening_sf, polys, review).
+    MONEY-SAFE: the dangerous direction is a FALSE POSITIVE — panel reveal/joint grids, louvers and
+    signage are also rectangles, and deducting them under-states SF → under-bid → real loss. So we:
+      * SKIP repeating same-size rectangle grids (that's a panel layout = cladding, not fenestration) —
+        deduct nothing, just flag for review;
+      * CAP total deduction at 35% of the wall;
+      * always return the opening polygons + a review flag so the estimator vetoes them (never silent).
+    Under-deducting (over-bid = lose the bid) is acceptable; over-deducting (lose money) is not."""
     H, W = struct.shape[:2]
     wall = np.zeros((H, W), np.uint8); cv2.fillPoly(wall, [poly_px], 1); gross_px = int(wall.sum())
     if gross_px < 100:
-        return 0.0, []
+        return 0.0, [], False
     s = cv2.dilate(struct & wall, np.ones((3, 3), np.uint8))
     cnts, _ = cv2.findContours(s, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
     cand = []
@@ -143,13 +146,25 @@ def _detect_openings(struct, poly_px, ftpx, W, H):
         x, y, w2, h2 = cv2.boundingRect(c)
         if a / (w2 * h2 + 1e-6) > 0.72 and 0.2 < w2 / (h2 + 1e-6) < 6:   # a filled rectangle
             cand.append((c, a))
+    if not cand:
+        return 0.0, [], False
+    def _poly(c):
+        ap = cv2.approxPolyDP(c, 0.02 * cv2.arcLength(c, True), True).reshape(-1, 2)
+        return [[round(float(px) / W, 5), round(float(py) / H, 5)] for px, py in ap]
+    # PANEL-GRID GUARD: many rectangles of similar size = a panel reveal/joint grid (cladding), NOT windows
+    areas = sorted(a for _, a in cand)
+    med = areas[len(areas) // 2]
+    similar = sum(1 for a in areas if 0.6 * med <= a <= 1.6 * med)
+    if len(cand) >= 4 and similar >= 0.7 * len(cand):
+        return 0.0, [_poly(c) for c, _ in cand[:12]], True   # looks like a panel grid → deduct NOTHING, flag
     cand.sort(key=lambda t: -t[1])
-    used = np.zeros((H, W), np.uint8); op_px = 0; polys = []
+    used = np.zeros((H, W), np.uint8); op_px = 0; polys = []; cap = int(0.35 * gross_px)
     for c, a in cand:
         mm = np.zeros((H, W), np.uint8); cv2.drawContours(mm, [c], -1, 1, -1)
         if (mm & used).sum() > 0.3 * mm.sum():              # skip overlaps (nested mullions etc.)
             continue
-        used |= mm; op_px += int(mm.sum())
-        ap = cv2.approxPolyDP(c, 0.02 * cv2.arcLength(c, True), True).reshape(-1, 2)
-        polys.append([[round(float(px) / W, 5), round(float(py) / H, 5)] for px, py in ap])
-    return op_px * ftpx ** 2, polys
+        if op_px + int(mm.sum()) > cap:                     # cap total deduction → never eat the wall
+            break
+        used |= mm; op_px += int(mm.sum()); polys.append(_poly(c))
+    review = op_px >= 0.25 * gross_px                        # a big deduction → flag for a glance
+    return op_px * ftpx ** 2, polys, review
