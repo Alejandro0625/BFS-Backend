@@ -391,9 +391,10 @@ def process(jid, pdf_bytes):
                 p["id"] = i  # unique ids across polygons + linear runs
             auto = False; scale_conf = True; scale_val = None; auto_engine = None
             page_is_elev = is_elevation_page(pg) or not doc_any_elevation  # only auto-mark elevations (or all if none detectable)
-            if not polys and not doc_has_markup and page_is_elev and auto_used < MAX_AUTO_PAGES:
+            if not polys and not doc_has_markup and page_is_elev:
                 # RAW/clean page -> auto-markup. Engine order: VECTOR (reads the drawn pattern —
-                # exact geometry, openings netted) -> trained MODEL -> texture heuristics.
+                # exact geometry, openings netted; cheap, so EVERY page gets it) -> trained MODEL
+                # -> texture heuristics (heavy, capped so a 77-page set can't stall the worker).
                 try:
                     auto_tried += 1
                     tpolys = []; sinfo = {}
@@ -402,7 +403,7 @@ def process(jid, pdf_bytes):
                         auto_engine = "vector"
                     except Exception:
                         tpolys = []
-                    if not tpolys:
+                    if not tpolys and auto_used < MAX_AUTO_PAGES:
                         if model_infer.available():
                             tpolys, _, _, sinfo = model_infer.detect(pdf_bytes, pi, zoom=2.0)
                             auto_engine = "model"
