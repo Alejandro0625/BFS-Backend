@@ -256,6 +256,89 @@ def is_elevation_page(pg):
         return False
     return ("elevation" in t) or ("return" in t) or ("soffit" in t)
 
+def _page_struct_lines(pg):
+    """Long H/V vector lines of the page (same rule as /snap-points): the building's real geometry."""
+    W, H = pg.rect.width, pg.rect.height
+    Lmin = 0.06 * max(W, H)
+    hlines, vlines = [], []
+    try:
+        for d in pg.get_drawings():
+            for it in d["items"]:
+                segs = []
+                if it[0] == "l":
+                    segs = [(it[1].x, it[1].y, it[2].x, it[2].y)]
+                elif it[0] == "re":
+                    r = it[1]; segs = [(r.x0, r.y0, r.x1, r.y0), (r.x1, r.y0, r.x1, r.y1),
+                                       (r.x1, r.y1, r.x0, r.y1), (r.x0, r.y1, r.x0, r.y0)]
+                for (x1, y1, x2, y2) in segs:
+                    if (x2 - x1) ** 2 + (y2 - y1) ** 2 < Lmin ** 2:
+                        continue
+                    if abs(y2 - y1) < abs(x2 - x1) * 0.02:
+                        hlines.append((min(x1, x2), max(x1, x2), (y1 + y2) / 2))
+                    elif abs(x2 - x1) < abs(y2 - y1) * 0.02:
+                        vlines.append((min(y1, y2), max(y1, y2), (x1 + x2) / 2))
+    except Exception:
+        pass
+    return hlines[:600], vlines[:600]
+
+def snap_auto_polys(pg, polys, pw, ph):
+    """The model paints a pixel mask — its outline is blobby and ignores the CAD geometry that is
+    RIGHT THERE in the vector file. Make the AI's shapes look like an estimator drew them:
+    simplify the contour, then snap each vertex to the drawing's real corners/lines (Bluebeam-style).
+    SF is rescaled by the area ratio so the mask's net-of-openings measurement is preserved."""
+    import numpy as np, cv2
+    hlines, vlines = _page_struct_lines(pg)
+    if not hlines and not vlines:
+        return polys
+    corners = []
+    for (xa, xb, yh) in hlines:
+        for (ya, yb, xv) in vlines:
+            if xa - 2 <= xv <= xb + 2 and ya - 2 <= yh <= yb + 2:
+                corners.append((xv, yh))
+    corners = np.array(corners[:4000], dtype=np.float32) if corners else None
+    hy = np.array([y for (_, _, y) in hlines], dtype=np.float32) if hlines else None
+    vx = np.array([x for (_, _, x) in vlines], dtype=np.float32) if vlines else None
+    tol = 0.012 * max(pw, ph)   # snap radius ~1.2% of the sheet
+    out = []
+    for p in polys:
+        try:
+            pts = np.array([(x * pw, y * ph) for x, y in p["points"]], dtype=np.float32)
+            if len(pts) < 3:
+                out.append(p); continue
+            orig_area = abs(cv2.contourArea(pts.reshape(-1, 1, 2)))
+            appr = cv2.approxPolyDP(pts.reshape(-1, 1, 2), 0.012 * cv2.arcLength(pts.reshape(-1, 1, 2), True), True).reshape(-1, 2)
+            if len(appr) < 3:
+                out.append(p); continue
+            snapped = []
+            for (x, y) in appr:
+                nx, ny = float(x), float(y)
+                hit = False
+                if corners is not None and len(corners):
+                    d = np.hypot(corners[:, 0] - nx, corners[:, 1] - ny)
+                    i = int(d.argmin())
+                    if d[i] < tol:
+                        nx, ny = float(corners[i][0]), float(corners[i][1]); hit = True
+                if not hit:  # no true corner nearby — align edges to the nearest structural line
+                    if vx is not None and len(vx):
+                        dv = np.abs(vx - nx); i = int(dv.argmin())
+                        if dv[i] < tol: nx = float(vx[i])
+                    if hy is not None and len(hy):
+                        dh = np.abs(hy - ny); i = int(dh.argmin())
+                        if dh[i] < tol: ny = float(hy[i])
+                if not snapped or abs(snapped[-1][0] - nx) > 1 or abs(snapped[-1][1] - ny) > 1:
+                    snapped.append((nx, ny))
+            if len(snapped) < 3:
+                out.append(p); continue
+            new_area = abs(cv2.contourArea(np.array(snapped, dtype=np.float32).reshape(-1, 1, 2)))
+            q = dict(p)
+            q["points"] = [[round(x / pw, 5), round(y / ph, 5)] for (x, y) in snapped]
+            if orig_area > 0 and new_area > 0:
+                q["area_sf"] = round(p.get("area_sf", 0) * new_area / orig_area, 1)
+            out.append(q)
+        except Exception:
+            out.append(p)
+    return out
+
 def process(jid, pdf_bytes):
     job = jobs[jid]
     try:
@@ -318,6 +401,10 @@ def process(jid, pdf_bytes):
                         tpolys, _, _, sinfo = texture.detect(pdf_bytes, pi, ft_per_in=ft, zoom=2.0)
                         auto_engine = "texture"
                     if tpolys:
+                        try:
+                            tpolys = snap_auto_polys(pg, tpolys, pw, ph)  # lock AI shapes to the drawing's real corners
+                        except Exception:
+                            pass
                         polys = tpolys; auto = True; auto_used += 1; auto_hits += 1
                         scale_conf = bool(sinfo.get("scale_confirmed")); scale_val = sinfo.get("ft_per_in")
                 except Exception as te:
