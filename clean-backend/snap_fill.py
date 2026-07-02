@@ -85,8 +85,20 @@ def corners(pdf_bytes, page_index, pts):
     line in x and y → exact polygon + SF. Robust on hatched fields (the estimator supplies the shape)."""
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     img, ftpx, sc, conf, z = _render(doc, page_index)
-    doc.close()
     H, W = img.shape[:2]
+    struct = np.zeros((H, W), np.uint8)                     # medium+long vector lines (window/door outlines; NOT hatch)
+    try:
+        for d in doc[page_index].get_drawings():
+            for it in d.get("items", []):
+                if it[0] == "l":
+                    p1, p2 = it[1], it[2]
+                    if ((p1.x - p2.x) ** 2 + (p1.y - p2.y) ** 2) ** 0.5 >= 20:
+                        cv2.line(struct, (int(p1.x * z), int(p1.y * z)), (int(p2.x * z), int(p2.y * z)), 1, 2)
+                elif it[0] == "re":
+                    r = it[1]; cv2.rectangle(struct, (int(r.x0 * z), int(r.y0 * z)), (int(r.x1 * z), int(r.y1 * z)), 1, 2)
+    except Exception:
+        pass
+    doc.close()
     gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY); dark = (gray < DARK).astype(np.uint8)
     hk = cv2.getStructuringElement(cv2.MORPH_RECT, (max(30, W // 60), 1))
     vk = cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(30, H // 60)))
@@ -103,6 +115,41 @@ def corners(pdf_bytes, page_index, pts):
         sx = (max(0, px - m) + xi[np.argmin(np.abs(max(0, px - m) + xi - px))]) if len(xi) else px
         snapped.append([round(sx / W, 5), round(sy / H, 5)])
     poly_px = np.array([[int(x * W), int(y * H)] for x, y in snapped], np.int32)
-    area = abs(cv2.contourArea(poly_px))
-    return {"status": "ok", "points": snapped, "area_sf": round(area * ftpx ** 2, 1),
+    gross = abs(cv2.contourArea(poly_px)) * ftpx ** 2
+    op_sf, op_polys = _detect_openings(struct, poly_px, ftpx, W, H)
+    net = max(0.0, gross - op_sf)
+    return {"status": "ok", "points": snapped, "area_sf": round(net, 1), "gross_sf": round(gross, 1),
+            "opening_sf": round(op_sf, 1), "openings": op_polys, "n_openings": len(op_polys),
             "scale_confirmed": conf, "source": "corners"}
+
+
+def _detect_openings(struct, poly_px, ftpx, W, H):
+    """Inside a wall polygon, find rectangular window/door openings (closed rectangles of the STRUCTURAL
+    vector lines — hatch is excluded upstream) and return their total SF + polygons to deduct.
+    CONSERVATIVE by design: it under-detects rather than over-detects, so a miss over-states area
+    (over-bid = lose the bid) instead of under-stating it (under-bid = lose money). The estimator
+    confirms/adds — it's a suggested deduction, not a silent one."""
+    H, W = struct.shape[:2]
+    wall = np.zeros((H, W), np.uint8); cv2.fillPoly(wall, [poly_px], 1); gross_px = int(wall.sum())
+    if gross_px < 100:
+        return 0.0, []
+    s = cv2.dilate(struct & wall, np.ones((3, 3), np.uint8))
+    cnts, _ = cv2.findContours(s, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
+    cand = []
+    for c in cnts:
+        a = cv2.contourArea(c)
+        if a < 0.012 * gross_px or a > 0.6 * gross_px:      # window/door-sized only
+            continue
+        x, y, w2, h2 = cv2.boundingRect(c)
+        if a / (w2 * h2 + 1e-6) > 0.72 and 0.2 < w2 / (h2 + 1e-6) < 6:   # a filled rectangle
+            cand.append((c, a))
+    cand.sort(key=lambda t: -t[1])
+    used = np.zeros((H, W), np.uint8); op_px = 0; polys = []
+    for c, a in cand:
+        mm = np.zeros((H, W), np.uint8); cv2.drawContours(mm, [c], -1, 1, -1)
+        if (mm & used).sum() > 0.3 * mm.sum():              # skip overlaps (nested mullions etc.)
+            continue
+        used |= mm; op_px += int(mm.sum())
+        ap = cv2.approxPolyDP(c, 0.02 * cv2.arcLength(c, True), True).reshape(-1, 2)
+        polys.append([[round(float(px) / W, 5), round(float(py) / H, 5)] for px, py in ap])
+    return op_px * ftpx ** 2, polys
