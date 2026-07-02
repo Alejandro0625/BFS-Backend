@@ -423,6 +423,19 @@ def material_groups_route(payload: dict = Body(...)):
         return {"groups": [], "error": str(e)}
     return r
 
+@app.post("/refine-group")
+def refine_group_route(payload: dict = Body(...)):
+    """Exact-on-select: preview-group patches → corner-snapped exact shapes (+opening deductions).
+    payload: {jobId, page (1-indexed), patches:[[nx,ny,nw,nh],...], min_opening_sf}. Additive."""
+    j = get_job(payload.get("jobId"))
+    if not j or not j.get("pdf"):
+        raise HTTPException(404, "job not found")
+    try:
+        return snap_fill.refine_group(j["pdf"], int(payload.get("page", 1)) - 1, payload.get("patches") or [],
+                                      min_opening_sf=float(payload.get("min_opening_sf") or 0))
+    except Exception as e:
+        return {"status": "error", "shapes": [], "error": str(e)}
+
 @app.post("/snap-fill")
 def snap_fill_route(payload: dict = Body(...)):
     """Coloring-book bucket / corner-snap → exact polygon + SF from the drawing's vector geometry.
