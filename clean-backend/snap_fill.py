@@ -76,54 +76,88 @@ def bucket(pdf_bytes, page_index, point):
     poly = _poly_from_region(region, W, H)
     if poly is None:
         return {"status": "empty"}
-    return {"status": "ok", "points": poly, "area_sf": round(area * ftpx ** 2, 1),
+    # interior HOLES (windows/doors the fill flowed around) — returned so the UI can show them: the SF
+    # is net of these, and an honest highlight must show what was excluded (never a silent deduction)
+    holes = []
+    cnts, hier = cv2.findContours(region, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
+    if hier is not None and len(cnts):
+        hier = hier[0]
+        ext = [i for i in range(len(cnts)) if hier[i][3] == -1]
+        if ext:
+            big = max(ext, key=lambda i: cv2.contourArea(cnts[i]))
+            for i in range(len(cnts)):
+                if hier[i][3] == big and cv2.contourArea(cnts[i]) > 0.002 * area:
+                    ap = cv2.approxPolyDP(cnts[i], 0.02 * cv2.arcLength(cnts[i], True), True).reshape(-1, 2)
+                    if len(ap) >= 3:
+                        holes.append([[round(float(x) / W, 5), round(float(y) / H, 5)] for x, y in ap])
+    return {"status": "ok", "points": poly, "area_sf": round(area * ftpx ** 2, 1), "holes": holes[:40],
             "scale_confirmed": conf, "source": "bucket"}
 
 
-def corners(pdf_bytes, page_index, pts):
-    """pts = list of [nx, ny] rough corner clicks (in order). Each snaps to the nearest strong vector
-    line in x and y → exact polygon + SF. Robust on hatched fields (the estimator supplies the shape)."""
+def corners(pdf_bytes, page_index, pts, min_opening_sf=0.0):
+    """pts = list of [nx, ny] rough corner clicks (in order). Each click snaps to the nearest REAL
+    CORNER of the drawing — a vector line ENDPOINT (eave corner, gable PEAK, rake end — any angle),
+    falling back to the nearest long horizontal/vertical line. So gables and sloped walls measure
+    exactly, not just rectangles. min_opening_sf: openings smaller than this are NOT deducted
+    (many shops don't deduct small windows — labor around them costs the same)."""
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     img, ftpx, sc, conf, z = _render(doc, page_index)
     H, W = img.shape[:2]
     struct = np.zeros((H, W), np.uint8)                     # medium+long vector lines (window/door outlines; NOT hatch)
+    ends = []                                                # endpoints of real segments = true drawing corners (any angle)
     try:
         for d in doc[page_index].get_drawings():
             for it in d.get("items", []):
                 if it[0] == "l":
                     p1, p2 = it[1], it[2]
-                    if ((p1.x - p2.x) ** 2 + (p1.y - p2.y) ** 2) ** 0.5 >= 20:
+                    L = ((p1.x - p2.x) ** 2 + (p1.y - p2.y) ** 2) ** 0.5
+                    if L >= 20:
                         cv2.line(struct, (int(p1.x * z), int(p1.y * z)), (int(p2.x * z), int(p2.y * z)), 1, 2)
+                    if L >= 15:
+                        ends.append((p1.x * z, p1.y * z)); ends.append((p2.x * z, p2.y * z))
                 elif it[0] == "re":
-                    r = it[1]; cv2.rectangle(struct, (int(r.x0 * z), int(r.y0 * z)), (int(r.x1 * z), int(r.y1 * z)), 1, 2)
+                    r = it[1]
+                    cv2.rectangle(struct, (int(r.x0 * z), int(r.y0 * z)), (int(r.x1 * z), int(r.y1 * z)), 1, 2)
+                    for X in (r.x0, r.x1):
+                        for Y in (r.y0, r.y1):
+                            ends.append((X * z, Y * z))
     except Exception:
         pass
     doc.close()
+    ends = np.array(ends, np.float32) if ends else np.zeros((0, 2), np.float32)
     gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY); dark = (gray < DARK).astype(np.uint8)
     hk = cv2.getStructuringElement(cv2.MORPH_RECT, (max(30, W // 60), 1))
     vk = cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(30, H // 60)))
     Hl = cv2.morphologyEx(dark, cv2.MORPH_OPEN, hk)
     Vl = cv2.morphologyEx(dark, cv2.MORPH_OPEN, vk)
     m = int(SNAP_MARGIN * max(W, H))
+    mp = int(0.011 * max(W, H))                              # point-snap radius (a bit tighter than line snap)
     snapped = []
     for nx, ny in pts:
         px, py = int(nx * W), int(ny * H)
-        yb = Hl[:, max(0, px - 4):px + 4].max(1); xb = Vl[max(0, py - 4):py + 4, :].max(0)
-        yi = np.where(yb[max(0, py - m):py + m] > 0)[0]
-        xi = np.where(xb[max(0, px - m):px + m] > 0)[0]
-        sy = (max(0, py - m) + yi[np.argmin(np.abs(max(0, py - m) + yi - py))]) if len(yi) else py
-        sx = (max(0, px - m) + xi[np.argmin(np.abs(max(0, px - m) + xi - px))]) if len(xi) else px
-        snapped.append([round(sx / W, 5), round(sy / H, 5)])
+        sx = sy = None
+        if len(ends):                                        # 1) nearest true drawing corner within radius (handles gable peaks/slopes)
+            dd = np.hypot(ends[:, 0] - px, ends[:, 1] - py)
+            j = int(dd.argmin())
+            if dd[j] <= mp:
+                sx, sy = float(ends[j, 0]), float(ends[j, 1])
+        if sx is None:                                       # 2) fallback: nearest long H/V line per axis (old behavior)
+            yb = Hl[:, max(0, px - 4):px + 4].max(1); xb = Vl[max(0, py - 4):py + 4, :].max(0)
+            yi = np.where(yb[max(0, py - m):py + m] > 0)[0]
+            xi = np.where(xb[max(0, px - m):px + m] > 0)[0]
+            sy = (max(0, py - m) + yi[np.argmin(np.abs(max(0, py - m) + yi - py))]) if len(yi) else py
+            sx = (max(0, px - m) + xi[np.argmin(np.abs(max(0, px - m) + xi - px))]) if len(xi) else px
+        snapped.append([round(min(max(sx, 0), W - 1) / W, 5), round(min(max(sy, 0), H - 1) / H, 5)])
     poly_px = np.array([[int(x * W), int(y * H)] for x, y in snapped], np.int32)
     gross = abs(cv2.contourArea(poly_px)) * ftpx ** 2
-    op_sf, op_polys, review = _detect_openings(struct, poly_px, ftpx, W, H)
+    op_sf, op_polys, review = _detect_openings(struct, poly_px, ftpx, W, H, min_opening_sf)
     net = max(0.0, gross - op_sf)
     return {"status": "ok", "points": snapped, "area_sf": round(net, 1), "gross_sf": round(gross, 1),
             "opening_sf": round(op_sf, 1), "openings": op_polys, "n_openings": len(op_polys),
             "openings_review": review, "scale_confirmed": conf, "source": "corners"}
 
 
-def _detect_openings(struct, poly_px, ftpx, W, H):
+def _detect_openings(struct, poly_px, ftpx, W, H, min_opening_sf=0.0):
     """Inside a wall polygon, find rectangular window/door openings to deduct → (opening_sf, polys, review).
     MONEY-SAFE: the dangerous direction is a FALSE POSITIVE — panel reveal/joint grids, louvers and
     signage are also rectangles, and deducting them under-states SF → under-bid → real loss. So we:
@@ -139,9 +173,10 @@ def _detect_openings(struct, poly_px, ftpx, W, H):
     s = cv2.dilate(struct & wall, np.ones((3, 3), np.uint8))
     cnts, _ = cv2.findContours(s, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
     cand = []
+    min_px = max(0.012 * gross_px, (min_opening_sf / (ftpx ** 2)) if min_opening_sf > 0 else 0)
     for c in cnts:
         a = cv2.contourArea(c)
-        if a < 0.012 * gross_px or a > 0.6 * gross_px:      # window/door-sized only
+        if a < min_px or a > 0.6 * gross_px:                # window/door-sized only + shop's no-deduct-under rule
             continue
         x, y, w2, h2 = cv2.boundingRect(c)
         if a / (w2 * h2 + 1e-6) > 0.72 and 0.2 < w2 / (h2 + 1e-6) < 6:   # a filled rectangle
