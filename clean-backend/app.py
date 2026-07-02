@@ -129,7 +129,8 @@ def jlog(job, msg, level="info"):
 
 def extract_page_polygons(pg, pw, ph, ft_per_in):
     polys = []
-    for a in (pg.annots() or []):
+    rot = pg.rotation_matrix                       # ROTATED pages (e.g. 270°) store annot vertices in unrotated coords;
+    for a in (pg.annots() or []):                  # apply the page rotation so shapes align to the drawing (identity if rotation=0)
         if a.type[0] != 6:  # 6 = Polygon
             continue
         verts = a.vertices or []
@@ -139,7 +140,11 @@ def extract_page_polygons(pg, pw, ph, ft_per_in):
         content = info.get("content", "") or ""
         subject = info.get("subject", "") or ""
         fill = a.colors.get("fill") if a.colors else None
-        pts_pdf = [(v[0], v[1]) if isinstance(v, (list, tuple)) else (v.x, v.y) for v in verts]
+        pts_pdf = []
+        for v in verts:
+            vx, vy = (v[0], v[1]) if isinstance(v, (list, tuple)) else (v.x, v.y)
+            p = fitz.Point(vx, vy) * rot
+            pts_pdf.append((p.x, p.y))
         m = re.search(r"([\d,]+(?:\.\d+)?)\s*sf", content, re.I)
         if m:
             sf = float(m.group(1).replace(",", "")); sf_exact = True   # estimator's own measured SF — ground truth
@@ -197,7 +202,8 @@ def extract_page_polylines(pg, pw, ph):
         if esf or h:  # a CLADDING run → SF (explicit, else length × wall height)
             sf = round(esf if esf else length_ft * h, 1)
             verts = a.vertices or []
-            pts_pdf = [(v[0], v[1]) if isinstance(v, (list, tuple)) else (v.x, v.y) for v in verts]
+            pts_pdf = [( (fitz.Point(v[0], v[1]) if isinstance(v, (list, tuple)) else fitz.Point(v.x, v.y)) * pg.rotation_matrix ) for v in verts]
+            pts_pdf = [(p.x, p.y) for p in pts_pdf]
             norm = [[round(x / pw, 5), round(y / ph, 5)] for (x, y) in pts_pdf] or [[0, 0]]
             cx = round(sum(p[0] for p in norm) / len(norm), 5)
             cy = round(sum(p[1] for p in norm) / len(norm), 5)
