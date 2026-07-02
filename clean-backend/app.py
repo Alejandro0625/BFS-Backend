@@ -14,6 +14,7 @@ from collections import defaultdict
 import fitz  # PyMuPDF
 import texture  # classical-CV texture fallback for unmarked drawings
 import model_infer  # trained cladding-extent model (ONNX) — the real auto-markup for RAW drawings
+import snap_fill  # coloring-book BUCKET fill + corner-snap → exact SF from vector geometry (assist layer)
 from fastapi import FastAPI, UploadFile, File, BackgroundTasks, HTTPException, Body
 from fastapi.responses import Response
 from fastapi.middleware.cors import CORSMiddleware
@@ -398,6 +399,27 @@ def page_image(jid: str, page: int):
     pix = doc[page - 1].get_pixmap(matrix=fitz.Matrix(2, 2))  # ~144 dpi
     png = pix.tobytes("png"); doc.close()
     return Response(content=png, media_type="image/png")
+
+@app.post("/snap-fill")
+def snap_fill_route(payload: dict = Body(...)):
+    """Coloring-book bucket / corner-snap → exact polygon + SF from the drawing's vector geometry.
+    payload: {jobId, page (1-indexed), point:[nx,ny]}  OR  {jobId, page, corners:[[nx,ny],...]}.
+    Bucket returns status 'ok' (points+area_sf) or 'leak' (caller switches to corner mode). Additive —
+    does not touch the digitize-markup pipeline."""
+    j = get_job(payload.get("jobId"))
+    if not j or not j.get("pdf"):
+        raise HTTPException(404, "job not found")
+    page = int(payload.get("page", 1)) - 1
+    dims = j.get("dims_by_page", {}).get(page + 1) or {"width": 612, "height": 792}
+    try:
+        if payload.get("corners"):
+            r = snap_fill.corners(j["pdf"], page, payload["corners"])
+        else:
+            r = snap_fill.bucket(j["pdf"], page, payload.get("point", [0.5, 0.5]))
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+    r["width"] = dims["width"]; r["height"] = dims["height"]
+    return r
 
 @app.post("/learn")
 def learn(payload: dict = Body(...)):
