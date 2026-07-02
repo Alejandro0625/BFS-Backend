@@ -515,6 +515,26 @@ def page_image(jid: str, page: int):
     png = pix.tobytes("png"); doc.close()
     return Response(content=png, media_type="image/png")
 
+@app.get("/page-crop/{jid}/{page}")
+def page_crop(jid: str, page: int, x0: float = 0, y0: float = 0, x1: float = 1, y1: float = 1, px: int = 1800):
+    """Bluebeam-style deep zoom: render ONLY the viewport rect (normalized coords) at high DPI.
+    The frontend swaps this in when the estimator zooms past ~2.5x so textures stay crisp."""
+    j = get_job(jid)
+    if not j or not j.get("pdf"): raise HTTPException(404, "job not found")
+    doc = fitz.open(stream=j["pdf"], filetype="pdf")
+    if page < 1 or page > doc.page_count:
+        doc.close(); raise HTTPException(404, "page out of range")
+    pg = doc[page - 1]
+    x0 = max(0.0, min(1.0, x0)); y0 = max(0.0, min(1.0, y0))
+    x1 = max(x0 + 0.01, min(1.0, x1)); y1 = max(y0 + 0.01, min(1.0, y1))
+    # pg.rect is already the rotated/display rect and clip takes display coords (verified on a 270° page)
+    W, H = pg.rect.width, pg.rect.height
+    clip = fitz.Rect(x0 * W, y0 * H, x1 * W, y1 * H)
+    z = min(8.0, max(1.0, min(2200, px) / max(1, clip.width)))
+    pix = pg.get_pixmap(matrix=fitz.Matrix(z, z), clip=clip, alpha=False)
+    png = pix.tobytes("png"); doc.close()
+    return Response(content=png, media_type="image/png")
+
 @app.post("/material-groups")
 def material_groups_route(payload: dict = Body(...)):
     """A PREVIEW of material groups (within-job texture clustering, elevation-fenced). The estimator
