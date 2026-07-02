@@ -268,13 +268,23 @@ def process(jid, pdf_bytes):
         auto_used = 0  # cap expensive texture renders so a big unmarked PDF can't blow memory
         # If the estimator marked ANY page, this is a DIGITIZE job — don't texture-auto the other
         # pages (they're plans/details, not cladding) or we inflate the bid with invented SF.
+        # Count only annotations the digitize path actually READS as measurements: a polygon
+        # with real vertices, or a polyline whose label carries a length. Stray leader lines,
+        # clouds, or review stamps in an issued set must NOT disable auto-detect (that made a
+        # "no markups" full set return a completely empty takeoff).
         doc_has_markup = False
         for pi in range(n):
             try:
-                if any(a.type[0] in (6, 7) for a in (doc[pi].annots() or [])):
-                    doc_has_markup = True; break
+                for a in (doc[pi].annots() or []):
+                    t = a.type[0]
+                    if t == 6 and len(a.vertices or []) >= 3:
+                        doc_has_markup = True; break
+                    if t == 7 and _feet((a.info or {}).get("content", "") or ""):
+                        doc_has_markup = True; break
             except Exception:
                 pass
+            if doc_has_markup:
+                break
         # auto-crop: which pages are elevations? (only mark those; if none detectable, fall back to all)
         doc_any_elevation = any(is_elevation_page(doc[pi]) for pi in range(n))
         for pi in range(n):
