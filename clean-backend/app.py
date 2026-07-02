@@ -286,7 +286,15 @@ def process(jid, pdf_bytes):
             if doc_has_markup:
                 break
         # auto-crop: which pages are elevations? (only mark those; if none detectable, fall back to all)
-        doc_any_elevation = any(is_elevation_page(doc[pi]) for pi in range(n))
+        # Text-based classification only works if the PDF actually HAS text — many issued sets
+        # flatten CAD text to curves (a 77-page set had text on 1 page). If too few pages carry
+        # text, the filter is meaningless: turn it OFF and try every page instead of page 6 only.
+        text_pages = sum(1 for pi in range(n) if len(doc[pi].get_text() or "") > 150)
+        text_reliable = text_pages >= max(3, int(n * 0.3))
+        doc_any_elevation = text_reliable and any(is_elevation_page(doc[pi]) for pi in range(n))
+        if not text_reliable and n > 1:
+            jlog(job, f"Drawing text not extractable ({text_pages}/{n} pages with text) — scanning every page for cladding", "warn")
+        auto_tried = 0; auto_hits = 0
         for pi in range(n):
             job["progress"] = {"label": f"Reading page {pi+1} of {n}", "pct": 5 + int(90 * pi / max(n, 1))}
             job["phase"] = "analyzing"
@@ -302,6 +310,7 @@ def process(jid, pdf_bytes):
             if not polys and not doc_has_markup and page_is_elev and auto_used < MAX_AUTO_PAGES:
                 # RAW/clean page -> auto-markup. Prefer the trained MODEL; fall back to texture heuristics.
                 try:
+                    auto_tried += 1
                     if model_infer.available():
                         tpolys, _, _, sinfo = model_infer.detect(pdf_bytes, pi, zoom=2.0)
                         auto_engine = "model"
@@ -309,7 +318,7 @@ def process(jid, pdf_bytes):
                         tpolys, _, _, sinfo = texture.detect(pdf_bytes, pi, ft_per_in=ft, zoom=2.0)
                         auto_engine = "texture"
                     if tpolys:
-                        polys = tpolys; auto = True; auto_used += 1
+                        polys = tpolys; auto = True; auto_used += 1; auto_hits += 1
                         scale_conf = bool(sinfo.get("scale_confirmed")); scale_val = sinfo.get("ft_per_in")
                 except Exception as te:
                     jlog(job, f"Page {pi+1}: auto-detect skipped ({te})", "warn")
@@ -365,8 +374,10 @@ def process(jid, pdf_bytes):
         doc.close()
         job["legend"] = list(legend.values())
         total = sum(z["netArea"] for e in job["takeoffData"] for z in e["zones"])
+        if auto_tried:  # never fail silently: say what the AI actually looked at
+            jlog(job, f"Auto-detect scanned {auto_tried} page(s), found cladding on {auto_hits}", "warn" if auto_hits == 0 else "ok")
         if not job["takeoffData"]:
-            jlog(job, "No Bluebeam markup found on any page — load a marked-up drawing for digitize-markup.", "warn")
+            jlog(job, "No measurements found — no readable markup, and the AI saw no cladding on the pages it scanned.", "warn")
         else:
             jlog(job, f"Done — {len(job['takeoffData'])} page(s), {round(total):,} SF total", "success")
         job["status"] = "done"; job["phase"] = "done"
