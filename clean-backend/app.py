@@ -15,6 +15,7 @@ import fitz  # PyMuPDF
 import texture  # classical-CV texture fallback for unmarked drawings
 import model_infer  # trained cladding-extent model (ONNX) — the real auto-markup for RAW drawings
 import snap_fill  # coloring-book BUCKET fill + corner-snap → exact SF from vector geometry (assist layer)
+import material_groups  # within-job texture grouping → a selectable PREVIEW of material groups (assist layer)
 from fastapi import FastAPI, UploadFile, File, BackgroundTasks, HTTPException, Body
 from fastapi.responses import Response
 from fastapi.middleware.cors import CORSMiddleware
@@ -399,6 +400,22 @@ def page_image(jid: str, page: int):
     pix = doc[page - 1].get_pixmap(matrix=fitz.Matrix(2, 2))  # ~144 dpi
     png = pix.tobytes("png"); doc.close()
     return Response(content=png, media_type="image/png")
+
+@app.post("/material-groups")
+def material_groups_route(payload: dict = Body(...)):
+    """A PREVIEW of material groups (within-job texture clustering, elevation-fenced). The estimator
+    SELECTS the groups she's bidding — her selection carries the accuracy; the preview may be imperfect.
+    SF returned is a PREVIEW estimate (approx), clearly flagged. Additive; digitize-markup untouched.
+    payload: {jobId, page (1-indexed)}."""
+    j = get_job(payload.get("jobId"))
+    if not j or not j.get("pdf"):
+        raise HTTPException(404, "job not found")
+    page = int(payload.get("page", 1)) - 1
+    try:
+        r = material_groups.groups(j["pdf"], page)
+    except Exception as e:
+        return {"groups": [], "error": str(e)}
+    return r
 
 @app.post("/snap-fill")
 def snap_fill_route(payload: dict = Body(...)):
