@@ -103,8 +103,9 @@ def groups(pdf_bytes, page_index, k=None):
                 continue
             g = gray[y:y + PATCH, x:x + PATCH]
             edge = (g < DARK).mean()
-            if edge < 0.01:                       # blank whitespace = no material
-                continue
+            if edge < 0.01 and g.mean() > 245:    # truly blank PAPER only — keep smooth GREY panel fill
+                continue                          # (metal/ACM renders as solid grey tone ~190-240, no edges;
+                                                  #  the old edge-only skip dropped BFS's core material from the preview)
             exx = gx[y:y + PATCH, x:x + PATCH]; eyy = gy[y:y + PATCH, x:x + PATCH]
             hr = float(exx.mean() / (exx.mean() + eyy.mean() + 1e-3))
             feats.append([edge * 4, hr, g.mean() / 255.0, eyy.mean() / 50.0])
