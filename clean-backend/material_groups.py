@@ -7,6 +7,7 @@ flagged approx. Additive; does not touch digitize-markup.
 Honest: within-job texture purity measured 62-83% on real multi-material jobs → a strong first-pass
 SELECTION, not a trusted SF. `approx_sf` is labeled approximate; the money number comes from the
 confirmed/snapped boundary."""
+import re
 import numpy as np
 import cv2
 import fitz
@@ -17,28 +18,59 @@ PATCH = 40
 DARK = 170
 
 
+_KEEP_RE = re.compile(r'\b(elevation|soffit|return)\b', re.I)
+_SKIP_RE = re.compile(r'\b(floor plan|roof plan|site plan|detail|section|schedule|keynote|legend|door|window)\b', re.I)
+
+
 def _elev_mask(pg, img, z):
-    """Fence to the ELEVATION drawings: mask out TEXT regions (notes/titleblock/dimensions via the PDF
-    text layer) then keep the LARGE connected blobs of drawing ink. Returns a HxW uint8 keep-mask so
-    clustering never groups the titleblock/notes as 'materials'."""
+    """Fence to the ELEVATION/SOFFIT/RETURN drawings only — read the blueprint like a person. Keep the
+    large building regions BUILT FROM LONG STRUCTURAL LINES (rooflines/floor lines); that's what tells an
+    elevation apart from notes, dimension boxes, callouts, and the titleblock (which have no long lines).
+    Cut the far-right titleblock strip, and subtract any region a text title marks as plan/detail/
+    section/schedule. Returns a HxW keep-mask so clustering never groups 'other bullshit' as a material."""
     H, W = img.shape[:2]
     gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
     ink = (gray < DARK).astype(np.uint8)
-    txt = np.zeros((H, W), np.uint8)
+    # long structural lines (buildings have them; text/notes/boxes don't)
+    longm = np.zeros((H, W), np.uint8)
+    try:
+        for d in pg.get_drawings():
+            for it in d.get("items", []):
+                if it[0] == "l":
+                    p1, p2 = it[1], it[2]
+                    if ((p1.x - p2.x) ** 2 + (p1.y - p2.y) ** 2) ** 0.5 >= 70:
+                        cv2.line(longm, (int(p1.x * z), int(p1.y * z)), (int(p2.x * z), int(p2.y * z)), 1, 3)
+    except Exception:
+        pass
+    longd = cv2.dilate(longm, np.ones((25, 25), np.uint8))
+    # text-block mask + collect plan/detail/section/schedule titles to subtract
+    txt = np.zeros((H, W), np.uint8); skip_boxes = []
     try:
         for b in pg.get_text("blocks"):
-            x0, y0, x1, y1 = [int(v * z) for v in b[:4]]
+            x0, y0, x1, y1 = [int(v * z) for v in b[:4]]; t = (b[4] or "").strip().replace("\n", " ")
             cv2.rectangle(txt, (max(0, x0 - 2), max(0, y0 - 2)), (min(W, x1 + 2), min(H, y1 + 2)), 1, -1)
+            if len(t) < 50 and _SKIP_RE.search(t) and not _KEEP_RE.search(t):
+                skip_boxes.append((x0, y0, x1, y1))
     except Exception:
         pass
     draw = ink & (1 - txt)
-    dil = cv2.dilate(draw, np.ones((15, 15), np.uint8))
-    n, lab, st, _ = cv2.connectedComponentsWithStats(dil, 8)
+    n, lab, st, _ = cv2.connectedComponentsWithStats(cv2.dilate(draw, np.ones((17, 17), np.uint8)), 8)
     keep = np.zeros((H, W), np.uint8)
     for i in range(1, n):
-        if st[i, cv2.CC_STAT_AREA] > 0.02 * H * W:
-            keep[lab == i] = 1
-    if keep.sum() < 0.02 * H * W:        # fence found nothing → don't over-filter, allow whole sheet
+        area = st[i, cv2.CC_STAT_AREA]; cw = st[i, cv2.CC_STAT_WIDTH]; cx0 = st[i, cv2.CC_STAT_LEFT]
+        if area < 0.03 * H * W:                              # drop small stuff (dims/callouts/boxes/text)
+            continue
+        if (cx0 + cw / 2) > 0.80 * W and cw < 0.22 * W:      # drop far-right titleblock strip
+            continue
+        comp = (lab == i).astype(np.uint8)
+        if (comp & longd).sum() < 0.20 * comp.sum():         # must be built from long structural lines = a real elevation
+            continue
+        keep |= comp
+    for (x0, y0, x1, y1) in skip_boxes:                      # subtract plan/detail/section/schedule view areas
+        vw = max(x1 - x0, int(0.12 * W))
+        cv2.rectangle(keep, (max(0, (x0 + x1) // 2 - vw), max(0, y0 - int(0.35 * H))),
+                      (min(W, (x0 + x1) // 2 + vw), min(H, y1 + int(0.05 * H))), 0, -1)
+    if keep.sum() < 0.02 * H * W:                            # fence found nothing → fail-open (don't return empty)
         keep[:] = 1
     return keep
 
