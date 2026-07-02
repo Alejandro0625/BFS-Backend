@@ -157,6 +157,74 @@ def corners(pdf_bytes, page_index, pts, min_opening_sf=0.0):
             "openings_review": review, "scale_confirmed": conf, "source": "corners"}
 
 
+def refine_group(pdf_bytes, page_index, patches, min_opening_sf=0.0):
+    """#3 EXACT-ON-SELECT: turn a texture-preview group (blocky patches [[nx,ny,nw,nh],...]) into EXACT
+    shapes — each patch-blob's corners snap to the drawing's real vector endpoints (any angle, same
+    primitive as the gable-verified corner tool), openings deducted. Output shapes feed the normal
+    exact pipeline, so the estimator's one click on a group yields a bid-grade SF, not an estimate."""
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    img, ftpx, sc, conf, z = _render(doc, page_index)
+    H, W = img.shape[:2]
+    struct = np.zeros((H, W), np.uint8); ends = []
+    try:
+        for d in doc[page_index].get_drawings():
+            for it in d.get("items", []):
+                if it[0] == "l":
+                    p1, p2 = it[1], it[2]
+                    L = ((p1.x - p2.x) ** 2 + (p1.y - p2.y) ** 2) ** 0.5
+                    if L >= 20:
+                        cv2.line(struct, (int(p1.x * z), int(p1.y * z)), (int(p2.x * z), int(p2.y * z)), 1, 2)
+                    if L >= 15:
+                        ends.append((p1.x * z, p1.y * z)); ends.append((p2.x * z, p2.y * z))
+                elif it[0] == "re":
+                    r = it[1]
+                    cv2.rectangle(struct, (int(r.x0 * z), int(r.y0 * z)), (int(r.x1 * z), int(r.y1 * z)), 1, 2)
+                    for X in (r.x0, r.x1):
+                        for Y in (r.y0, r.y1):
+                            ends.append((X * z, Y * z))
+    except Exception:
+        pass
+    doc.close()
+    ends = np.array(ends, np.float32) if ends else np.zeros((0, 2), np.float32)
+    mask = np.zeros((H, W), np.uint8)
+    for p in patches or []:
+        x0, y0 = int(p[0] * W), int(p[1] * H)
+        cv2.rectangle(mask, (x0, y0), (min(W - 1, x0 + int(p[2] * W)), min(H - 1, y0 + int(p[3] * H))), 1, -1)
+    if not mask.any():
+        return {"status": "empty", "shapes": []}
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((25, 25), np.uint8))   # bridge patch gaps within one wall
+    mp = int(0.015 * max(W, H))                                                    # blob corners are ±patch off → slightly wider snap radius
+    shapes = []
+    n, lab, st, _ = cv2.connectedComponentsWithStats(mask, 8)
+    for i in range(1, n):
+        if st[i, cv2.CC_STAT_AREA] * ftpx ** 2 < 8:                                # skip crumbs (<8 SF)
+            continue
+        cnts, _ = cv2.findContours((lab == i).astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not cnts:
+            continue
+        c = max(cnts, key=cv2.contourArea)
+        ap = cv2.approxPolyDP(c, 0.02 * cv2.arcLength(c, True), True).reshape(-1, 2)
+        if len(ap) < 3:
+            continue
+        snapped = []
+        for px, py in ap:                                                          # snap each blob corner to the nearest TRUE drawing corner
+            if len(ends):
+                dd = np.hypot(ends[:, 0] - px, ends[:, 1] - py)
+                j = int(dd.argmin())
+                if dd[j] <= mp:
+                    px, py = float(ends[j, 0]), float(ends[j, 1])
+            snapped.append([round(min(max(px, 0), W - 1) / W, 5), round(min(max(py, 0), H - 1) / H, 5)])
+        poly_px = np.array([[int(x * W), int(y * H)] for x, y in snapped], np.int32)
+        gross = abs(cv2.contourArea(poly_px)) * ftpx ** 2
+        if gross < 8:
+            continue
+        op_sf, op_polys, review = _detect_openings(struct, poly_px, ftpx, W, H, min_opening_sf)
+        shapes.append({"points": snapped, "area_sf": round(max(0.0, gross - op_sf), 1), "gross_sf": round(gross, 1),
+                       "opening_sf": round(op_sf, 1), "openings": op_polys, "openings_review": review})
+    return {"status": "ok", "shapes": shapes, "total_sf": round(sum(s["area_sf"] for s in shapes), 1),
+            "scale_confirmed": conf, "source": "group-refined"}
+
+
 def _detect_openings(struct, poly_px, ftpx, W, H, min_opening_sf=0.0):
     """Inside a wall polygon, find rectangular window/door openings to deduct → (opening_sf, polys, review).
     MONEY-SAFE: the dangerous direction is a FALSE POSITIVE — panel reveal/joint grids, louvers and
