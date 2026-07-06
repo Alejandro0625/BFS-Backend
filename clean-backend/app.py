@@ -557,6 +557,32 @@ def material_groups_route(payload: dict = Body(...)):
     if not j or not j.get("pdf"):
         raise HTTPException(404, "job not found")
     page = int(payload.get("page", 1)) - 1
+    # VECTOR-FIRST (estimator-confirmed: the geometry path beats texture clustering by a mile).
+    # Each vector region is emitted as grid patches so the existing select + exact-on-select
+    # flow works unchanged; the texture clustering stays as the fallback for scanned pages.
+    try:
+        vpolys, _, _, _ = vector_hatch.detect(j["pdf"], page)
+        if vpolys:
+            import numpy as np
+            import cv2 as _cv2
+            GX, GY = 96, 64
+            groups = []
+            for gi, p in enumerate(vpolys[:24]):
+                pts = np.array([[x * GX, y * GY] for x, y in p["points"]], np.float32).astype(np.int32)
+                m = np.zeros((GY, GX), np.uint8)
+                _cv2.fillPoly(m, [pts.reshape(-1, 1, 2)], 1)
+                ys, xs = np.where(m > 0)
+                patches = [[round(x / GX, 4), round(y / GY, 4), round(1 / GX, 4), round(1 / GY, 4)]
+                           for x, y in zip(xs.tolist(), ys.tolist())][:1500]
+                if not patches:
+                    continue
+                groups.append({"group": f"vec{gi}", "color": p.get("fill_color") or [0, 0.7, 0.85],
+                               "patches": patches, "approx_sf": p.get("area_sf", 0),
+                               "material": p.get("material"), "source": "vector"})
+            if groups:
+                return {"status": "ok", "groups": groups, "engine": "vector"}
+    except Exception:
+        pass
     try:
         r = material_groups.groups(j["pdf"], page)
     except Exception as e:
