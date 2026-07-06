@@ -16,6 +16,7 @@ import texture  # classical-CV texture fallback for unmarked drawings
 import model_infer  # trained cladding-extent model (ONNX) — the real auto-markup for RAW drawings
 import vector_hatch  # reads the DRAWN pattern vectors (seam trains + gray fills) — exact, preferred on clean pages
 import callouts  # reads the drawing's own text callouts + leader arrows -> names the regions
+import ocr_text  # OCR fallback (onnxruntime RapidOCR) for FLATTENED sets — lazy, memory-safe
 import snap_fill  # coloring-book BUCKET fill + corner-snap → exact SF from vector geometry (assist layer)
 import material_groups  # within-job texture grouping → a selectable PREVIEW of material groups (assist layer)
 from fastapi import FastAPI, UploadFile, File, BackgroundTasks, HTTPException, Body
@@ -499,6 +500,28 @@ def process(jid, pdf_bytes):
                           f"{job['drawingSchedule']['total']:,} SF stated", "ok")
         except Exception:
             pass
+        # OCR FALLBACK for FLATTENED sets — auto-detected pages with cladding but NO base text
+        # (lettering exported as curves). Reads the material spec off the rendered image so the
+        # estimator knows WHAT the cladding is even when the file carries no text. Lazy + capped.
+        try:
+            odoc = fitz.open(stream=pdf_bytes, filetype="pdf")
+            flat_pages = [e["pageNumber"] for e in job["takeoffData"]
+                          if e.get("source") == "texture-auto"
+                          and len((odoc[e["pageNumber"] - 1].get_text() or "")) < 40][:4]
+            odoc.close()
+            if flat_pages and ocr_text.available():
+                seen = set(); ocr_mats = []
+                for pn in flat_pages:
+                    for m in ocr_text.read_materials(pdf_bytes, pn - 1):
+                        k = m["text"].upper()
+                        if k not in seen:
+                            seen.add(k); ocr_mats.append(m)
+                if ocr_mats:
+                    job["ocrMaterials"] = ocr_mats[:10]
+                    jlog(job, f"Read {len(ocr_mats)} material spec(s) off the drawing with OCR "
+                              f"(flattened set): {', '.join(m['text'] for m in ocr_mats[:3])}", "ok")
+        except Exception:
+            pass
         total = sum(z["netArea"] for e in job["takeoffData"] for z in e["zones"])
         if auto_tried:  # never fail silently: say what the AI actually looked at
             jlog(job, f"Auto-detect scanned {auto_tried} page(s), found cladding on {auto_hits}", "warn" if auto_hits == 0 else "ok")
@@ -534,7 +557,7 @@ def status(jid: str):
     return {"status": j["status"], "phase": j.get("phase", ""), "log": j["log"], "progress": j["progress"],
             "legend": j.get("legend", []), "takeoffData": j.get("takeoffData", []),
             "scheduleData": j.get("scheduleData"), "drawingSchedule": j.get("drawingSchedule"),
-            "error": j.get("error")}
+            "ocrMaterials": j.get("ocrMaterials"), "error": j.get("error")}
 
 @app.get("/polygons/{jid}/{page}")
 def polygons(jid: str, page: int):
