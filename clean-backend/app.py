@@ -642,16 +642,55 @@ def learn(payload: dict = Body(...)):
         ts = str(int(time.time() * 1000))
         d = os.path.join(CORR_DIR, ts)
         os.makedirs(d, exist_ok=True)
-        if job and job.get("pdf"):
+        if job and job.get("pdf") and payload.get("shapes"):   # pdf copy only for shape-labeled corrections
             with open(os.path.join(d, "drawing.pdf"), "wb") as fh:
                 fh.write(job["pdf"])
         with open(os.path.join(d, "labels.json"), "w", encoding="utf-8") as fh:
-            json.dump({"jobId": jid, "page": payload.get("page"), "source": payload.get("source", "manual"),
-                       "shapes": payload.get("shapes", []), "at": ts}, fh)
+            json.dump({**payload, "at": ts}, fh)               # keep the WHOLE payload (final-* answer keys carry takeoffData)
         n = len([x for x in os.listdir(CORR_DIR) if os.path.isdir(os.path.join(CORR_DIR, x))])
         return {"ok": True, "saved": ts, "total": n}
     except Exception as e:
         return {"ok": False, "error": str(e)}
+
+@app.get("/autonomy-status")
+def autonomy_status():
+    """THE AUTONOMY METER: for every exported bid (answer key = final-* capture), compare the
+    system's FIRST AUTO OUTPUT (job.json as processed, before any human edit) against the
+    human-confirmed final. agreement = min/max of total SF. This is the dial that shows the
+    learning working — when it lives near 100%, estimators stop reviewing and only price."""
+    jobs_seen = {}
+    try:
+        for d in sorted(os.listdir(CORR_DIR)):
+            lp = os.path.join(CORR_DIR, d, "labels.json")
+            if not os.path.isfile(lp):
+                continue
+            try:
+                with open(lp, encoding="utf-8") as fh:
+                    rec = json.load(fh)
+            except Exception:
+                continue
+            if not str(rec.get("source", "")).startswith("final"):
+                continue
+            jid = rec.get("jobId")
+            if jid:
+                jobs_seen[jid] = rec        # latest final per job wins
+    except Exception:
+        pass
+    out = []
+    for jid, rec in jobs_seen.items():
+        j = get_job(jid)
+        if not j:
+            continue
+        auto_sf = sum(z.get("netArea", 0) for e in (j.get("takeoffData") or []) for z in (e.get("zones") or []))
+        fin_sf = sum(z.get("netArea", 0) for e in (rec.get("takeoffData") or []) for z in (e.get("zones") or []))
+        if fin_sf <= 0:
+            continue
+        agree = round(100 * min(auto_sf, fin_sf) / max(auto_sf, fin_sf, 1))
+        out.append({"jobId": jid, "projName": rec.get("projName") or j.get("projName") or "Project",
+                    "auto_sf": round(auto_sf), "final_sf": round(fin_sf), "agreement": agree})
+    out.sort(key=lambda r: r["jobId"], reverse=True)
+    avg = round(sum(r["agreement"] for r in out) / len(out)) if out else None
+    return {"jobs": out[:40], "avg_agreement": avg, "n": len(out)}
 
 @app.get("/learn-status")
 def learn_status():
