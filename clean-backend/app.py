@@ -509,6 +509,8 @@ def process(jid, pdf_bytes):
                           if e.get("source") == "texture-auto"
                           and len((odoc[e["pageNumber"] - 1].get_text() or "")) < 250][:4]
             odoc.close()
+            if flat_pages and not ocr_text.available():
+                jlog(job, f"OCR unavailable on server ({len(flat_pages)} flattened page(s) would benefit)", "warn")
             if flat_pages and ocr_text.available():
                 seen = set(); ocr_mats = []
                 for pn in flat_pages:
@@ -903,4 +905,5 @@ def health():
         on_disk = 0
     return {"status": "ok", "engine": "digitize-markup", "deps": "pymupdf+onnx",
             "auto_engine": "model" if model_infer.available() else "texture",
+            "ocr": ocr_text.available(),
             "jobs_in_mem": len(jobs), "jobs_on_disk": on_disk, "mem_cap": MAX_MEM_JOBS}
