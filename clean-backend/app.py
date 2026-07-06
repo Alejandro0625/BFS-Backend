@@ -479,6 +479,26 @@ def process(jid, pdf_bytes):
                 jlog(job, f"Page {pi+1}: ⚠ {w}", "warn")
         doc.close()
         job["legend"] = list(legend.values())
+        # THE ARCHITECT'S OWN MATERIAL SCHEDULE — read it off any text-bearing page so the
+        # estimator can sanity-check our takeoff against the drawing's stated quantities.
+        try:
+            sched_best = {}
+            sdoc = fitz.open(stream=pdf_bytes, filetype="pdf")
+            for pi in range(sdoc.page_count):
+                if len(sdoc[pi].get_text() or "") < 60:   # skip textless pages fast
+                    continue
+                for row in callouts.read_schedule_pg(sdoc[pi]):
+                    k = row["key"]
+                    if k not in sched_best or row["sf"] > sched_best[k]["sf"]:
+                        sched_best[k] = row
+            sdoc.close()
+            if len(sched_best) >= 2:
+                sched = sorted(sched_best.values(), key=lambda r: -r["sf"])
+                job["drawingSchedule"] = {"items": sched, "total": sum(r["sf"] for r in sched)}
+                jlog(job, f"Read the drawing's own material schedule — {len(sched)} materials, "
+                          f"{job['drawingSchedule']['total']:,} SF stated", "ok")
+        except Exception:
+            pass
         total = sum(z["netArea"] for e in job["takeoffData"] for z in e["zones"])
         if auto_tried:  # never fail silently: say what the AI actually looked at
             jlog(job, f"Auto-detect scanned {auto_tried} page(s), found cladding on {auto_hits}", "warn" if auto_hits == 0 else "ok")
