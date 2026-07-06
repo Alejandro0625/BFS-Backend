@@ -33,6 +33,49 @@ def _render(doc, page_index):
     return img[:, :, :3], ft_per_px, sc, conf, z
 
 
+def _rot_pt(pg, x, y, z):
+    """Drawing coords are UNROTATED; the render is rotated. Map through the page rotation."""
+    p = fitz.Point(x, y) * pg.rotation_matrix
+    return int(p.x * z), int(p.y * z)
+
+
+def _vector_struct(pg, z, H, W, min_len=8, width=3, collect_ends=False, end_min=15):
+    """Rasterize the page's REAL vector linework (rotation-aware). Skips strokes shorter than
+    min_len — text glyphs, arrowheads, dim ticks — so notes on top of a wall aren't barriers."""
+    struct = np.zeros((H, W), np.uint8)
+    ends = []
+    try:
+        for d in pg.get_drawings():
+            # barrier rule matches what the ESTIMATOR SEES: only strokes that render visibly
+            # block a fill — dark AND heavier than a hairline. Panel seams/ribs are hairlines
+            # (or light gray): texture, not walls. Wall outlines are heavier ink.
+            col = d.get("color")
+            wd = d.get("width") or 0
+            dark_stroke = (col is not None and len(col) >= 3
+                           and (col[0] + col[1] + col[2]) / 3 < 0.66
+                           and wd * z >= 1.0)
+            for it in d.get("items", []):
+                if it[0] == "l":
+                    p1, p2 = it[1], it[2]
+                    L = ((p1.x - p2.x) ** 2 + (p1.y - p2.y) ** 2) ** 0.5
+                    if L >= min_len and dark_stroke:
+                        cv2.line(struct, _rot_pt(pg, p1.x, p1.y, z), _rot_pt(pg, p2.x, p2.y, z), 1, width)
+                    if collect_ends and L >= end_min:
+                        ends.append(_rot_pt(pg, p1.x, p1.y, z)); ends.append(_rot_pt(pg, p2.x, p2.y, z))
+                elif it[0] == "re":
+                    r = it[1]
+                    cs = [(r.x0, r.y0), (r.x1, r.y0), (r.x1, r.y1), (r.x0, r.y1)]
+                    rp = [_rot_pt(pg, X, Y, z) for (X, Y) in cs]
+                    if dark_stroke:
+                        for k in range(4):
+                            cv2.line(struct, rp[k], rp[(k + 1) % 4], 1, width)
+                    if collect_ends:
+                        ends += rp
+    except Exception:
+        pass
+    return struct, ends
+
+
 def _linework(img):
     gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
     lines = (gray < DARK).astype(np.uint8)
@@ -52,13 +95,18 @@ def _poly_from_region(region, W, H):
 
 
 def bucket(pdf_bytes, page_index, point):
-    """point = [nx, ny] normalized. Returns dict with status 'ok' (polygon+area_sf) or 'leak'."""
+    """point = [nx, ny] normalized. Returns dict with status 'ok' (polygon+area_sf) or 'leak'.
+    Barriers come from the VECTOR linework (segments >= 8pt + rectangles) — NOT from dark pixels.
+    Text glyphs, arrowheads and dimension ticks are tiny strokes/curves, so notes and leaders
+    sitting on top of a wall no longer create fake pockets or block the fill (estimator-reported)."""
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     img, ftpx, sc, conf, z = _render(doc, page_index)
-    doc.close()
     H, W = img.shape[:2]
-    lines = _linework(img)
-    free = (1 - lines).astype(np.uint8)
+    struct, _ = _vector_struct(doc[page_index], z, H, W, min_len=4, width=3)
+    doc.close()
+    if not struct.any():                                     # scanned/no-vector page → old pixel barriers
+        struct = _linework(img)
+    free = (1 - struct).astype(np.uint8)
     px, py = int(point[0] * W), int(point[1] * H)
     px = min(max(px, 0), W - 1); py = min(max(py, 0), H - 1)
     if free[py, px] == 0:                                   # clicked on a line → nudge to nearest free px
@@ -103,26 +151,7 @@ def corners(pdf_bytes, page_index, pts, min_opening_sf=0.0):
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     img, ftpx, sc, conf, z = _render(doc, page_index)
     H, W = img.shape[:2]
-    struct = np.zeros((H, W), np.uint8)                     # medium+long vector lines (window/door outlines; NOT hatch)
-    ends = []                                                # endpoints of real segments = true drawing corners (any angle)
-    try:
-        for d in doc[page_index].get_drawings():
-            for it in d.get("items", []):
-                if it[0] == "l":
-                    p1, p2 = it[1], it[2]
-                    L = ((p1.x - p2.x) ** 2 + (p1.y - p2.y) ** 2) ** 0.5
-                    if L >= 20:
-                        cv2.line(struct, (int(p1.x * z), int(p1.y * z)), (int(p2.x * z), int(p2.y * z)), 1, 2)
-                    if L >= 15:
-                        ends.append((p1.x * z, p1.y * z)); ends.append((p2.x * z, p2.y * z))
-                elif it[0] == "re":
-                    r = it[1]
-                    cv2.rectangle(struct, (int(r.x0 * z), int(r.y0 * z)), (int(r.x1 * z), int(r.y1 * z)), 1, 2)
-                    for X in (r.x0, r.x1):
-                        for Y in (r.y0, r.y1):
-                            ends.append((X * z, Y * z))
-    except Exception:
-        pass
+    struct, ends = _vector_struct(doc[page_index], z, H, W, min_len=20, width=2, collect_ends=True, end_min=15)
     doc.close()
     ends = np.array(ends, np.float32) if ends else np.zeros((0, 2), np.float32)
     gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY); dark = (gray < DARK).astype(np.uint8)
@@ -165,25 +194,7 @@ def refine_group(pdf_bytes, page_index, patches, min_opening_sf=0.0):
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     img, ftpx, sc, conf, z = _render(doc, page_index)
     H, W = img.shape[:2]
-    struct = np.zeros((H, W), np.uint8); ends = []
-    try:
-        for d in doc[page_index].get_drawings():
-            for it in d.get("items", []):
-                if it[0] == "l":
-                    p1, p2 = it[1], it[2]
-                    L = ((p1.x - p2.x) ** 2 + (p1.y - p2.y) ** 2) ** 0.5
-                    if L >= 20:
-                        cv2.line(struct, (int(p1.x * z), int(p1.y * z)), (int(p2.x * z), int(p2.y * z)), 1, 2)
-                    if L >= 15:
-                        ends.append((p1.x * z, p1.y * z)); ends.append((p2.x * z, p2.y * z))
-                elif it[0] == "re":
-                    r = it[1]
-                    cv2.rectangle(struct, (int(r.x0 * z), int(r.y0 * z)), (int(r.x1 * z), int(r.y1 * z)), 1, 2)
-                    for X in (r.x0, r.x1):
-                        for Y in (r.y0, r.y1):
-                            ends.append((X * z, Y * z))
-    except Exception:
-        pass
+    struct, ends = _vector_struct(doc[page_index], z, H, W, min_len=20, width=2, collect_ends=True, end_min=15)
     doc.close()
     ends = np.array(ends, np.float32) if ends else np.zeros((0, 2), np.float32)
     mask = np.zeros((H, W), np.uint8)
