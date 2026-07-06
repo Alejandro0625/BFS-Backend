@@ -15,6 +15,7 @@ import fitz  # PyMuPDF
 import texture  # classical-CV texture fallback for unmarked drawings
 import model_infer  # trained cladding-extent model (ONNX) — the real auto-markup for RAW drawings
 import vector_hatch  # reads the DRAWN pattern vectors (seam trains + gray fills) — exact, preferred on clean pages
+import callouts  # reads the drawing's own text callouts + leader arrows -> names the regions
 import snap_fill  # coloring-book BUCKET fill + corner-snap → exact SF from vector geometry (assist layer)
 import material_groups  # within-job texture grouping → a selectable PREVIEW of material groups (assist layer)
 from fastapi import FastAPI, UploadFile, File, BackgroundTasks, HTTPException, Body
@@ -416,6 +417,12 @@ def process(jid, pdf_bytes):
                             except Exception:
                                 pass
                     if tpolys:
+                        try:  # read the architect's own labels: callout text + leader arrows -> region names
+                            n_named = callouts.name_regions(pdf_bytes, pi, tpolys, pw, ph)
+                            if n_named:
+                                jlog(job, f"Page {pi+1}: {n_named} region(s) named from the drawing's callouts", "ok")
+                        except Exception:
+                            pass
                         polys = tpolys; auto = True; auto_used += 1; auto_hits += 1
                         scale_conf = bool(sinfo.get("scale_confirmed")); scale_val = sinfo.get("ft_per_in")
                 except Exception as te:
