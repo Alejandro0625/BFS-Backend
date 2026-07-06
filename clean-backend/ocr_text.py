@@ -29,7 +29,7 @@ def available():
     """Lazy-load RapidOCR. If not pip-installed, extract the VENDORED package (shipped in the
     repo as rapidocr_vendor.zip) — zero pip resolution, so the opencv-python conflict that
     once took the backend down is structurally impossible."""
-    global _ENGINE, _TRIED
+    global _ENGINE, _TRIED, _ERR
     if _ENGINE is None and not _TRIED:
         _TRIED = True
         try:
@@ -37,21 +37,28 @@ def available():
                 from rapidocr_onnxruntime import RapidOCR
             except ImportError:
                 import sys, zipfile, tempfile, os as _os
-                vz = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "rapidocr_vendor.zip")
+                here = _os.path.dirname(_os.path.abspath(__file__))
+                vz = _os.path.join(here, "rapidocr_vendor.zip")
                 if not _os.path.isfile(vz):
+                    _ERR = f"vendor zip missing at {vz}; dir has: {sorted(_os.listdir(here))[:12]}"
                     _ENGINE = None
                     return False
                 dest = _os.path.join(tempfile.gettempdir(), "bfs_rapidocr")
-                if not _os.path.isdir(_os.path.join(dest, "rapidocr_onnxruntime")):
-                    _os.makedirs(dest, exist_ok=True)
-                    with zipfile.ZipFile(vz) as z:
-                        z.extractall(dest)
+                _os.makedirs(dest, exist_ok=True)
+                with zipfile.ZipFile(vz) as z:
+                    z.extractall(dest)
                 if dest not in sys.path:
                     sys.path.insert(0, dest)
-                from rapidocr_onnxruntime import RapidOCR
+                import importlib
+                importlib.invalidate_caches()
+                try:
+                    from rapidocr_onnxruntime import RapidOCR
+                except ImportError as e2:
+                    _ERR = f"post-extract import failed: {e2} | dest listing: {sorted(_os.listdir(dest))[:8]}"
+                    _ENGINE = None
+                    return False
             _ENGINE = RapidOCR()
         except Exception as e:
-            global _ERR
             _ERR = f"{type(e).__name__}: {e}"[:220]
             _ENGINE = None
     return _ENGINE is not None
