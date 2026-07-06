@@ -287,6 +287,145 @@ def _train_polygon(reg, snapx=(), snapy=()):
     return pts
 
 
+def _pip_pt(pt, poly):
+    x, y = pt
+    inside = False
+    n = len(poly)
+    for i in range(n):
+        x1, y1 = poly[i]
+        x2, y2 = poly[(i - 1) % n]
+        if (y1 > y) != (y2 > y) and x < (x2 - x1) * (y - y1) / (y2 - y1 + 1e-12) + x1:
+            inside = not inside
+    return inside
+
+
+def _collect_rects(pg):
+    """All axis-aligned rectangles on the page (display coords): 're' items plus closed
+    4-line paths (CAD exports draw window frames both ways). Returns [(x0,y0,x1,y1)]."""
+    rot = pg.rotation_matrix
+    rects = []
+
+    def add_rect_pts(x0, y0, x1, y1):
+        a = fitz.Point(x0, y0) * rot
+        b = fitz.Point(x1, y1) * rot
+        rects.append((min(a.x, b.x), min(a.y, b.y), max(a.x, b.x), max(a.y, b.y)))
+
+    try:
+        for d in pg.get_drawings():
+            items = d.get("items", [])
+            res = [it for it in items if it[0] == "re"]
+            for it in res:
+                r = it[1]
+                if r.width > 2 and r.height > 2:
+                    add_rect_pts(r.x0, r.y0, r.x1, r.y1)
+            # closed line-loop that traces its own bbox = a drawn rectangle
+            ls = [it for it in items if it[0] == "l"]
+            if 3 <= len(ls) <= 6 and not res:
+                r = d["rect"]
+                if r.width > 2 and r.height > 2:
+                    per = sum(((it[1].x - it[2].x) ** 2 + (it[1].y - it[2].y) ** 2) ** 0.5 for it in ls)
+                    if abs(per - 2 * (r.width + r.height)) < 0.25 * (r.width + r.height):
+                        add_rect_pts(r.x0, r.y0, r.x1, r.y1)
+    except Exception:
+        pass
+    return rects[:6000]
+
+
+def page_geometry(pg):
+    """One-pass page geometry for opening detection (display coords): rectangles + segments."""
+    segs = []
+    try:
+        rot = pg.rotation_matrix
+        for d in pg.get_drawings():
+            for it in d.get("items", []):
+                if it[0] == "l":
+                    a = fitz.Point(it[1].x, it[1].y) * rot
+                    b = fitz.Point(it[2].x, it[2].y) * rot
+                    segs.append((a.x, a.y, b.x, b.y))
+    except Exception:
+        pass
+    return {"rects": _collect_rects(pg), "segs": segs[:30000]}
+
+
+def find_openings(geo, pts_disp, ft_pt):
+    """READ WINDOWS/DOORS THE WAY AN ESTIMATOR DOES. Inside the wall polygon (display coords),
+    an opening is an axis-aligned rectangle that (a) is a believable window/door size at this
+    scale, (b) shows FENESTRATION EVIDENCE — a nested frame rectangle or interior mullion
+    lines — and (c) doors may touch the wall's bottom edge. Returns (opening_polys_norm_NONE —
+    caller normalizes), list of rect tuples, total opening area pt^2. MONEY-SAFE: evidence
+    required (never deduct a bare reference box), dedupe nested frames (outermost wins),
+    total deduction capped at 40% of the wall."""
+    rects = geo.get("rects") or []
+    if not rects:
+        return [], 0.0
+    xs = [p[0] for p in pts_disp]; ys = [p[1] for p in pts_disp]
+    bx0, bx1, by0, by1 = min(xs), max(xs), min(ys), max(ys)
+    region_w = max(1.0, bx1 - bx0)
+    wall_area = _shoelace(pts_disp)
+    # candidate rects: inside the wall, plausible physical size
+    cands = []
+    for (x0, y0, x1, y1) in rects:
+        w_ft = (x1 - x0) * ft_pt
+        h_ft = (y1 - y0) * ft_pt
+        if not (1.2 <= w_ft <= 22 and 1.2 <= h_ft <= 16):
+            continue
+        if (x1 - x0) > 0.8 * region_w:          # full-width band = wall articulation, not a window
+            continue
+        cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
+        corners_in = sum(1 for (px, py) in ((x0 + 1, y0 + 1), (x1 - 1, y0 + 1), (x1 - 1, y1 - 1), (x0 + 1, y1 - 1))
+                         if _pip_pt((px, py), pts_disp))
+        if corners_in < 3 or not _pip_pt((cx, cy), pts_disp):
+            continue
+        cands.append((x0, y0, x1, y1))
+    if not cands:
+        return [], 0.0
+    # dedupe nested frames: outermost rect of each concentric family wins
+    cands.sort(key=lambda r: -(r[2] - r[0]) * (r[3] - r[1]))
+    keep = []
+    nested_count = {}
+    for r in cands:
+        host = None
+        for k in keep:
+            if r[0] >= k[0] - 2 and r[1] >= k[1] - 2 and r[2] <= k[2] + 2 and r[3] <= k[3] + 2:
+                host = k; break
+        if host is not None:
+            nested_count[host] = nested_count.get(host, 0) + 1
+        else:
+            keep.append(r); nested_count[r] = 0
+    # evidence gate: nested frame OR interior mullion/glazing linework
+    segs = geo.get("segs") or []
+    openings = []
+    for r in keep:
+        x0, y0, x1, y1 = r
+        if nested_count.get(r, 0) >= 1:
+            openings.append(r); continue
+        mull = 0
+        for (sx0, sy0, sx1, sy1) in segs:
+            mx, my = (sx0 + sx1) / 2, (sy0 + sy1) / 2
+            if x0 + 2 < mx < x1 - 2 and y0 + 2 < my < y1 - 2:
+                L = ((sx1 - sx0) ** 2 + (sy1 - sy0) ** 2) ** 0.5
+                if L >= 0.35 * min(x1 - x0, y1 - y0):
+                    mull += 1
+                    if mull >= 2:
+                        break
+        if mull >= 2:
+            openings.append(r)
+    if not openings:
+        return [], 0.0
+    # cap the deduction — a wall can never lose more than 40% to detected openings
+    openings.sort(key=lambda r: -(r[2] - r[0]) * (r[3] - r[1]))
+    total = 0.0
+    final = []
+    cap = 0.40 * wall_area
+    for (x0, y0, x1, y1) in openings[:24]:
+        a = (x1 - x0) * (y1 - y0)
+        if total + a > cap:
+            continue
+        total += a
+        final.append((x0, y0, x1, y1))
+    return final, total
+
+
 def detect(pdf_bytes, page_index, zoom=None):
     """Same contract as model_infer.detect(): (polys, w, h, scale_info)."""
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
@@ -302,6 +441,7 @@ def detect(pdf_bytes, page_index, zoom=None):
     _vl, _hc = _collect_axis(pg, "v")
     snapx = sorted(set(c for (c, _, _) in _vl))[:800]
     snapy = sorted(set(y for (_, _, y) in _hc))[:800]
+    geo = page_geometry(pg)   # rectangles + segments for window/door detection (display coords)
     doc.close()
 
     # fills win where they overlap a train (they are the exact drawn shape)
@@ -328,21 +468,36 @@ def detect(pdf_bytes, page_index, zoom=None):
 
     polys = []
 
-    def add(pts_page, area_pt2, material, color, sf_exact):
+    def add(pts_page, area_pt2, material, color, sf_exact, deduct_openings=False):
+        disp_pts = [((fitz.Point(x, y) * rot).x, (fitz.Point(x, y) * rot).y) for (x, y) in pts_page]
+        # WINDOWS/DOORS: detect evidence-backed openings inside this wall. For plain-fill walls
+        # SUBTRACT them (their shoelace SF was gross); pattern walls' strip-integral is already
+        # net, so openings attach for DISPLAY only (honest cut-outs, no double deduction).
+        holes_norm = []
+        try:
+            op_rects, op_pt2 = find_openings(geo, disp_pts, ft_pt)
+            for (ox0, oy0, ox1, oy1) in op_rects:
+                holes_norm.append([[round(ox0 / W, 5), round(oy0 / H, 5)], [round(ox1 / W, 5), round(oy0 / H, 5)],
+                                   [round(ox1 / W, 5), round(oy1 / H, 5)], [round(ox0 / W, 5), round(oy1 / H, 5)]])
+            if deduct_openings and op_pt2 > 0:
+                area_pt2 = max(0.0, area_pt2 - op_pt2)
+                sf_exact = True     # net-of-openings: protect from shoelace recompute (would re-add windows)
+        except Exception:
+            pass
         sf = area_pt2 * ft_pt * ft_pt
         if sf < MIN_SF:
             return
-        disp = [fitz.Point(x, y) * rot for (x, y) in pts_page]
-        norm = [[round(p.x / W, 5), round(p.y / H, 5)] for p in disp]
+        norm = [[round(x / W, 5), round(y / H, 5)] for (x, y) in disp_pts]
         cx = round(sum(p[0] for p in norm) / len(norm), 5)
         cy = round(sum(p[1] for p in norm) / len(norm), 5)
         polys.append({"points": norm, "area_sf": round(sf, 1), "cx": cx, "cy": cy,
                       "fill_color": color, "source": "vector", "material": material,
                       "category": material, "group": material, "sf_exact": sf_exact,
+                      "holes": holes_norm[:24],
                       "label": f"~{round(sf):,} SF"})
 
     for f in fills:
-        add(f["pts"], f["area_pt2"], "Panel wall (drawn fill)", [0.35, 0.55, 0.85], False)
+        add(f["pts"], f["area_pt2"], "Panel wall (drawn fill)", [0.35, 0.55, 0.85], False, deduct_openings=True)
     for t in kept_trains:
         sp_ft = t["spacing"] * ft_pt
         len_ft = t["med_len"] * ft_pt
