@@ -3,5 +3,5 @@ uvicorn[standard]
 pymupdf
 python-multipart
 numpy
+opencv-python-headless
 onnxruntime
-rapidocr-onnxruntime==1.2.3
