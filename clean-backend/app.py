@@ -533,7 +533,8 @@ def status(jid: str):
     if not j: raise HTTPException(404, "job not found")
     return {"status": j["status"], "phase": j.get("phase", ""), "log": j["log"], "progress": j["progress"],
             "legend": j.get("legend", []), "takeoffData": j.get("takeoffData", []),
-            "scheduleData": j.get("scheduleData"), "error": j.get("error")}
+            "scheduleData": j.get("scheduleData"), "drawingSchedule": j.get("drawingSchedule"),
+            "error": j.get("error")}
 
 @app.get("/polygons/{jid}/{page}")
 def polygons(jid: str, page: int):
