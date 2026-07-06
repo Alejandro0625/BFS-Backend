@@ -208,6 +208,14 @@ def _train_regions(pg, axis):
                 mid = fitz.Point((a0 + a1) / 2, (c0 + c1_) / 2) * rot
             if abs(mid.x) > 0.86 * RX or abs(mid.y) > 0.92 * RY:
                 continue
+            # sheet-border strips: a thin full-length band hugging a page edge is the border/
+            # dimension track, not a wall
+            RW, RH = (H, W) if abs(rot.b) > 0.5 or abs(rot.c) > 0.5 else (W, H)
+            bx0, bx1, by0, by1 = (c0, c1_, a0, a1) if axis == "v" else (a0, a1, c0, c1_)
+            if (by1 - by0) < 0.06 * RH and (bx1 - bx0) > 0.7 * RW and (by0 < 0.03 * RH or by1 > 0.97 * RH):
+                continue
+            if (bx1 - bx0) < 0.06 * RW and (by1 - by0) > 0.7 * RH and (bx0 < 0.03 * RW or bx1 > 0.97 * RW):
+                continue
             topC = _pct([v[1] for v in part], 10) - 6
             botC = _pct([v[2] for v in part], 90) + 6
             part = [(c, max(a, topC), min(b, botC)) for (c, a, b) in part if min(b, botC) - max(a, topC) > 10]
