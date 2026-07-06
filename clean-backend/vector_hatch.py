@@ -16,8 +16,8 @@ import math
 import fitz
 import texture  # reuse the robust scale reader
 
-MIN_SF = 100          # ignore specks — estimator noise floor
-MAX_REGIONS = 40
+MIN_SF = 30           # keep small real faces (returns, soffit strips) — welding consolidates specks
+MAX_REGIONS = 60
 
 
 def _pct(v, p):
@@ -597,6 +597,9 @@ def weld_faces(polys, gap=0.015, raster=1600):
                 _cv.fillPoly(m2, [cnt.reshape(-1, 1, 2)], 1)
             k = max(3, int(gap * S * 0.8))
             m2 = _cv.morphologyEx(m2, _cv.MORPH_CLOSE, np.ones((k, k), np.uint8))
+            # shave thin SPURS (leader lines poking out of the face) — outline only, SF untouched
+            ko = max(3, k // 2)
+            m2 = _cv.morphologyEx(m2, _cv.MORPH_OPEN, np.ones((ko, ko), np.uint8))
             cnts, _ = _cv.findContours(m2, _cv.RETR_EXTERNAL, _cv.CHAIN_APPROX_SIMPLE)
             if not cnts:
                 out.extend(members); continue
