@@ -234,9 +234,19 @@ def _train_area_pt2(reg):
     return A
 
 
-def _train_polygon(reg):
-    """Rectilinear outline from runs of similar extents (an estimator-looking border)."""
+def _train_polygon(reg, snapx=(), snapy=()):
+    """Rectilinear outline from runs of similar extents, with every edge SNAPPED to the
+    drawing's real structural lines — the border lands on actual corners, not near them."""
     part = reg["lines"]
+
+    def sn(v, cands, tol=9):
+        best = None; bd = tol
+        for c in cands:
+            d = abs(c - v)
+            if d < bd:
+                bd = d; best = c
+        return best if best is not None else v
+
     cols = {}
     for (c, a, b) in part:
         e = cols.setdefault(c, [a, b])
@@ -245,10 +255,12 @@ def _train_polygon(reg):
     runs = []
     for c in cs:
         t, b = cols[c]
-        if runs and abs(runs[-1][2] - t) < 8 and abs(runs[-1][3] - b) < 8:
+        if runs and abs(runs[-1][2] - t) < 14 and abs(runs[-1][3] - b) < 14:
             runs[-1] = (runs[-1][0], c, min(runs[-1][2], t), max(runs[-1][3], b))
         else:
             runs.append((c, c, t, b))
+    ext = snapy if reg["axis"] == "v" else snapx     # run tops/bottoms snap along the line axis
+    runs = [(ca, cb, sn(t, ext), sn(b, ext)) for (ca, cb, t, b) in runs]
     pts = []
     for (ca, cb, t, b) in runs:
         pts += [(ca, t), (cb, t)]
@@ -256,6 +268,14 @@ def _train_polygon(reg):
         pts += [(cb, b), (ca, b)]
     if reg["axis"] == "h":
         pts = [(y, x) for (x, y) in pts]
+    try:  # collapse micro stair-steps (<~5pt) so the border reads like an estimator drew it
+        import numpy as np, cv2
+        arr = np.array(pts, np.float32).reshape(-1, 1, 2)
+        ap = cv2.approxPolyDP(arr, 5.0, True).reshape(-1, 2)
+        if len(ap) >= 4:
+            pts = [(float(x), float(y)) for x, y in ap]
+    except Exception:
+        pass
     return pts
 
 
@@ -270,6 +290,10 @@ def detect(pdf_bytes, page_index, zoom=None):
 
     fills = _fill_regions(pg)
     trains = _train_regions(pg, "v") + _train_regions(pg, "h")
+    # structural snap targets: the page's long vertical Xs and horizontal Ys
+    _vl, _hc = _collect_axis(pg, "v")
+    snapx = sorted(set(c for (c, _, _) in _vl))[:800]
+    snapy = sorted(set(y for (_, _, y) in _hc))[:800]
     doc.close()
 
     # fills win where they overlap a train (they are the exact drawn shape)
@@ -325,7 +349,7 @@ def detect(pdf_bytes, page_index, zoom=None):
             mat = f"Lap / horizontal - {sp_ft * 12:.0f}in courses" if sp_ft < 2 else f"Horizontal panel - {sp_ft:.1f}'"
             col = [0.25, 0.75, 0.35]
         # strip-integral SF is net of openings — trust it, don't let calibrate re-add openings
-        add(_train_polygon(t), _train_area_pt2(t), mat, col, True)
+        add(_train_polygon(t, snapx, snapy), _train_area_pt2(t), mat, col, True)
 
     # overlap dedup — regions must never double-count the same wall into the total.
     # Rasterize at low res; drop a region mostly covered by earlier (bigger/fill) ones,
