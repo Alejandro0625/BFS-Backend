@@ -270,6 +270,12 @@ def _train_polygon(reg, snapx=(), snapy=()):
             runs.append((c, c, t, b))
     ext = snapy if reg["axis"] == "v" else snapx     # run tops/bottoms snap along the line axis
     runs = [(ca, cb, sn(t, ext), sn(b, ext)) for (ca, cb, t, b) in runs]
+    # clamp outline to the DOMINANT band — dimension/leader verticals that slipped into the
+    # train can't spike the display shape (SF comes from the strip integral, untouched)
+    if len(runs) >= 3:
+        topsP = _pct([r[2] for r in runs], 15) - 10
+        botsP = _pct([r[3] for r in runs], 85) + 10
+        runs = [(ca, cb, max(t, topsP), min(b, botsP)) for (ca, cb, t, b) in runs if min(b, botsP) - max(t, topsP) > 4]
     pts = []
     for (ca, cb, t, b) in runs:
         pts += [(ca, t), (cb, t)]
@@ -595,7 +601,49 @@ def weld_faces(polys, gap=0.015, raster=1600):
                 else:
                     keep.append(p)
             remaining = keep
-        # weld the cluster (also smooths a single piece's stair-noise)
+        # weld the cluster — EXACT geometry first (shapely union with mitred closing: square
+        # corners by construction, no raster stair-noise, real holes); raster fallback second
+        try:
+            from shapely.geometry import Polygon as _SPoly, MultiPolygon as _SMulti
+            from shapely.ops import unary_union as _sunion
+            parts = []
+            for p in members:
+                try:
+                    sp = _SPoly([(x, y) for x, y in p["points"]]).buffer(0)
+                    if not sp.is_empty:
+                        parts.append(sp)
+                except Exception:
+                    pass
+            if parts:
+                u = _sunion(parts)
+                g2 = gap / 2.0
+                u = u.buffer(g2, join_style=2).buffer(-g2, join_style=2)   # close butt joints, mitred = square
+                if isinstance(u, _SMulti):
+                    u = max(u.geoms, key=lambda q: q.area)
+                u = u.simplify(0.0022, preserve_topology=True)
+                ext = list(u.exterior.coords)
+                if len(ext) >= 4:
+                    face = dict(members[0])
+                    face["points"] = [[round(float(x), 5), round(float(y), 5)] for x, y in ext[:-1]]
+                    face["area_sf"] = round(sum(p.get("area_sf", 0) for p in members), 1)
+                    holes = []
+                    for p in members:
+                        holes += (p.get("holes") or [])
+                    for ring in list(u.interiors)[:12]:      # true geometric holes from the union
+                        rc = list(ring.coords)
+                        if len(rc) >= 4:
+                            holes.append([[round(float(x), 5), round(float(y), 5)] for x, y in rc[:-1]])
+                    face["holes"] = holes[:24]
+                    face["cx"] = round(sum(pt[0] for pt in face["points"]) / len(face["points"]), 5)
+                    face["cy"] = round(sum(pt[1] for pt in face["points"]) / len(face["points"]), 5)
+                    if len(members) > 1:
+                        face["sf_exact"] = True
+                        face["merged_pieces"] = len(members)
+                    face["label"] = f"~{round(face['area_sf']):,} SF"
+                    out.append(face)
+                    continue
+        except Exception:
+            pass
         try:
             S = raster; SH = raster
             m2 = np.zeros((SH, S), np.uint8)
