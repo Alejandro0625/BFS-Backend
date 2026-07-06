@@ -507,7 +507,7 @@ def process(jid, pdf_bytes):
             odoc = fitz.open(stream=pdf_bytes, filetype="pdf")
             flat_pages = [e["pageNumber"] for e in job["takeoffData"]
                           if e.get("source") == "texture-auto"
-                          and len((odoc[e["pageNumber"] - 1].get_text() or "")) < 40][:4]
+                          and len((odoc[e["pageNumber"] - 1].get_text() or "")) < 250][:4]
             odoc.close()
             if flat_pages and ocr_text.available():
                 seen = set(); ocr_mats = []
