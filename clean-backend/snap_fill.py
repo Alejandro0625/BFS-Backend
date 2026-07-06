@@ -170,7 +170,7 @@ def bucket(pdf_bytes, page_index, point):
         if hits:
             best = max(hits, key=lambda p: p.get("area_sf", 0))   # if regions overlap, the largest wall wins
             return {"status": "ok", "points": best["points"], "area_sf": best.get("area_sf", 0),
-                    "holes": [], "material": best.get("material", ""),
+                    "holes": best.get("holes", []), "material": best.get("material", ""),
                     "scale_confirmed": bool(vinfo.get("scale_confirmed")), "source": "bucket-vector",
                     "width": VW, "height": VH}
     except Exception:
