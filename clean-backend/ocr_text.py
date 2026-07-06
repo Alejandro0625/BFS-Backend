@@ -12,6 +12,7 @@ import fitz
 
 _ENGINE = None
 _TRIED = False
+_ERR = ""
 
 # CLADDING head-nouns only (OCR reads whole sentences, so exclude trim/fascia/hardware/doors)
 _CLAD_RE = re.compile(r"\b(metl[-\s]?span|standing\s*seam|board\s*&?\s*batten|"
@@ -49,9 +50,15 @@ def available():
                     sys.path.insert(0, dest)
                 from rapidocr_onnxruntime import RapidOCR
             _ENGINE = RapidOCR()
-        except Exception:
+        except Exception as e:
+            global _ERR
+            _ERR = f"{type(e).__name__}: {e}"[:220]
             _ENGINE = None
     return _ENGINE is not None
+
+
+def last_error():
+    return _ERR
 
 
 def read_materials(pdf_bytes, page_index, long_side=2200, max_lines=120):
