@@ -25,11 +25,29 @@ _NOTE_RE = re.compile(r"\b(existing|building|roof|installed|install|opening|prov
 
 
 def available():
+    """Lazy-load RapidOCR. If not pip-installed, extract the VENDORED package (shipped in the
+    repo as rapidocr_vendor.zip) — zero pip resolution, so the opencv-python conflict that
+    once took the backend down is structurally impossible."""
     global _ENGINE, _TRIED
     if _ENGINE is None and not _TRIED:
         _TRIED = True
         try:
-            from rapidocr_onnxruntime import RapidOCR
+            try:
+                from rapidocr_onnxruntime import RapidOCR
+            except ImportError:
+                import sys, zipfile, tempfile, os as _os
+                vz = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "rapidocr_vendor.zip")
+                if not _os.path.isfile(vz):
+                    _ENGINE = None
+                    return False
+                dest = _os.path.join(tempfile.gettempdir(), "bfs_rapidocr")
+                if not _os.path.isdir(_os.path.join(dest, "rapidocr_onnxruntime")):
+                    _os.makedirs(dest, exist_ok=True)
+                    with zipfile.ZipFile(vz) as z:
+                        z.extractall(dest)
+                if dest not in sys.path:
+                    sys.path.insert(0, dest)
+                from rapidocr_onnxruntime import RapidOCR
             _ENGINE = RapidOCR()
         except Exception:
             _ENGINE = None
