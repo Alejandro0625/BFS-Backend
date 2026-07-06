@@ -21,6 +21,50 @@ _NOISE_RE = re.compile(r"\b(scale|elevation\s*$|sheet|drawn|date|revision|note[s
 # LINEAR items (priced per LF) — must never name a big AREA region
 _LINEARISH_RE = re.compile(r"\b(trim|railing|handrail|guardrail|watertable|decking|downspout|"
                            r"gutter|drip|flashing|coping)\b", re.I)
+# NOT cladding at all — openings, hardware, notes that happen to contain a material word
+_NOTCLAD_RE = re.compile(r"\b(glass|glazing|window|door|louver|vent|hose\s*bibb|meter|"
+                         r"knox|sconce|light\s*pak|spandrel|parking|column\s*wrap|canopy)\b", re.I)
+
+
+def _is_dark(c):
+    return c and len(c) >= 3 and (c[0] + c[1] + c[2]) / 3 < 0.5
+
+
+def _arrowheads(pg):
+    """Dark ~3-vertex small filled triangles = leader arrowheads. Returns list of
+    {tip:(x,y), cx, cy}. tip = sharpest-angle vertex (points AT the region)."""
+    import math
+    heads = []
+    try:
+        for d in pg.get_drawings():
+            if not (_is_dark(d.get("fill")) or _is_dark(d.get("color"))):
+                continue
+            r = d["rect"]
+            area = r.width * r.height
+            if area < 8 or area > 150:
+                continue
+            pts = []
+            for it in d["items"]:
+                if it[0] == "l":
+                    pts += [(it[1].x, it[1].y), (it[2].x, it[2].y)]
+            uniq = list({(round(x, 1), round(y, 1)) for x, y in pts})
+            if len(uniq) != 3:
+                continue
+
+            def ang(a, b, c):
+                v1 = (b[0] - a[0], b[1] - a[1]); v2 = (c[0] - a[0], c[1] - a[1])
+                d1 = math.hypot(*v1); d2 = math.hypot(*v2)
+                if d1 * d2 == 0:
+                    return 999
+                cs = max(-1, min(1, (v1[0] * v2[0] + v1[1] * v2[1]) / (d1 * d2)))
+                return math.acos(cs)
+
+            angs = [ang(uniq[i], uniq[(i + 1) % 3], uniq[(i + 2) % 3]) for i in range(3)]
+            tip = uniq[angs.index(min(angs))]
+            heads.append({"tip": tip, "cx": sum(p[0] for p in uniq) / 3, "cy": sum(p[1] for p in uniq) / 3})
+    except Exception:
+        pass
+    return heads[:2000]
 
 
 def _blocks(pg):
@@ -33,7 +77,7 @@ def _blocks(pg):
                 continue
             if not _MAT_RE.search(t):
                 continue
-            if _NOISE_RE.search(t):
+            if _NOISE_RE.search(t) or _NOTCLAD_RE.search(t):
                 continue
             out.append({"rect": (x0, y0, x1, y1), "text": t})
     except Exception:
@@ -74,9 +118,45 @@ def _near_rect(pt, rect, pad):
     return rect[0] - pad <= pt[0] <= rect[2] + pad and rect[1] - pad <= pt[1] <= rect[3] + pad
 
 
+# note/instruction words — if a "callout" reads like a spec sentence, it's NOT a material name
+_NOTE_RE = re.compile(r"\b(refer|see|per|secure|fasten|provide|install|coordinate|seal|"
+                      r"match|dams?|ties|sheathing|continuous|prefinished|typ|note|detail|"
+                      r"schedule|remove|clean|paint|reattach|exposure|fastener|conceal|"
+                      r"air\s*barrier|barrier|balcony|manufacturer|knife|thru|membrane|"
+                      r"securement|coursing|opening)\b", re.I)
+# a real material name doesn't START with a connective/fragment word
+_FRAG_RE = re.compile(r"^(of|and|the|to|at|w/|@|with|or|in|on)\b", re.I)
+# cut a material name off where a note-clause begins ("LP LAP SIDING, REFER TO..." -> "LP LAP SIDING")
+_TAIL_RE = re.compile(r"\s*(?:[,;:]|\bREFER\b|\bSEE\b|\bPER\b|\bTYP\b|\bTO MATCH\b|\bSECURED\b|"
+                      r"\bFASTENED\b|\bW/\b|@).*$", re.I)
+
+
 def _clean(t):
-    t = re.sub(r"[•‣▪\-–—]\s*", "", t).strip(" .;:,")
-    return t[:48]
+    t = re.sub(r"[•‣▪]\s*", "", t or "").strip(" .;:,-–—")
+    t = re.sub(r"\s+", " ", t)
+    if t.count('"') % 2:                     # drop a dangling open-quote from truncation
+        t = re.sub(r'\s+"[^"]*$', "", t)
+    return t[:80].strip(' "-')
+
+
+def _material_name(t):
+    """Return a clean MATERIAL name, or None if the text is a construction note, not a material.
+    Precision-first: a wrong name corrupts the takeoff, so reject anything note-shaped."""
+    t = _clean(t)
+    if not t:
+        return None
+    core = _TAIL_RE.sub("", t).strip(' "-@/')  # keep only the material noun-phrase before any note-clause
+    if len(core) < 4:
+        return None
+    if re.match(r"^\d", core):                # "040 CONT", "2 SEAL" — a note, not a material
+        return None
+    if _FRAG_RE.search(core):                 # "OF SIDING", "@ STONE" — a fragment, not a name
+        return None
+    if _NOTE_RE.search(core):                 # still reads like an instruction
+        return None
+    if not _MAT_RE.search(core):              # must actually name a material
+        return None
+    return core[:56]
 
 
 # material KEY tags: M1, PNL-1, EF-3, WD2 ... (legend key on the wall)
@@ -129,6 +209,7 @@ def name_regions(pdf_bytes, page_index, polys, pw, ph):
         segs = _leaders(pg)
         legend = _legend_pairs(pg, blocks)
         keys = _key_words(pg)
+        heads = _arrowheads(pg)
         doc.close()
         # region polygons in PAGE-display coords
         rpolys = [[(x * pw, y * ph) for x, y in p["points"]] for p in polys]
@@ -163,42 +244,60 @@ def name_regions(pdf_bytes, page_index, polys, pw, ph):
                         used.add(ri)
                         named += 1
                         break
-        for bi, b in enumerate(dblocks):
-            target = None
-            # 1) leader: one end near the block, other end inside a region
+        # arrowheads in display coords, with a tip that points AT a region
+        dheads = [{"tip": rp(*h["tip"]), "c": rp(h["cx"], h["cy"])} for h in heads]
+
+        def region_at(pt):
+            for ri, rr in enumerate(rpolys):
+                if ri not in used and len(rr) >= 3 and _pip(pt, rr):
+                    return ri
+            return None
+
+        def assign(ri, nm, how):
+            nm = _material_name(nm)
+            if not nm:
+                return False
+            # a trim/railing/opening callout crossing a big wall points at a DETAIL, not the
+            # wall — naming 4,800 SF of panel "PVC TRIM" would corrupt the takeoff
+            if _LINEARISH_RE.search(nm) and (polys[ri].get("area_sf") or 0) > 250:
+                return False
+            polys[ri]["material"] = nm
+            polys[ri]["category"] = nm
+            polys[ri]["group"] = nm
+            polys[ri]["named_by"] = how
+            used.add(ri)
+            return True
+
+        # 1) TEXT + LEADER, confidence-tiered per material block:
+        #    (a) arrowhead-confirmed — a leader from the block ends at an arrowhead whose TIP
+        #        sits in a region. This is the "read the arrow" path: only arrowheads paired
+        #        with material text count, so detail-bubble/dimension arrows never mislabel.
+        #    (b) plain leader — a leader segment from the block ends inside a region.
+        #    (c) proximity — the block center sits inside a region.
+        for b in dblocks:
+            nm = b["text"]
+            hit = False
             for (x1, y1, x2, y2) in segs:
                 a = rp(x1, y1); c2 = rp(x2, y2)
                 for (p_from, p_to) in ((a, c2), (c2, a)):
-                    if _near_rect(p_from, b["rect"], 14):
-                        for ri, rr in enumerate(rpolys):
-                            if len(rr) >= 3 and _pip(p_to, rr):
-                                target = ri; break
-                    if target is not None:
-                        break
-                if target is not None:
+                    if not _near_rect(p_from, b["rect"], 16):
+                        continue
+                    # (a) is there an arrowhead near this leader's far end?
+                    ah = min(dheads, key=lambda h: (h["c"][0] - p_to[0]) ** 2 + (h["c"][1] - p_to[1]) ** 2, default=None) if dheads else None
+                    if ah and (ah["c"][0] - p_to[0]) ** 2 + (ah["c"][1] - p_to[1]) ** 2 <= 22 ** 2:
+                        ri = region_at(ah["tip"])
+                        if ri is None:
+                            ri = region_at(p_to)
+                        if ri is not None and assign(ri, nm, "arrow"):
+                            hit = True; break
+                    # (b) plain leader end in a region
+                    ri = region_at(p_to)
+                    if ri is not None and assign(ri, nm, "leader"):
+                        hit = True; break
+                if hit:
                     break
-            # 2) fallback: block center inside (or very near) a region
-            if target is None:
-                cx = (b["rect"][0] + b["rect"][2]) / 2
-                cy = (b["rect"][1] + b["rect"][3]) / 2
-                for ri, rr in enumerate(rpolys):
-                    if len(rr) >= 3 and _pip((cx, cy), rr):
-                        target = ri; break
-            if target is None or target in used:
-                continue
-            nm = _clean(b["text"])
-            if not nm:
-                continue
-            # a trim/railing callout crossing a big wall region is pointing at the DETAIL,
-            # not the wall — naming 4,800 SF of panel "PVC TRIM" would corrupt the takeoff
-            if _LINEARISH_RE.search(nm) and (polys[target].get("area_sf") or 0) > 250:
-                continue
-            polys[target]["material"] = nm
-            polys[target]["category"] = nm
-            polys[target]["group"] = nm
-            polys[target]["named_by"] = "callout"
-            used.add(target)
-            named += 1
-        return named
+            # NOTE: no pure-proximity tier — a material-word note floating over a wall would
+            # mislabel it, and a wrong name corrupts the takeoff. Only leader/arrow/legend name.
+        return sum(1 for p in polys if p.get("named_by"))
     except Exception:
         return 0
