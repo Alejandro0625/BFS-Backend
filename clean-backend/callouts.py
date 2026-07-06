@@ -127,6 +127,8 @@ def name_regions(pdf_bytes, page_index, polys, pw, ph):
             doc.close(); return 0
         rot = pg.rotation_matrix
         segs = _leaders(pg)
+        legend = _legend_pairs(pg, blocks)
+        keys = _key_words(pg)
         doc.close()
         # region polygons in PAGE-display coords
         rpolys = [[(x * pw, y * ph) for x, y in p["points"]] for p in polys]
@@ -141,6 +143,26 @@ def name_regions(pdf_bytes, page_index, polys, pw, ph):
             dblocks.append({"rect": r, "text": b["text"]})
         named = 0
         used = set()
+        # 0) LEGEND-KEY FIRST — the most reliable convention (M5/PNL-1 tag on the wall + a
+        # legend mapping key->material). Runs before leaders/proximity so junk text can't
+        # claim a region that has a proper key.
+        if legend and keys:
+            for (kx, ky, key) in keys:
+                if key not in legend:
+                    continue
+                q = fitz.Point(kx, ky) * rot
+                pt = (q.x, q.y)
+                for ri, rr in enumerate(rpolys):
+                    if ri in used or len(rr) < 3:
+                        continue
+                    if _pip(pt, rr):
+                        polys[ri]["material"] = legend[key]
+                        polys[ri]["category"] = legend[key]
+                        polys[ri]["group"] = legend[key]
+                        polys[ri]["named_by"] = "legend:" + key
+                        used.add(ri)
+                        named += 1
+                        break
         for bi, b in enumerate(dblocks):
             target = None
             # 1) leader: one end near the block, other end inside a region
@@ -177,31 +199,6 @@ def name_regions(pdf_bytes, page_index, polys, pw, ph):
             polys[target]["named_by"] = "callout"
             used.add(target)
             named += 1
-        # 3) LEGEND-KEY convention: an M5/PNL-1 tag on (or leadered to) the wall + a legend
-        # mapping the key to its material name — the dominant convention on CD sets.
-        doc2 = fitz.open(stream=pdf_bytes, filetype="pdf")
-        pg2 = doc2[page_index]
-        legend = _legend_pairs(pg2, blocks)
-        keys = _key_words(pg2)
-        rot2 = pg2.rotation_matrix
-        doc2.close()
-        if legend and keys:
-            for (kx, ky, key) in keys:
-                if key not in legend:
-                    continue
-                q = fitz.Point(kx, ky) * rot2
-                pt = (q.x, q.y)
-                for ri, rr in enumerate(rpolys):
-                    if ri in used or len(rr) < 3:
-                        continue
-                    if _pip(pt, rr):
-                        polys[ri]["material"] = legend[key]
-                        polys[ri]["category"] = legend[key]
-                        polys[ri]["group"] = legend[key]
-                        polys[ri]["named_by"] = "legend:" + key
-                        used.add(ri)
-                        named += 1
-                        break
         return named
     except Exception:
         return 0
