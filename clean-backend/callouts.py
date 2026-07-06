@@ -196,6 +196,56 @@ def _key_words(pg):
     return out
 
 
+_SCHED_NUM = re.compile(r"^[\d,]+(?:\.\d+)?$")
+_SCHED_UNIT = re.compile(r"^(sf|sq|s\.?f\.?)$", re.I)
+
+
+def read_schedule_pg(pg):
+    """Schedule reader on an already-open page (cheap — no per-page PDF re-parse)."""
+    out = []
+    try:
+        legend = _legend_pairs(pg, _blocks(pg))
+        from collections import defaultdict
+        rows = defaultdict(list)
+        for w in pg.get_text("words"):
+            rows[round(w[1] / 4)].append(w)     # cluster by ~4pt y-band = one table row
+        best = {}
+        for _, ws in rows.items():
+            ws = sorted(ws, key=lambda w: w[0])
+            toks = [w[4] for w in ws]
+            for i in range(len(toks) - 1):
+                if not _KEY_RE.match(toks[i]):
+                    continue
+                for j in range(i + 1, min(i + 3, len(toks))):
+                    if _SCHED_NUM.match(toks[j]):
+                        val = float(toks[j].replace(",", ""))
+                        unit_ok = (j + 1 < len(toks) and _SCHED_UNIT.match(toks[j + 1]))
+                        if val >= 50 and unit_ok:
+                            best[toks[i]] = max(best.get(toks[i], 0), val)  # schedule total > stray region labels
+                        break
+        for key, val in best.items():
+            mat = legend.get(key, "")
+            if not mat or _LINEARISH_RE.search(mat):   # only wall materials (skip railings/trim fixtures)
+                continue
+            out.append({"key": key, "sf": round(val), "material": mat})
+    except Exception:
+        pass
+    out.sort(key=lambda r: -r["sf"])
+    # only trust it as a schedule if there are at least 2 keyed material rows
+    return out if len(out) >= 2 else []
+
+
+def read_schedule(pdf_bytes, page_index):
+    """Convenience wrapper: read the schedule from one page of a PDF byte-stream."""
+    try:
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        r = read_schedule_pg(doc[page_index])
+        doc.close()
+        return r
+    except Exception:
+        return []
+
+
 def name_regions(pdf_bytes, page_index, polys, pw, ph):
     """polys carry normalized DISPLAY points. Returns count of regions named.
     Mutates polys in place: sets material/category/group to the callout text when found."""
