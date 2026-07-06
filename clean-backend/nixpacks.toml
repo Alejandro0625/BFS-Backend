@@ -1,0 +1,5 @@
+# rapidocr-onnxruntime pulls opencv-python (full), which needs these system libs at runtime.
+# Unifying on full opencv (was opencv-python-headless) so there is exactly ONE cv2 install —
+# two opencv distributions would clobber each other's cv2/ dir and break imports.
+[phases.setup]
+aptPkgs = ["libgl1", "libglib2.0-0"]
