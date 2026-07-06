@@ -16,8 +16,8 @@ import math
 import fitz
 import texture  # reuse the robust scale reader
 
-MIN_SF = 30           # keep small real faces (returns, soffit strips) — welding consolidates specks
-MAX_REGIONS = 60
+MIN_SF = 100          # REVERTED: 30 let junk specks become stepping stones that chained welds
+MAX_REGIONS = 40      # across the sheet into one sprawling blob (user-caught regression)
 
 
 def _pct(v, p):
@@ -263,7 +263,8 @@ def _train_polygon(reg, snapx=(), snapy=()):
     runs = []
     for c in cs:
         t, b = cols[c]
-        if runs and abs(runs[-1][2] - t) < 14 and abs(runs[-1][3] - b) < 14:
+        # 36pt (~4.5ft at 1/8") run tolerance: real parapet steps survive, stair-noise collapses
+        if runs and abs(runs[-1][2] - t) < 36 and abs(runs[-1][3] - b) < 36:
             runs[-1] = (runs[-1][0], c, min(runs[-1][2], t), max(runs[-1][3], b))
         else:
             runs.append((c, c, t, b))
@@ -578,13 +579,19 @@ def weld_faces(polys, gap=0.015, raster=1600):
             grew = False
             mb = [bbox(m) for m in members]
             keep = []
+            cb = (min(m[0] for m in mb), min(m[1] for m in mb), max(m[2] for m in mb), max(m[3] for m in mb))
             for p in remaining:
                 if (p.get("group") or p.get("material")) != grp:
                     keep.append(p); continue
                 b = bbox(p)
                 near = any(not (b[2] < m[0] - gap or b[0] > m[2] + gap or b[3] < m[1] - gap or b[1] > m[3] + gap) for m in mb)
+                # ANTI-SPRAWL: a weld may never grow into a page-spanning blob — one wall face
+                # is wide OR tall, never half the sheet in BOTH directions
+                nb = (min(cb[0], b[0]), min(cb[1], b[1]), max(cb[2], b[2]), max(cb[3], b[3]))
+                if near and (nb[2] - nb[0]) > 0.55 and (nb[3] - nb[1]) > 0.55:
+                    near = False
                 if near:
-                    members.append(p); grew = True
+                    members.append(p); grew = True; cb = nb
                 else:
                     keep.append(p)
             remaining = keep
@@ -604,9 +611,26 @@ def weld_faces(polys, gap=0.015, raster=1600):
             if not cnts:
                 out.extend(members); continue
             c = max(cnts, key=_cv.contourArea)
-            ap = _cv.approxPolyDP(c, 0.0035 * _cv.arcLength(c, True), True).reshape(-1, 2)
+            ap = _cv.approxPolyDP(c, 0.008 * _cv.arcLength(c, True), True).reshape(-1, 2)   # straighter, estimator-looking edges
             if len(ap) < 3:
                 out.extend(members); continue
+            # drop NEEDLE vertices (sharp slivers poking into text/dimension areas)
+            import math as _math
+            def _ang(a, b, cpt):
+                v1 = (a[0] - b[0], a[1] - b[1]); v2 = (cpt[0] - b[0], cpt[1] - b[1])
+                d1 = _math.hypot(*v1); d2 = _math.hypot(*v2)
+                if d1 * d2 == 0:
+                    return 180.0
+                cs = max(-1, min(1, (v1[0] * v2[0] + v1[1] * v2[1]) / (d1 * d2)))
+                return _math.degrees(_math.acos(cs))
+            for _ in range(3):
+                if len(ap) <= 4:
+                    break
+                keepv = [i for i in range(len(ap))
+                         if _ang(ap[i - 1], ap[i], ap[(i + 1) % len(ap)]) > 22]
+                if len(keepv) == len(ap) or len(keepv) < 3:
+                    break
+                ap = ap[keepv]
             face = dict(members[0])
             face["points"] = [[round(float(x) / S, 5), round(float(y) / SH, 5)] for x, y in ap]
             face["area_sf"] = round(sum(p.get("area_sf", 0) for p in members), 1)
