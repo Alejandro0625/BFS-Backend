@@ -545,6 +545,80 @@ def detect(pdf_bytes, page_index, zoom=None):
 
     polys.sort(key=lambda p: -p["area_sf"])
     polys = [p for p in polys if p["area_sf"] >= MIN_SF][:MAX_REGIONS]
+    polys = weld_faces(polys)   # FIRST IMPRESSION = clean faces: same-pattern pieces welded into one
     for i, p in enumerate(polys):
         p["id"] = i
     return polys, W, H, {"ft_per_in": round(sc, 3), "scale_confirmed": conf}
+
+
+def weld_faces(polys, gap=0.015, raster=1600):
+    """THE FACE IS ONE PIECE. Cluster same-pattern regions whose bboxes nearly touch (butt-
+    joined pieces of one wall) and weld each cluster into a single clean outline. SF = SUM of
+    members' own (already net) SF — welding never invents area; holes carried through. Also
+    smooths single regions' staircase micro-notches (the 'zigzag' first impression) via the
+    same raster-close pass. Different materials that touch never weld (same group only)."""
+    try:
+        import numpy as np
+        import cv2 as _cv
+    except Exception:
+        return polys
+
+    def bbox(p):
+        xs = [q[0] for q in p["points"]]; ys = [q[1] for q in p["points"]]
+        return (min(xs), min(ys), max(xs), max(ys))
+
+    out = []
+    remaining = list(polys)
+    while remaining:
+        seed = remaining.pop(0)
+        grp = seed.get("group") or seed.get("material")
+        members = [seed]
+        grew = True
+        while grew:
+            grew = False
+            mb = [bbox(m) for m in members]
+            keep = []
+            for p in remaining:
+                if (p.get("group") or p.get("material")) != grp:
+                    keep.append(p); continue
+                b = bbox(p)
+                near = any(not (b[2] < m[0] - gap or b[0] > m[2] + gap or b[3] < m[1] - gap or b[1] > m[3] + gap) for m in mb)
+                if near:
+                    members.append(p); grew = True
+                else:
+                    keep.append(p)
+            remaining = keep
+        # weld the cluster (also smooths a single piece's stair-noise)
+        try:
+            S = raster; SH = raster
+            m2 = np.zeros((SH, S), np.uint8)
+            for p in members:
+                cnt = np.array([[int(x * S), int(y * SH)] for x, y in p["points"]], np.int32)
+                _cv.fillPoly(m2, [cnt.reshape(-1, 1, 2)], 1)
+            k = max(3, int(gap * S * 0.8))
+            m2 = _cv.morphologyEx(m2, _cv.MORPH_CLOSE, np.ones((k, k), np.uint8))
+            cnts, _ = _cv.findContours(m2, _cv.RETR_EXTERNAL, _cv.CHAIN_APPROX_SIMPLE)
+            if not cnts:
+                out.extend(members); continue
+            c = max(cnts, key=_cv.contourArea)
+            ap = _cv.approxPolyDP(c, 0.0035 * _cv.arcLength(c, True), True).reshape(-1, 2)
+            if len(ap) < 3:
+                out.extend(members); continue
+            face = dict(members[0])
+            face["points"] = [[round(float(x) / S, 5), round(float(y) / SH, 5)] for x, y in ap]
+            face["area_sf"] = round(sum(p.get("area_sf", 0) for p in members), 1)
+            holes = []
+            for p in members:
+                holes += (p.get("holes") or [])
+            face["holes"] = holes[:24]
+            face["cx"] = round(sum(pt[0] for pt in face["points"]) / len(face["points"]), 5)
+            face["cy"] = round(sum(pt[1] for pt in face["points"]) / len(face["points"]), 5)
+            if len(members) > 1:
+                face["sf_exact"] = True       # summed nets: protect from shoelace recompute
+                face["merged_pieces"] = len(members)
+            face["label"] = f"~{round(face['area_sf']):,} SF"
+            out.append(face)
+        except Exception:
+            out.extend(members)
+    out.sort(key=lambda p: -p.get("area_sf", 0))
+    return out
