@@ -142,11 +142,39 @@ def _poly_from_region(region, W, H):
     return [[round(float(x) / W, 5), round(float(y) / H, 5)] for x, y in ap]
 
 
+def _pip_norm(pt, poly):
+    """point-in-polygon on normalized [nx,ny] coords."""
+    x, y = pt
+    inside = False
+    n = len(poly)
+    for i in range(n):
+        x1, y1 = poly[i]
+        x2, y2 = poly[(i - 1) % n]
+        if (y1 > y) != (y2 > y) and x < (x2 - x1) * (y - y1) / (y2 - y1 + 1e-12) + x1:
+            inside = not inside
+    return inside
+
+
 def bucket(pdf_bytes, page_index, point):
-    """point = [nx, ny] normalized. Returns dict with status 'ok' (polygon+area_sf) or 'leak'.
-    Barriers come from the VECTOR linework (segments >= 8pt + rectangles) — NOT from dark pixels.
-    Text glyphs, arrowheads and dimension ticks are tiny strokes/curves, so notes and leaders
-    sitting on top of a wall no longer create fake pockets or block the fill (estimator-reported)."""
+    """Click a wall -> exact polygon + SF. point = [nx, ny] normalized (DISPLAY coords).
+
+    PRIMARY: return the VECTOR-ENGINE region under the click — the same reader that produces the
+    auto-detect regions (reads the panel/seam pattern, spans the whole wall, nets openings, snaps
+    borders). This fixes the flood-fill failures on patterned walls: diagonal hatch and dimension
+    lines no longer chop the fill into a jagged strip, and windows are already netted out.
+    FALLBACK: the classic flood-fill for pages/spots the vector engine didn't cover."""
+    try:
+        import vector_hatch
+        vpolys, VW, VH, vinfo = vector_hatch.detect(pdf_bytes, page_index)
+        hits = [p for p in (vpolys or []) if len(p.get("points", [])) >= 3 and _pip_norm(point, p["points"])]
+        if hits:
+            best = max(hits, key=lambda p: p.get("area_sf", 0))   # if regions overlap, the largest wall wins
+            return {"status": "ok", "points": best["points"], "area_sf": best.get("area_sf", 0),
+                    "holes": [], "material": best.get("material", ""),
+                    "scale_confirmed": bool(vinfo.get("scale_confirmed")), "source": "bucket-vector",
+                    "width": VW, "height": VH}
+    except Exception:
+        pass
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     img, ftpx, sc, conf, z = _render(doc, page_index)
     H, W = img.shape[:2]
