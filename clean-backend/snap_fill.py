@@ -83,6 +83,54 @@ def _linework(img):
     return lines
 
 
+def _all_segs(pg, z, min_len=6):
+    """All visible line segments in raster coords (rotation-aware) — for pattern signatures."""
+    out = []
+    try:
+        for d in pg.get_drawings():
+            for it in d.get("items", []):
+                if it[0] == "l":
+                    p1, p2 = it[1], it[2]
+                    if ((p1.x - p2.x) ** 2 + (p1.y - p2.y) ** 2) ** 0.5 >= min_len:
+                        a = _rot_pt(pg, p1.x, p1.y, z); b = _rot_pt(pg, p2.x, p2.y, z)
+                        out.append((a[0], a[1], b[0], b[1]))
+    except Exception:
+        pass
+    return out[:20000]
+
+
+def _pattern_sig(segs, poly, W, H, ftpx):
+    """Signature of the pattern INSIDE a region: dominant line axis + median spacing in feet.
+    Same signature = same material pattern -> regions group across tools and pages."""
+    try:
+        pts = np.array([[int(x * W), int(y * H)] for x, y in poly], np.int32)
+        vs = []; hs = []
+        for (x1, y1, x2, y2) in segs:
+            mx, my = (x1 + x2) / 2, (y1 + y2) / 2
+            if cv2.pointPolygonTest(pts, (float(mx), float(my)), False) < 0:
+                continue
+            dx, dy = abs(x2 - x1), abs(y2 - y1)
+            L = (dx * dx + dy * dy) ** 0.5
+            if L < 8:
+                continue
+            if dx < 0.15 * L:
+                vs.append(round((x1 + x2) / 2))
+            elif dy < 0.15 * L:
+                hs.append(round((y1 + y2) / 2))
+        def spacing(cs):
+            cs = sorted(set(cs))
+            gaps = [b - a for a, b in zip(cs, cs[1:]) if b - a > 1]
+            return sorted(gaps)[len(gaps) // 2] if len(gaps) >= 3 else None
+        sv, sh = spacing(vs), spacing(hs)
+        if sv and (not sh or len(vs) >= len(hs)):
+            return f"v@{sv * ftpx:.1f}ft"
+        if sh:
+            return f"h@{sh * ftpx:.1f}ft"
+        return "plain"
+    except Exception:
+        return "plain"
+
+
 def _poly_from_region(region, W, H):
     cnts, _ = cv2.findContours(region, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not cnts:
@@ -103,6 +151,7 @@ def bucket(pdf_bytes, page_index, point):
     img, ftpx, sc, conf, z = _render(doc, page_index)
     H, W = img.shape[:2]
     struct, _ = _vector_struct(doc[page_index], z, H, W, min_len=4, width=3)
+    page_segs = _all_segs(doc[page_index], z)
     doc.close()
     if not struct.any():                                     # scanned/no-vector page → old pixel barriers
         struct = _linework(img)
@@ -124,9 +173,11 @@ def bucket(pdf_bytes, page_index, point):
     poly = _poly_from_region(region, W, H)
     if poly is None:
         return {"status": "empty"}
-    # interior HOLES (windows/doors the fill flowed around) — returned so the UI can show them: the SF
-    # is net of these, and an honest highlight must show what was excluded (never a silent deduction)
+    # interior HOLES: keep as deductions ONLY the window/door-shaped ones (clean rectangles of
+    # real size). Text callouts, leader arrows and dimension boxes sitting ON the wall are
+    # annotations, not holes — their area goes BACK into the wall SF (estimator's rule).
     holes = []
+    add_back_px = 0
     cnts, hier = cv2.findContours(region, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
     if hier is not None and len(cnts):
         hier = hier[0]
@@ -134,11 +185,22 @@ def bucket(pdf_bytes, page_index, point):
         if ext:
             big = max(ext, key=lambda i: cv2.contourArea(cnts[i]))
             for i in range(len(cnts)):
-                if hier[i][3] == big and cv2.contourArea(cnts[i]) > 0.002 * area:
+                if hier[i][3] != big:
+                    continue
+                a = cv2.contourArea(cnts[i])
+                if a <= 0.002 * area:
+                    add_back_px += a          # crumbs (letter counters, tick gaps) = wall
+                    continue
+                x, y, w2, h2 = cv2.boundingRect(cnts[i])
+                rectish = a / (w2 * h2 + 1e-6) > 0.6 and 0.15 < w2 / (h2 + 1e-6) < 8
+                if rectish and a * ftpx ** 2 >= 4:   # a real opening: window/door/louver
                     ap = cv2.approxPolyDP(cnts[i], 0.02 * cv2.arcLength(cnts[i], True), True).reshape(-1, 2)
                     if len(ap) >= 3:
-                        holes.append([[round(float(x) / W, 5), round(float(y) / H, 5)] for x, y in ap])
-    return {"status": "ok", "points": poly, "area_sf": round(area * ftpx ** 2, 1), "holes": holes[:40],
+                        holes.append([[round(float(px) / W, 5), round(float(py) / H, 5)] for px, py in ap])
+                else:                                 # text/arrow-shaped island: not a hole
+                    add_back_px += a
+    return {"status": "ok", "points": poly, "area_sf": round((area + add_back_px) * ftpx ** 2, 1),
+            "holes": holes[:40], "pattern_sig": _pattern_sig(page_segs, poly, W, H, ftpx),
             "scale_confirmed": conf, "source": "bucket"}
 
 
