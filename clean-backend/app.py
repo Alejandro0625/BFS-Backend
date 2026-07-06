@@ -905,5 +905,5 @@ def health():
         on_disk = 0
     return {"status": "ok", "engine": "digitize-markup", "deps": "pymupdf+onnx",
             "auto_engine": "model" if model_infer.available() else "texture",
-            "ocr": ocr_text.available(),
+            "ocr": ocr_text.available(), "ocr_err": ocr_text.last_error(),
             "jobs_in_mem": len(jobs), "jobs_on_disk": on_disk, "mem_cap": MAX_MEM_JOBS}
