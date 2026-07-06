@@ -6,3 +6,7 @@ numpy
 opencv-python-headless
 onnxruntime
 shapely
+pyclipper
+pillow
+pyyaml
+six
