@@ -169,62 +169,17 @@ def bucket(pdf_bytes, page_index, point):
         hits = [p for p in (vpolys or []) if len(p.get("points", [])) >= 3 and _pip_norm(point, p["points"])]
         if hits:
             best = max(hits, key=lambda p: p.get("area_sf", 0))   # if regions overlap, the largest wall wins
-            # THE FACE IS ONE PIECE (estimator's rule): the engine stores a wall as several
-            # drawn pieces — gather every SAME-PATTERN piece touching the clicked one (BFS over
-            # near-adjacent bboxes) and weld them into ONE shape. SF = sum of the pieces' own
-            # (already net-of-openings) SF — the weld never invents area.
+            # SELECT THE PATTERN, EVERYWHERE (the estimator's click-a-hatch vision): the click
+            # picks a pattern — return EVERY face on the page with that same pattern (all
+            # elevations), each as its own already-welded, net-of-openings shape. The clicked
+            # face is primary; the rest ride along as `siblings` so one click fills them all.
             group = best.get("group") or best.get("material")
             fam = [p for p in vpolys if (p.get("group") or p.get("material")) == group and len(p.get("points", [])) >= 3]
-            def bbox(p):
-                xs = [q[0] for q in p["points"]]; ys = [q[1] for q in p["points"]]
-                return (min(xs), min(ys), max(xs), max(ys))
-            GAP = 0.015    # pieces within ~1.5% of the sheet touch/butt-join = same face
-            members = [best]; rest = [p for p in fam if p is not best]
-            grew = True
-            while grew and rest:
-                grew = False
-                mb = [bbox(m) for m in members]
-                keep2 = []
-                for p in rest:
-                    b = bbox(p)
-                    near = any(not (b[2] < m[0] - GAP or b[0] > m[2] + GAP or b[3] < m[1] - GAP or b[1] > m[3] + GAP) for m in mb)
-                    if near:
-                        members.append(p); grew = True
-                    else:
-                        keep2.append(p)
-                rest = keep2
-            if len(members) == 1:
-                return {"status": "ok", "points": best["points"], "area_sf": best.get("area_sf", 0),
-                        "holes": best.get("holes", []), "material": best.get("material", ""),
-                        "scale_confirmed": bool(vinfo.get("scale_confirmed")), "source": "bucket-vector",
-                        "width": VW, "height": VH}
-            # weld: rasterize members, close the butt-joint gaps, take the outer contour
-            S = 1600
-            SH = max(200, int(S * VH / max(1.0, VW)))
-            m2 = np.zeros((SH, S), np.uint8)
-            for p in members:
-                cnt = np.array([[int(x * S), int(y * SH)] for x, y in p["points"]], np.int32)
-                cv2.fillPoly(m2, [cnt.reshape(-1, 1, 2)], 1)
-            k = max(3, int(GAP * S))
-            m2 = cv2.morphologyEx(m2, cv2.MORPH_CLOSE, np.ones((k, k), np.uint8))
-            cnts, _ = cv2.findContours(m2, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            if cnts:
-                c = max(cnts, key=cv2.contourArea)
-                ap = cv2.approxPolyDP(c, 0.004 * cv2.arcLength(c, True), True).reshape(-1, 2)
-                if len(ap) >= 3:
-                    pts = [[round(float(x) / S, 5), round(float(y) / SH, 5)] for x, y in ap]
-                    holes = []
-                    for p in members:
-                        holes += (p.get("holes") or [])
-                    return {"status": "ok", "points": pts,
-                            "area_sf": round(sum(p.get("area_sf", 0) for p in members), 1),
-                            "holes": holes[:40], "material": best.get("material", ""),
-                            "merged_pieces": len(members),
-                            "scale_confirmed": bool(vinfo.get("scale_confirmed")), "source": "bucket-vector",
-                            "width": VW, "height": VH}
-            # weld failed → clicked piece alone (never block the estimator)
+            sibs = [{"points": p["points"], "area_sf": p.get("area_sf", 0), "holes": p.get("holes", [])}
+                    for p in fam if p is not best][:30]
             return {"status": "ok", "points": best["points"], "area_sf": best.get("area_sf", 0),
                     "holes": best.get("holes", []), "material": best.get("material", ""),
+                    "siblings": sibs, "pattern_total_sf": round(best.get("area_sf", 0) + sum(s["area_sf"] for s in sibs), 1),
                     "scale_confirmed": bool(vinfo.get("scale_confirmed")), "source": "bucket-vector",
                     "width": VW, "height": VH}
     except Exception:
