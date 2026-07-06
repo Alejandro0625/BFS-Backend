@@ -18,6 +18,9 @@ _MAT_RE = re.compile(r"\b(panel|siding|lap|shake|shingle|brick|masonry|cmu|stucc
 # blocks that are definitely NOT material names
 _NOISE_RE = re.compile(r"\b(scale|elevation\s*$|sheet|drawn|date|revision|note[s]?:|typ\.?$|"
                        r"see\s+(detail|spec|struct)|contractor|install|provide|existing\s+to\s+remain)\b", re.I)
+# LINEAR items (priced per LF) — must never name a big AREA region
+_LINEARISH_RE = re.compile(r"\b(trim|railing|handrail|guardrail|watertable|decking|downspout|"
+                           r"gutter|drip|flashing|coping)\b", re.I)
 
 
 def _blocks(pg):
@@ -163,6 +166,10 @@ def name_regions(pdf_bytes, page_index, polys, pw, ph):
                 continue
             nm = _clean(b["text"])
             if not nm:
+                continue
+            # a trim/railing callout crossing a big wall region is pointing at the DETAIL,
+            # not the wall — naming 4,800 SF of panel "PVC TRIM" would corrupt the takeoff
+            if _LINEARISH_RE.search(nm) and (polys[target].get("area_sf") or 0) > 250:
                 continue
             polys[target]["material"] = nm
             polys[target]["category"] = nm
