@@ -19,6 +19,7 @@ import callouts  # reads the drawing's own text callouts + leader arrows -> name
 import ocr_text  # OCR fallback (onnxruntime RapidOCR) for FLATTENED sets — lazy, memory-safe
 import snap_fill  # coloring-book BUCKET fill + corner-snap → exact SF from vector geometry (assist layer)
 import material_groups  # within-job texture grouping → a selectable PREVIEW of material groups (assist layer)
+import auto_trim as auto_trim_mod  # derive corner/base/opening LF from face geometry (blueprint 1c) — suggestions only
 from fastapi import FastAPI, UploadFile, File, BackgroundTasks, HTTPException, Body
 from fastapi.responses import Response
 from fastapi.middleware.cors import CORSMiddleware
@@ -487,6 +488,17 @@ def process(jid, pdf_bytes):
                 lin_by_mat[it["material"]] += it["lf"]
             linear_items = [{"material": m, "lf": round(v, 1)} for m, v in sorted(lin_by_mat.items(), key=lambda x: -x[1])]
             n_lin_sf = len(lin_sf_polys)
+            # AUTO-TRIM (blueprint 1c): derive corner/base-top/opening LF straight from the
+            # detected faces. SUGGESTIONS only — kept in a separate field so they never touch
+            # the estimator's confirmed linearItems or the money total. Needs a trusted scale.
+            auto_trim = []
+            if auto and scale_conf and scale_val:
+                try:
+                    auto_trim = auto_trim_mod.compute(polys, pw, ph, float(scale_val) / 72.0)
+                    if auto_trim:
+                        auto_flags.append("Suggested trim (auto) below — verify each line against your scope before pricing")
+                except Exception as _te:
+                    jlog(job, f"Page {pi+1}: auto-trim skipped ({_te})", "warn")
             job["takeoffData"].append({
                 "pageNumber": pi + 1, "title": f"Sheet page {pi+1}", "sheetRef": f"p{pi+1}",
                 "scale": (f"1\"={scale_val}'" if (auto and scale_conf) else "auto (calibrate)") if auto else "from markup",
@@ -495,6 +507,7 @@ def process(jid, pdf_bytes):
                 "building": "Building",
                 "zones": zones,
                 "linearItems": linear_items,
+                "autoTrim": auto_trim,
                 "flags": auto_flags + sf_warns,
                 "levels": page_levels,
                 "source": "texture-auto" if auto else "digitize",
