@@ -235,6 +235,99 @@ def read_schedule_pg(pg):
     return out if len(out) >= 2 else []
 
 
+# elevation LEVEL markers: "T.O. STEEL / FINISHED FLOOR / CEILING ... ELEV.: 139'-0""
+_LEVEL_LABEL = re.compile(r"\b(T\.?O\.?|B\.?O\.?|FIN(?:ISHED)?\s*FL(?:OO)?R|CEILING|ROOF|"
+                          r"SECOND\s*FL|FIRST\s*FL|THIRD\s*FL|EAVE|RIDGE|PARAPET|GRADE|STEEL|WALL|FTG)\b", re.I)
+_FEETIN = re.compile(r"(\d{1,3})'\s*-?\s*(\d{1,2})?(?:\s*(\d+)/(\d+))?\"?")
+
+
+def read_levels_pg(pg):
+    """Read elevation MARKERS off a text-bearing page: [(y_display, feet, label)].
+    A marker's y-position IS the height it names — two or more give the exact vertical
+    scale of the sheet by linear fit (how a human knows a wall is 39 ft without measuring)."""
+    out = []
+    try:
+        rot = pg.rotation_matrix
+        for b in pg.get_text("blocks"):
+            t = re.sub(r"\s+", " ", (b[4] or "")).strip()
+            if len(t) > 90 or not _LEVEL_LABEL.search(t):
+                continue
+            m = _FEETIN.search(t)
+            if not m:
+                continue
+            ft = int(m.group(1)) + (int(m.group(2)) if m.group(2) else 0) / 12.0
+            if not (0 <= ft <= 400):
+                continue
+            cy = (b[1] + b[3]) / 2
+            cx = (b[0] + b[2]) / 2
+            p = fitz.Point(cx, cy) * rot
+            out.append({"y": round(p.y, 1), "ft": round(ft, 2), "label": t[:40]})
+    except Exception:
+        pass
+    return out[:40]
+
+
+def vertical_scale_from_levels(levels):
+    """Markers → vertical scale, done the way sheets actually work: MULTIPLE elevations are
+    stacked on one sheet, each with its own marker column, so we CLUSTER by y-gap first and
+    fit per cluster. Within a cluster, pairwise-slope MEDIAN (robust: one OCR-mangled value
+    can't poison the fit), then consensus filter. Returns (ft_per_point, quality, n_markers)
+    or None. Elevation decreases as drawing-y increases; slope must be negative."""
+    import statistics
+    pts = sorted(set((l["y"], l["ft"]) for l in levels))
+    if len(pts) < 2:
+        return None
+    # cluster by vertical gaps (stacked elevations are far apart)
+    clusters = [[pts[0]]]
+    for p in pts[1:]:
+        if p[0] - clusters[-1][-1][0] > 250:
+            clusters.append([p])
+        else:
+            clusters[-1].append(p)
+    slopes = []
+    used = 0
+    for cl in clusters:
+        cl = [p for p in cl]
+        if len({p[1] for p in cl}) < 2:
+            continue
+        # pairwise slopes (ft per drawing-point), keep negatives only
+        pw = []
+        for i in range(len(cl)):
+            for j in range(i + 1, len(cl)):
+                dy = cl[j][0] - cl[i][0]
+                df = cl[j][1] - cl[i][1]
+                if abs(dy) < 8:
+                    continue
+                s = df / dy
+                if s < 0:
+                    pw.append(s)
+        if len(pw) < 2:
+            continue
+        # LARGEST AGREEING GROUP of pairwise slopes (within 6%) — a single agreeing pair is
+        # not evidence; OCR-mangled values can't form a group, real markers always do
+        pw.sort()
+        best_grp = []
+        for i in range(len(pw)):
+            grp = [s for s in pw if abs(s - pw[i]) <= 0.06 * abs(pw[i])]
+            if len(grp) > len(best_grp):
+                best_grp = grp
+        if len(best_grp) < 2:
+            continue
+        slopes.append(statistics.median(best_grp))
+        used += len(cl)
+    if not slopes:
+        return None
+    a = statistics.median(slopes)
+    ftpi = abs(a) * 72.0
+    if not (0.5 <= ftpi <= 40):          # real elevation scales live here; anything else = bad read
+        return None
+    spread = max(slopes) - min(slopes) if len(slopes) > 1 else 0.0
+    quality = 1.0 - min(1.0, spread / abs(a)) if a else 0.0
+    if len(slopes) > 1 and quality < 0.94:
+        return None                      # clusters disagree — don't trust the read
+    return (abs(a), round(quality, 4), used)
+
+
 def read_schedule(pdf_bytes, page_index):
     """Convenience wrapper: read the schedule from one page of a PDF byte-stream."""
     try:
