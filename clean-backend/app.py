@@ -449,6 +449,7 @@ def process(jid, pdf_bytes):
                 })
                 legend[mat] = {"id": mat, "name": mat, "category": cat}
             auto_flags = []
+            page_levels = []
             if auto:
                 auto_flags.append("Read from the drawing's pattern vectors — confirm which walls are in your scope"
                                   if auto_engine == "vector" else "AI suggestion — verify SF before bidding")
@@ -457,6 +458,29 @@ def process(jid, pdf_bytes):
                     auto_flags.append("Scale could not be read on this sheet — calibrate before trusting SF (SF may be off several ×)")
                 else:
                     auto_flags.append(f"Scale read as 1\"={scale_val}' — verify")
+                # ELEVATION MARKERS (blueprint 1a): "T.O. STEEL 139'-0\"" texts give exact heights.
+                # When ≥2 markers agree they yield the sheet's TRUE vertical scale — the strongest
+                # possible check. Conservative: only speaks when the fit has real consensus.
+                try:
+                    lv = callouts.read_levels_pg(pg)
+                    if len(lv) < 2 and len((pg.get_text() or "")) < 250 and ocr_text.available():
+                        lv = ocr_text.read_levels(pdf_bytes, pi)
+                    if lv:
+                        page_levels = [{"ft": l["ft"], "label": l["label"]} for l in lv[:8]]
+                        fit = callouts.vertical_scale_from_levels(lv)
+                        if fit:
+                            m_ftpi = fit[0] * 72.0
+                            used_ftpi = float(scale_val) if (scale_conf and scale_val) else 8.0
+                            agree = min(m_ftpi, used_ftpi) / max(m_ftpi, used_ftpi)
+                            if agree >= 0.93:
+                                auto_flags.append(f"✓ Elevation markers confirm the scale ({m_ftpi:.1f} ft/in from {fit[2]} markers)")
+                                jlog(job, f"Page {pi+1}: elevation markers CONFIRM scale ({m_ftpi:.1f} ft/in)", "ok")
+                            else:
+                                scale_conf = False   # trips the existing calibrate-before-trusting safety
+                                auto_flags.append(f"⚠ Elevation markers imply {m_ftpi:.1f} ft/in but {used_ftpi:.1f} was used — calibrate before trusting SF")
+                                jlog(job, f"Page {pi+1}: markers imply {m_ftpi:.1f} ft/in vs {used_ftpi:.1f} used — flagged", "warn")
+                except Exception:
+                    pass
             # aggregate the estimator's LINEAR (LF) measurements — trim/soffit/fascia (priced per LF)
             lin_by_mat = defaultdict(float)
             for it in lin_lf_items:
@@ -472,6 +496,7 @@ def process(jid, pdf_bytes):
                 "zones": zones,
                 "linearItems": linear_items,
                 "flags": auto_flags + sf_warns,
+                "levels": page_levels,
                 "source": "texture-auto" if auto else "digitize",
             })
             extra = (f" + {n_lin_sf} linear run(s)" if n_lin_sf else "") + (f", {len(linear_items)} trim/LF item(s)" if linear_items else "")
