@@ -214,20 +214,29 @@ def _content_differs(vs_hair, hs_hair, axis, c, b0, b1, lo, hi):
                 if lo <= x <= hi:
                     vlen += max(0.0, min(y1, w1) - max(y0, w0))
         return vlen, hlen
-    va, ha = prof(c - WIN, c - 3)
-    vb, hb = prof(c + 3, c + WIN)
-    ta, tb = va + ha, vb + hb
     def dom(v, h):
         if v > 1.6 * h and v > 15:
             return "v"
         if h > 1.6 * v and h > 15:
             return "h"
         return "m" if (v + h) > 15 else "0"
-    if dom(va, ha) != dom(vb, hb):
-        return True                       # orientation flips (or pattern → blank)
-    if max(ta, tb) > 40 and (min(ta, tb) + 1) / (max(ta, tb) + 1) < 0.4:
-        return True                       # same orientation but density regime changes
-    return False
+    def differs(w0a, w1a, w0b, w1b):
+        va, ha = prof(w0a, w1a)
+        vb, hb = prof(w0b, w1b)
+        ta, tb = va + ha, vb + hb
+        if dom(va, ha) != dom(vb, hb):
+            return True                   # orientation flips (or pattern → blank)
+        if max(ta, tb) > 40 and (min(ta, tb) + 1) / (max(ta, tb) + 1) < 0.4:
+            return True                   # same orientation but density regime changes
+        return False
+    if not differs(c - WIN, c - 3, c + 3, c + WIN):
+        return False
+    # ZOOM OUT (how a human decides): a louver/trim strip flips the pattern locally but
+    # 6 ft past it the wall reads the SAME on both sides — feature IN the wall, not a
+    # boundary. A real material change differs in the far field too.
+    if b1 - b0 > 170 and c - 82 > b0 and c + 82 < b1:
+        return differs(c - 82, c - 42, c + 42, c + 82)
+    return True
 
 
 def _joint_positions(lines, lo_clip, hi_clip, need):
@@ -249,6 +258,11 @@ def _joint_positions(lines, lo_clip, hi_clip, need):
             j += 1
         items = ent[i:j]
         i = j
+        # DASHED lines are hidden/reference geometry, never wall boundaries. A real
+        # joint has at least one LONG stroke (ground lines mix long runs with short
+        # ticks — median fails them; pure dashes have no stroke ≥25pt).
+        if max(h - l for _, l, h, _, _ in items) < 25:
+            continue
         ivs = sorted((l, h) for _, l, h, _, _ in items)
         cov = 0.0
         cs, ce = ivs[0]
@@ -262,14 +276,17 @@ def _joint_positions(lines, lo_clip, hi_clip, need):
         if cov >= need:
             out.append((sum(c for c, _, _, _, _ in items) / len(items),
                         max(f for _, _, _, f, _ in items),
-                        max(w for _, _, _, _, w in items)))
+                        max(w for _, _, _, _, w in items),
+                        cov))
     return sorted(out)
 
 
-def split_face_at_joints(pg, pts_norm, holes_norm, area_sf, W, H, click_norm):
+def split_face_at_joints(pg, pts_norm, holes_norm, area_sf, W, H, click_norm, ft_pt=None,
+                         filter_empty=False):
     """Split a welded face at heavy full-span structural lines. Returns
-    (primary, others) piece dicts {points, area_sf, holes} with SF divided by area
-    ratio (sum EXACTLY preserved — the split never invents or loses a foot), or None
+    (primary, others) piece dicts {points, area_sf, holes}. SF per piece: GEOMETRIC
+    net of its holes when the sheet scale is confirmed (ft_pt given) — the way the
+    estimator measures a wall; parent-area-ratio fallback otherwise. Returns None
     when no joint crosses the face."""
     try:
         from shapely.geometry import Polygon, Point as SPt, LineString, box
@@ -278,6 +295,17 @@ def split_face_at_joints(pg, pts_norm, holes_norm, area_sf, W, H, click_norm):
         if poly.is_empty or poly.area <= 0:
             return None
         vs, hs, vs_hair, hs_hair = _heavy_lines(pg)
+
+        # fenestration edges: window heads/sills/jambs are HOLE boundaries, not wall
+        # boundaries — a joint candidate hugging one is the window row, skip it
+        hole_xs, hole_ys = [], []
+        for hole in (holes_norm or []):
+            hxs = [q[0] * W for q in hole]; hys = [q[1] * H for q in hole]
+            hole_xs += [min(hxs), max(hxs)]
+            hole_ys += [min(hys), max(hys)]
+
+        def _on_hole_edge(vals, c):
+            return any(abs(c - v) <= 8 for v in vals)
 
         def _height_at(p_, x):
             try:
@@ -315,21 +343,32 @@ def split_face_at_joints(pg, pts_norm, holes_norm, area_sf, W, H, click_norm):
             return big
 
         def _split_piece(p_, depth):
-            if depth >= 3:
+            if depth >= 6:      # stacked bands need 4-5 levels; evidence gates stop runaway
                 return [p_]
             x0, y0, x1, y1 = p_.bounds
             if (x1 - x0) < 12 or (y1 - y0) < 12:
                 return [p_]
-            pvx = [(x, sp, w) for x, sp, w in _joint_positions(vs, y0, y1, _JOINT_COVER * (y1 - y0))
+            # pre-filter at HALF the bar against the bbox (weld spurs inflate it), then
+            # verify coverage against the face's TRUE extent at that exact position —
+            # a joint spanning the building must not fail because a leader spur
+            # stretched the bbox.
+            pvx = [(x, sp, w, cov) for x, sp, w, cov in
+                   _joint_positions(vs, y0, y1, 0.5 * _JOINT_COVER * (y1 - y0))
                    if x0 + 4 < x < x1 - 4]
-            phy = [(y, sp, w) for y, sp, w in _joint_positions(hs, x0, x1, _JOINT_COVER * (x1 - x0))
+            phy = [(y, sp, w, cov) for y, sp, w, cov in
+                   _joint_positions(hs, x0, x1, 0.5 * _JOINT_COVER * (x1 - x0))
                    if y0 + 4 < y < y1 - 4]
-            for x, _sp, w in pvx[:8]:
+            for x, _sp, w, cov in pvx[:10]:
+                ext = _height_at(p_, x)
+                if ext < 18 or cov < _JOINT_COVER * ext:
+                    continue
                 # WHAT A HUMAN CHECKS at a heavy vertical line: outline-class ink (the
                 # weight buildings are drawn with, ≥1.5pt) IS a boundary; girt-class ink
                 # (1.0-1.5) needs evidence — the outline steps there, or the drawn content
                 # changes. A downspout: girt-class, same pattern both sides → never splits.
                 outline_class = w >= 1.5
+                if not outline_class and _on_hole_edge(hole_xs, x):
+                    continue          # window jamb line, not a wall boundary
                 step = abs(_height_at(p_, x - 8) - _height_at(p_, x + 8)) > 0.12 * (y1 - y0)
                 if not outline_class and not step and not _content_differs(vs_hair, hs_hair, "v", x, x0, x1, y0, y1):
                     continue
@@ -339,12 +378,17 @@ def split_face_at_joints(pg, pts_norm, holes_norm, area_sf, W, H, click_norm):
                     for q in parts:
                         out_.extend(_split_piece(q, depth + 1))
                     return out_
-            for y, sp, w in phy[:8]:
+            for y, sp, w, cov in phy[:10]:
+                ext = _width_at(p_, y)
+                if ext < 18 or cov < _JOINT_COVER * ext:
+                    continue
                 # buildings STACK: outline-class ink, or a line running far beyond this
                 # piece (roof/story line), splits even when the pattern continues
                 # (parapet screen over wall). Girt-class needs step/content evidence.
                 outline_class = w >= 1.5
                 building_scale = sp >= 2.2 * (x1 - x0)
+                if not outline_class and not building_scale and _on_hole_edge(hole_ys, y):
+                    continue          # window head/sill row, not a wall boundary
                 step = abs(_width_at(p_, y - 8) - _width_at(p_, y + 8)) > 0.12 * (x1 - x0)
                 if not outline_class and not building_scale and not step and \
                    not _content_differs(vs_hair, hs_hair, "h", y, y0, y1, x0, x1):
@@ -360,27 +404,72 @@ def split_face_at_joints(pg, pts_norm, holes_norm, area_sf, W, H, click_norm):
         pieces = _split_piece(poly, 0)
         pieces = [p_ for p_ in pieces if p_.geom_type == "Polygon" and
                   p_.area >= _JOINT_MIN_PIECE_FRAC * poly.area]
+        if filter_empty and len(pieces) >= 2:
+            # weld spurs drag TRAIN faces past the building (above the roof, below grade
+            # into the dimension zone). Those phantom pieces carry no drawn pattern —
+            # a real clad wall is covered in seam/course hairlines. Drop the blanks so
+            # they never become phantom SF. (Plain gray-FILL walls are legitimately
+            # blank — this filter only runs for pattern-train faces.)
+            def _pattern_len(p_):
+                x0, y0, x1, y1 = p_.bounds
+                tot = 0.0
+                for (x, l, h) in vs_hair:
+                    if x0 <= x <= x1:
+                        seg = min(h, y1) - max(l, y0)
+                        if seg > 0 and p_.contains(SPt(x, (max(l, y0) + min(h, y1)) / 2)):
+                            tot += seg
+                for (y, l, h) in hs_hair:
+                    if y0 <= y <= y1:
+                        seg = min(h, x1) - max(l, x0)
+                        if seg > 0 and p_.contains(SPt((max(l, x0) + min(h, x1)) / 2, y)):
+                            tot += seg
+                return tot
+            kept = [p_ for p_ in pieces if _pattern_len(p_) >= 0.004 * p_.area]
+            if kept:
+                pieces = kept
         if len(pieces) < 2:
             return None
         total = sum(p_.area for p_ in pieces)
         click_pt = SPt(click_norm[0] * W, click_norm[1] * H)
         out = []
         for p_ in pieces:
+            # shave spur fingers (leader-line tails thinner than ~2ft) before measuring —
+            # they're weld artifacts, not wall; mitre buffer keeps corners square
+            try:
+                q2 = p_.buffer(-9, join_style=2).buffer(9, join_style=2)
+                if q2.geom_type == "MultiPolygon":
+                    q2 = max(q2.geoms, key=lambda g: g.area)
+                if q2.geom_type == "Polygon" and not q2.is_empty and q2.area >= 0.5 * p_.area:
+                    p_ = q2
+            except Exception:
+                pass
             ring = list(p_.exterior.coords)[:-1]
             pts = [[round(px / W, 5), round(py / H, 5)] for px, py in ring]
             hl = []
+            hole_pt2 = 0.0
             for hole in (holes_norm or []):
                 hx = sum(q[0] for q in hole) / len(hole) * W
                 hyc = sum(q[1] for q in hole) / len(hole) * H
                 if p_.contains(SPt(hx, hyc)):
                     hl.append(hole)
-            out.append({"points": pts, "area_sf": round(area_sf * p_.area / total, 1),
+                    try:
+                        hole_pt2 += abs(Polygon([(q[0] * W, q[1] * H) for q in hole]).area)
+                    except Exception:
+                        pass
+            if ft_pt and ft_pt > 0:
+                # GEOMETRIC net — how the estimator measures: this wall's own area minus
+                # its own windows. Immune to the parent's overlap-shave/spur artifacts.
+                sf = max(0.0, (p_.area - hole_pt2)) * ft_pt * ft_pt
+            else:
+                sf = area_sf * p_.area / total
+            out.append({"points": pts, "area_sf": round(sf, 1),
                         "holes": hl, "contains_click": p_.contains(click_pt) or p_.distance(click_pt) < 2})
-        # exact-sum correction: rounding drift goes to the largest piece
-        drift = round(area_sf - sum(o["area_sf"] for o in out), 1)
-        if abs(drift) >= 0.1:
-            max(out, key=lambda o: o["area_sf"])["area_sf"] = round(
-                max(out, key=lambda o: o["area_sf"])["area_sf"] + drift, 1)
+        if not (ft_pt and ft_pt > 0):
+            # ratio mode: rounding drift goes to the largest piece (sum EXACTLY preserved)
+            drift = round(area_sf - sum(o["area_sf"] for o in out), 1)
+            if abs(drift) >= 0.1:
+                max(out, key=lambda o: o["area_sf"])["area_sf"] = round(
+                    max(out, key=lambda o: o["area_sf"])["area_sf"] + drift, 1)
         prim = next((o for o in out if o.pop("contains_click", False)), None)
         others = [o for o in out if o is not prim]
         for o in others:
@@ -424,8 +513,10 @@ def bucket(pdf_bytes, page_index, point):
             # the pattern total is IDENTICAL, but each wall now carries its own SF.
             try:
                 sdoc = fitz.open(stream=pdf_bytes, filetype="pdf")
+                ftp = (float(vinfo.get("ft_per_in") or 0) / 72.0) if vinfo.get("scale_confirmed") else None
+                is_train = not (best.get("group") or best.get("material") or "").startswith("Panel wall")
                 sp = split_face_at_joints(sdoc[page_index], prim_pts, prim_holes, prim_sf,
-                                          VW, VH, point)
+                                          VW, VH, point, ft_pt=ftp, filter_empty=is_train)
                 sdoc.close()
                 if sp:
                     prim, rest = sp
