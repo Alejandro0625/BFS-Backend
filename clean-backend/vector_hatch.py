@@ -594,6 +594,43 @@ def detect(pdf_bytes, page_index, zoom=None):
                 break
     polys = (big + kept_small)[:MAX_REGIONS]
     polys = weld_faces(polys)   # FIRST IMPRESSION = clean faces: same-pattern pieces welded into one
+    # FIRST PAINT = HIS TAKEOFF: split each welded face at structural joints (the same
+    # senior-estimator reader the bucket uses) so the auto preview shows one shape PER
+    # WALL, not one blob per band. MONEY-SAFE: ratio mode — each face's pieces carry
+    # exactly the face's SF (sum preserved to the tenth), so page totals cannot move.
+    try:
+        import snap_fill as _sf
+        doc2 = fitz.open(stream=pdf_bytes, filetype="pdf")
+        pg2 = doc2[page_index]
+        out_split = []
+        for p in polys:
+            if len(out_split) >= MAX_REGIONS - 4:
+                out_split.append(p)      # region budget guard: keep remaining faces whole
+                continue
+            is_train = not ((p.get("group") or p.get("material") or "").startswith("Panel wall"))
+            sp = None
+            try:
+                sp = _sf.split_face_at_joints(pg2, p["points"], p.get("holes") or [],
+                                              p.get("area_sf", 0), W, H, None,
+                                              ft_pt=None, filter_empty=is_train)
+            except Exception:
+                sp = None
+            if not sp or not sp[1] or len(sp[1]) < 2:
+                out_split.append(p)
+                continue
+            for piece in sp[1]:
+                q = dict(p)
+                q["points"] = piece["points"]
+                q["area_sf"] = piece["area_sf"]
+                q["holes"] = piece["holes"]
+                q["label"] = f"~{round(piece['area_sf']):,} SF"
+                xs = [x for x, _ in piece["points"]]; ys = [y for _, y in piece["points"]]
+                q["cx"] = round(sum(xs) / len(xs), 5); q["cy"] = round(sum(ys) / len(ys), 5)
+                out_split.append(q)
+        doc2.close()
+        polys = out_split[:MAX_REGIONS]
+    except Exception:
+        pass
     for i, p in enumerate(polys):
         p["id"] = i
     return polys, W, H, {"ft_per_in": round(sc, 3), "scale_confirmed": conf}
