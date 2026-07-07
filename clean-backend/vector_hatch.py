@@ -18,6 +18,9 @@ import texture  # reuse the robust scale reader
 
 MIN_SF = 100          # REVERTED: 30 let junk specks become stepping stones that chained welds
 MAX_REGIONS = 40      # across the sheet into one sprawling blob (user-caught regression)
+SMALL_MIN_SF = 30     # small faces (30-100 SF) survive ONLY via the discriminator below:
+SMALL_ADOPT_GAP = 0.06  # same pattern as a BIG face AND bbox within 6% of the sheet of that
+                        # big face DIRECTLY (never small-to-small — no stepping-stone chains)
 
 
 def _pct(v, p):
@@ -493,7 +496,7 @@ def detect(pdf_bytes, page_index, zoom=None):
         except Exception:
             pass
         sf = area_pt2 * ft_pt * ft_pt
-        if sf < MIN_SF:
+        if sf < SMALL_MIN_SF:
             return
         norm = [[round(x / W, 5), round(y / H, 5)] for (x, y) in disp_pts]
         cx = round(sum(p[0] for p in norm) / len(norm), 5)
@@ -552,7 +555,7 @@ def detect(pdf_bytes, page_index, zoom=None):
         pass
 
     polys.sort(key=lambda p: -p["area_sf"])
-    polys = [p for p in polys if p["area_sf"] >= MIN_SF][:MAX_REGIONS]
+    polys = [p for p in polys if p["area_sf"] >= SMALL_MIN_SF]
     # pattern fingerprint per piece — the weld may only join pieces whose PATTERNS match
     # (the estimator's rule: fill the material, and materials change where patterns change)
     for p in polys:
@@ -561,6 +564,35 @@ def detect(pdf_bytes, page_index, zoom=None):
             p["psig"] = piece_signature(geo.get("segs") or [], disp_pts, W, H)
         except Exception:
             p["psig"] = "plain"
+    # SMALL-FACE DISCRIMINATOR (the safe version of "lower MIN_SF" — that regressed once):
+    # a face under 100 SF is kept ONLY when its pattern matches a BIG face's group AND its
+    # bbox sits within SMALL_ADOPT_GAP of that big face DIRECTLY. Junk specks have no big
+    # same-pattern neighbor; real small wall pieces (a return, a knee wall) always do.
+    def _bbox(p):
+        xs = [x for x, _ in p["points"]]; ys = [y for _, y in p["points"]]
+        return (min(xs), min(ys), max(xs), max(ys))
+    big = [p for p in polys if p["area_sf"] >= MIN_SF]
+    kept_small = []
+    for p in polys:
+        if p["area_sf"] >= MIN_SF:
+            continue
+        grp = (p.get("group") or p.get("material") or "")
+        # the group name of a TRAIN region encodes its measured pattern ("Vertical panel -
+        # 2.0' seams") — that IS the fingerprint. The generic gray-fill group is where the
+        # sprawl junk lived (title-block boxes, specks) — those stay dropped.
+        if grp.startswith("Panel wall"):
+            continue
+        b0 = _bbox(p)
+        for q in big:
+            if (q.get("group") or q.get("material")) != grp:
+                continue
+            b1 = _bbox(q)
+            gx = max(0.0, max(b0[0], b1[0]) - min(b0[2], b1[2]))
+            gy = max(0.0, max(b0[1], b1[1]) - min(b0[3], b1[3]))
+            if gx <= SMALL_ADOPT_GAP and gy <= SMALL_ADOPT_GAP:
+                kept_small.append(p)
+                break
+    polys = (big + kept_small)[:MAX_REGIONS]
     polys = weld_faces(polys)   # FIRST IMPRESSION = clean faces: same-pattern pieces welded into one
     for i, p in enumerate(polys):
         p["id"] = i
