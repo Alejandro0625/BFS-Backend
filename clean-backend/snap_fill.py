@@ -169,15 +169,35 @@ _JOINT_MIN_PIECE_FRAC = 0.02  # drop split slivers under 2% of the face
 
 def _heavy_lines(pg):
     """H/V strokes in display coords, split HEAVY (structure) vs HAIRLINE (pattern).
-    Returns (vs_heavy, hs_heavy, vs_hair, hs_hair) as [(const, lo, hi)]."""
+    Ink classes are RELATIVE to this sheet (a human reads 'the heaviest ink here', not
+    absolute points): outline-class = ≥85% of the sheet's max stroke, heavy = ≥45%.
+    Fleet: max 1.56 → heavy ≥0.70 (1.32+1.56), outline ≥1.33 (1.56 only) — identical to
+    the absolute rules it was tuned on; sheets drawn lighter now classify the same way.
+    Returns (vs_heavy, hs_heavy, vs_hair, hs_hair, outline_th)."""
     rot = pg.rotation_matrix
+    drawings = pg.get_drawings()
+    wmax = 0.0
+    for d in drawings:
+        wd = d.get("width") or 0
+        col = d.get("color")
+        if col is not None and len(col) >= 3 and (col[0] + col[1] + col[2]) / 3 >= 0.66:
+            continue
+        if wd > wmax:
+            for it in d.get("items") or []:
+                if it[0] == "l":
+                    p0, p1 = fitz.Point(it[1]), fitz.Point(it[2])
+                    if abs(p1.x - p0.x) + abs(p1.y - p0.y) >= 8:
+                        wmax = wd
+                        break
+    heavy_th = max(0.45 * wmax, 0.4)      # sheets of all-hairline ink yield no joints
+    outline_th = max(0.85 * wmax, 0.5)
     vs, hs, vh, hh = [], [], [], []
-    for d in pg.get_drawings():
+    for d in drawings:
         wd = d.get("width") or 0
         col = d.get("color")
         if col is not None and len(col) >= 3 and (col[0] + col[1] + col[2]) / 3 >= 0.66:
             continue                      # light strokes are shading, not structure/pattern
-        heavy = wd >= _JOINT_MIN_WD
+        heavy = wd >= heavy_th
         for it in d.get("items") or []:
             if it[0] != "l":
                 continue
@@ -188,7 +208,7 @@ def _heavy_lines(pg):
                 (vs if heavy else vh).append(((p0.x + p1.x) / 2, min(p0.y, p1.y), max(p0.y, p1.y), wd))
             elif dx >= 8 and dy <= 1.5:
                 (hs if heavy else hh).append(((p0.y + p1.y) / 2, min(p0.x, p1.x), max(p0.x, p1.x), wd))
-    return vs, hs, [(c, a, b) for c, a, b, _ in vh], [(c, a, b) for c, a, b, _ in hh]
+    return vs, hs, [(c, a, b) for c, a, b, _ in vh], [(c, a, b) for c, a, b, _ in hh], outline_th
 
 
 def _content_differs(vs_hair, hs_hair, axis, c, b0, b1, lo, hi):
@@ -294,7 +314,7 @@ def split_face_at_joints(pg, pts_norm, holes_norm, area_sf, W, H, click_norm, ft
         poly = Polygon([(x * W, y * H) for x, y in pts_norm]).buffer(0)
         if poly.is_empty or poly.area <= 0:
             return None
-        vs, hs, vs_hair, hs_hair = _heavy_lines(pg)
+        vs, hs, vs_hair, hs_hair, outline_th = _heavy_lines(pg)
 
         # fenestration edges: window heads/sills/jambs are HOLE boundaries, not wall
         # boundaries — a joint candidate hugging one is the window row, skip it
@@ -366,7 +386,7 @@ def split_face_at_joints(pg, pts_norm, holes_norm, area_sf, W, H, click_norm, ft
                 # weight buildings are drawn with, ≥1.5pt) IS a boundary; girt-class ink
                 # (1.0-1.5) needs evidence — the outline steps there, or the drawn content
                 # changes. A downspout: girt-class, same pattern both sides → never splits.
-                outline_class = w >= 1.5
+                outline_class = w >= outline_th
                 if not outline_class and _on_hole_edge(hole_xs, x):
                     continue          # window jamb line, not a wall boundary
                 step = abs(_height_at(p_, x - 8) - _height_at(p_, x + 8)) > 0.12 * (y1 - y0)
@@ -385,7 +405,7 @@ def split_face_at_joints(pg, pts_norm, holes_norm, area_sf, W, H, click_norm, ft
                 # buildings STACK: outline-class ink, or a line running far beyond this
                 # piece (roof/story line), splits even when the pattern continues
                 # (parapet screen over wall). Girt-class needs step/content evidence.
-                outline_class = w >= 1.5
+                outline_class = w >= outline_th
                 building_scale = sp >= 2.2 * (x1 - x0)
                 if not outline_class and not building_scale and _on_hole_edge(hole_ys, y):
                     continue          # window head/sill row, not a wall boundary
