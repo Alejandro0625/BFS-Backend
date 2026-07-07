@@ -525,6 +525,103 @@ def detect(pdf_bytes, page_index, zoom=None):
         # strip-integral SF is net of openings — trust it, don't let calibrate re-add openings
         add(_train_polygon(t, snapx, snapy), _train_area_pt2(t), mat, col, True)
 
+    # DIAGONAL HATCH — DISABLED pending the angle-consistency gate. The multi-job gold
+    # benchmark exposed the blind spot (26-145's storefront band = 513 diagonal segs the
+    # v/h readers never see), but v1 also swallowed flattened TEXT (glyph curves are
+    # dense short diagonals) and moved the Fleet canary. Correct design, next session:
+    # region qualifies only if ≥70% of its diagonal ink shares ONE angle bucket
+    # (true hatch is parallel; text is angle-soup), plus spacing regularity.
+    try:
+        raise RuntimeError("diagonal reader disabled pending angle-consistency gate")
+        import numpy as np, cv2
+        doc_d = fitz.open(stream=pdf_bytes, filetype="pdf")
+        pg_d = doc_d[page_index]
+        rot_d = pg_d.rotation_matrix
+        diag = []                       # (x0,y0,x1,y1) display, 30-60 or 120-150 degrees
+        for d in pg_d.get_drawings():
+            for it in d.get("items") or []:
+                if it[0] != "l":
+                    continue
+                p0 = fitz.Point(it[1]) * rot_d
+                p1 = fitz.Point(it[2]) * rot_d
+                dx, dy = abs(p1.x - p0.x), abs(p1.y - p0.y)
+                L = (dx * dx + dy * dy) ** 0.5
+                # hatch strokes: short-to-medium; X-braces/leader arrows are LONG
+                if L < 6 or L > 0.22 * max(W, H):
+                    continue
+                if 0.45 <= (dy / (dx + 1e-9)) <= 2.2:
+                    diag.append((p0.x, p0.y, p1.x, p1.y))
+        doc_d.close()
+        if len(diag) >= 40:             # a hatched area is DENSE; scattered ticks are not
+            DW = 900
+            DH = max(1, int(DW * H / max(1, W)))
+            sx, sy = DW / W, DH / H
+            # NEVER re-count a wall another reader already measured: hatch regions may
+            # only claim VIRGIN territory (Fleet's brick is already train-measured — a
+            # hatch echo there would double the money).
+            taken = np.zeros((DH, DW), np.uint8)
+            for p0_ in polys:
+                try:
+                    cnt0 = np.array([[int(x * W * sx), int(y * H * sy)] for x, y in p0_["points"]], np.int32)
+                    cv2.fillPoly(taken, [cnt0], 1)
+                except Exception:
+                    pass
+            m = np.zeros((DH, DW), np.uint8)
+            for (x0d, y0d, x1d, y1d) in diag:
+                cv2.line(m, (int(x0d * sx), int(y0d * sy)), (int(x1d * sx), int(y1d * sy)), 1, 2)
+            # bridge the gaps BETWEEN hatch strokes, then drop thin strays
+            m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, np.ones((9, 9), np.uint8))
+            m = cv2.morphologyEx(m, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
+            cnts, hier = cv2.findContours(m, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
+            for ci, cnt in enumerate(cnts or []):
+                if hier is not None and hier[0][ci][3] != -1:
+                    continue            # holes handled via find_openings below
+                a_px = cv2.contourArea(cnt)
+                area_pt2 = a_px / (sx * sy)
+                sf = area_pt2 * ft_pt * ft_pt
+                if sf < MIN_SF:
+                    continue
+                bx, by, bw, bh = cv2.boundingRect(cnt)
+                if bw > 0.55 * DW and bh > 0.55 * DH:
+                    continue            # anti-sprawl: site-plan / whole-sheet junk
+                cm = np.zeros((DH, DW), np.uint8)
+                cv2.drawContours(cm, [cnt], -1, 1, -1)
+                inter = int((cm & taken).sum())
+                if inter > 0.2 * max(1, int(cm.sum())):
+                    continue            # already measured by the v/h/fill readers
+                eps = 0.008 * max(bw, bh)
+                ap = cv2.approxPolyDP(cnt, max(2.0, eps), True)
+                if len(ap) < 3:
+                    continue
+                disp_pts = [(float(p[0][0]) / sx, float(p[0][1]) / sy) for p in ap]
+                holes_norm = []
+                try:
+                    op_rects, op_pt2 = find_openings(geo, disp_pts, ft_pt)
+                    for (ox0, oy0, ox1, oy1) in op_rects:
+                        holes_norm.append([[round(ox0 / W, 5), round(oy0 / H, 5)],
+                                           [round(ox1 / W, 5), round(oy0 / H, 5)],
+                                           [round(ox1 / W, 5), round(oy1 / H, 5)],
+                                           [round(ox0 / W, 5), round(oy1 / H, 5)]])
+                    if op_pt2 > 0:
+                        area_pt2 = max(0.0, area_pt2 - op_pt2)
+                        sf = area_pt2 * ft_pt * ft_pt
+                except Exception:
+                    pass
+                if sf < MIN_SF:
+                    continue
+                norm = [[round(x / W, 5), round(y / H, 5)] for (x, y) in disp_pts]
+                cx = round(sum(p[0] for p in norm) / len(norm), 5)
+                cy = round(sum(p[1] for p in norm) / len(norm), 5)
+                polys.append({"points": norm, "area_sf": round(sf, 1), "cx": cx, "cy": cy,
+                              "fill_color": [0.85, 0.45, 0.25], "source": "vector",
+                              "material": "Hatched area (masonry/EIFS)",
+                              "category": "Hatched area (masonry/EIFS)",
+                              "group": "Hatched area (masonry/EIFS)", "sf_exact": True,
+                              "holes": holes_norm[:24],
+                              "label": f"~{round(sf):,} SF"})
+    except Exception:
+        pass
+
     # overlap dedup — regions must never double-count the same wall into the total.
     # Rasterize at low res; drop a region mostly covered by earlier (bigger/fill) ones,
     # and shave the SF of partial overlaps so the summed total stays honest.
