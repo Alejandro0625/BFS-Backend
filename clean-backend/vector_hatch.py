@@ -449,6 +449,7 @@ def detect(pdf_bytes, page_index, zoom=None):
     snapx = sorted(set(c for (c, _, _) in _vl))[:800]
     snapy = sorted(set(y for (_, _, y) in _hc))[:800]
     geo = page_geometry(pg)   # rectangles + segments for window/door detection (display coords)
+    rot_for_sig = pg.rotation_matrix
     doc.close()
 
     # fills win where they overlap a train (they are the exact drawn shape)
@@ -552,10 +553,57 @@ def detect(pdf_bytes, page_index, zoom=None):
 
     polys.sort(key=lambda p: -p["area_sf"])
     polys = [p for p in polys if p["area_sf"] >= MIN_SF][:MAX_REGIONS]
+    # pattern fingerprint per piece — the weld may only join pieces whose PATTERNS match
+    # (the estimator's rule: fill the material, and materials change where patterns change)
+    for p in polys:
+        try:
+            disp_pts = [(x * W, y * H) for x, y in p["points"]]
+            p["psig"] = piece_signature(geo.get("segs") or [], disp_pts, W, H)
+        except Exception:
+            p["psig"] = "plain"
     polys = weld_faces(polys)   # FIRST IMPRESSION = clean faces: same-pattern pieces welded into one
     for i, p in enumerate(polys):
         p["id"] = i
     return polys, W, H, {"ft_per_in": round(sc, 3), "scale_confirmed": conf}
+
+
+def piece_signature(segs_disp, pts_disp, W, H):
+    """Pattern fingerprint of ONE piece from the segments inside it: dominant axis @ median
+    spacing bucket. Two wall pieces are the SAME material only if their patterns match —
+    a terra-cotta lap band and a metal-panel band must never weld even when they touch."""
+    try:
+        from shapely.geometry import Polygon as _P, Point as _Pt
+        poly = _P(pts_disp).buffer(0)
+        if poly.is_empty:
+            return "plain"
+        minx, miny, maxx, maxy = poly.bounds
+        vs, hs = [], []
+        for (x1, y1, x2, y2) in segs_disp:
+            mx, my = (x1 + x2) / 2, (y1 + y2) / 2
+            if not (minx <= mx <= maxx and miny <= my <= maxy):
+                continue
+            dx, dy = abs(x2 - x1), abs(y2 - y1)
+            L = (dx * dx + dy * dy) ** 0.5
+            if L < 8:
+                continue
+            if not poly.contains(_Pt(mx, my)):
+                continue
+            if dx < 0.15 * L:
+                vs.append(round(mx))
+            elif dy < 0.15 * L:
+                hs.append(round(my))
+        def spacing(cs):
+            cs = sorted(set(cs))
+            gaps = [b - a for a, b in zip(cs, cs[1:]) if b - a > 1]
+            return sorted(gaps)[len(gaps) // 2] if len(gaps) >= 3 else None
+        sv, sh = spacing(vs), spacing(hs)
+        if sv and (not sh or len(vs) >= len(hs)):
+            return f"v{int(round(sv / 6))}"      # 6pt buckets: same product, tolerant of noise
+        if sh:
+            return f"h{int(round(sh / 6))}"
+        return "plain"
+    except Exception:
+        return "plain"
 
 
 def weld_faces(polys, gap=0.015, raster=1600):
@@ -578,7 +626,7 @@ def weld_faces(polys, gap=0.015, raster=1600):
     remaining = list(polys)
     while remaining:
         seed = remaining.pop(0)
-        grp = seed.get("group") or seed.get("material")
+        grp = ((seed.get("group") or seed.get("material")), seed.get("psig", "plain"))
         members = [seed]
         grew = True
         while grew:
@@ -587,7 +635,7 @@ def weld_faces(polys, gap=0.015, raster=1600):
             keep = []
             cb = (min(m[0] for m in mb), min(m[1] for m in mb), max(m[2] for m in mb), max(m[3] for m in mb))
             for p in remaining:
-                if (p.get("group") or p.get("material")) != grp:
+                if ((p.get("group") or p.get("material")), p.get("psig", "plain")) != grp:
                     keep.append(p); continue
                 b = bbox(p)
                 near = any(not (b[2] < m[0] - gap or b[0] > m[2] + gap or b[3] < m[1] - gap or b[1] > m[3] + gap) for m in mb)
