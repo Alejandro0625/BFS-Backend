@@ -525,34 +525,47 @@ def detect(pdf_bytes, page_index, zoom=None):
         # strip-integral SF is net of openings — trust it, don't let calibrate re-add openings
         add(_train_polygon(t, snapx, snapy), _train_area_pt2(t), mat, col, True)
 
-    # DIAGONAL HATCH — DISABLED pending the angle-consistency gate. The multi-job gold
-    # benchmark exposed the blind spot (26-145's storefront band = 513 diagonal segs the
-    # v/h readers never see), but v1 also swallowed flattened TEXT (glyph curves are
-    # dense short diagonals) and moved the Fleet canary. Correct design, next session:
-    # region qualifies only if ≥70% of its diagonal ink shares ONE angle bucket
-    # (true hatch is parallel; text is angle-soup), plus spacing regularity.
+    # DIAGONAL HATCH — the industry's most common material convention (masonry/EIFS/
+    # stone drawn as parallel 45-deg strokes). Benchmark-found blind spot (26-145's
+    # storefront band = 513 diagonal segs the v/h readers never see). THE GATE that
+    # makes it safe: true hatch is PARALLEL — one angle family; flattened text is
+    # angle-soup. A region only qualifies when >=70% of the diagonal ink inside it
+    # belongs to ONE angle bucket, so glyphs/arrowheads can never form a region.
     try:
-        raise RuntimeError("diagonal reader disabled pending angle-consistency gate")
+        import math as _m
+        import os as _os
+        if _os.environ.get("VH_NO_DIAG"):
+            raise RuntimeError("diagonal reader disabled by env")
         import numpy as np, cv2
         doc_d = fitz.open(stream=pdf_bytes, filetype="pdf")
         pg_d = doc_d[page_index]
         rot_d = pg_d.rotation_matrix
-        diag = []                       # (x0,y0,x1,y1) display, 30-60 or 120-150 degrees
+        diag = []                       # (x0,y0,x1,y1,angle_deg,len) display coords
         for d in pg_d.get_drawings():
             for it in d.get("items") or []:
                 if it[0] != "l":
                     continue
                 p0 = fitz.Point(it[1]) * rot_d
                 p1 = fitz.Point(it[2]) * rot_d
-                dx, dy = abs(p1.x - p0.x), abs(p1.y - p0.y)
+                dx, dy = p1.x - p0.x, p1.y - p0.y
                 L = (dx * dx + dy * dy) ** 0.5
                 # hatch strokes: short-to-medium; X-braces/leader arrows are LONG
-                if L < 6 or L > 0.22 * max(W, H):
+                if L < 7 or L > 0.22 * max(W, H):
                     continue
-                if 0.45 <= (dy / (dx + 1e-9)) <= 2.2:
-                    diag.append((p0.x, p0.y, p1.x, p1.y))
+                ang = _m.degrees(_m.atan2(dy, dx)) % 180.0
+                if 24.0 <= ang <= 66.0 or 114.0 <= ang <= 156.0:
+                    diag.append((p0.x, p0.y, p1.x, p1.y, ang, L))
         doc_d.close()
-        if len(diag) >= 40:             # a hatched area is DENSE; scattered ticks are not
+        # dominant angle FAMILIES (8-deg buckets); only their segs may form regions
+        fam_len = {}
+        for (_, _, _, _, ang, L) in diag:
+            k = int(ang // 8)
+            fam_len[k] = fam_len.get(k, 0.0) + L
+        strong = sorted([k for k, v in fam_len.items() if v > 400], key=lambda k: -fam_len[k])[:3]
+        diag_by_fam = {k: [(x0, y0, x1, y1, ang, L) for (x0, y0, x1, y1, ang, L) in diag
+                           if int(ang // 8) == k] for k in strong}
+        diag_all = diag
+        if strong and len(diag) >= 40:  # a hatched area is DENSE; scattered ticks are not
             DW = 900
             DH = max(1, int(DW * H / max(1, W)))
             sx, sy = DW / W, DH / H
@@ -566,14 +579,18 @@ def detect(pdf_bytes, page_index, zoom=None):
                     cv2.fillPoly(taken, [cnt0], 1)
                 except Exception:
                     pass
-            m = np.zeros((DH, DW), np.uint8)
-            for (x0d, y0d, x1d, y1d) in diag:
+            for fam_k in strong:
+              fam = diag_by_fam.get(fam_k) or []
+              if len(fam) < 25:
+                continue
+              m = np.zeros((DH, DW), np.uint8)
+              for (x0d, y0d, x1d, y1d, _a, _l) in fam:
                 cv2.line(m, (int(x0d * sx), int(y0d * sy)), (int(x1d * sx), int(y1d * sy)), 1, 2)
-            # bridge the gaps BETWEEN hatch strokes, then drop thin strays
-            m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, np.ones((9, 9), np.uint8))
-            m = cv2.morphologyEx(m, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
-            cnts, hier = cv2.findContours(m, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
-            for ci, cnt in enumerate(cnts or []):
+              # bridge the gaps BETWEEN hatch strokes, then drop thin strays
+              m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, np.ones((9, 9), np.uint8))
+              m = cv2.morphologyEx(m, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
+              cnts, hier = cv2.findContours(m, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
+              for ci, cnt in enumerate(cnts or []):
                 if hier is not None and hier[0][ci][3] != -1:
                     continue            # holes handled via find_openings below
                 a_px = cv2.contourArea(cnt)
@@ -589,6 +606,21 @@ def detect(pdf_bytes, page_index, zoom=None):
                 inter = int((cm & taken).sum())
                 if inter > 0.2 * max(1, int(cm.sum())):
                     continue            # already measured by the v/h/fill readers
+                # THE PURITY GATE: >=70% of the diagonal ink inside this region must be
+                # this one angle family. True hatch is parallel; text/arrow zones carry
+                # every angle and can never pass.
+                x0r, y0r = bx / sx, by / sy
+                x1r, y1r = (bx + bw) / sx, (by + bh) / sy
+                fam_ink = tot_ink = 0.0
+                for (xa, ya, xb, yb, ang2, L2) in diag_all:
+                    mx, my = (xa + xb) / 2, (ya + yb) / 2
+                    if x0r <= mx <= x1r and y0r <= my <= y1r and \
+                       cm[min(DH - 1, max(0, int(my * sy))), min(DW - 1, max(0, int(mx * sx)))]:
+                        tot_ink += L2
+                        if int(ang2 // 8) == fam_k:
+                            fam_ink += L2
+                if tot_ink < 300 or fam_ink < 0.7 * tot_ink:
+                    continue
                 eps = 0.008 * max(bw, bh)
                 ap = cv2.approxPolyDP(cnt, max(2.0, eps), True)
                 if len(ap) < 3:
