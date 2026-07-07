@@ -20,6 +20,7 @@ import ocr_text  # OCR fallback (onnxruntime RapidOCR) for FLATTENED sets — la
 import snap_fill  # coloring-book BUCKET fill + corner-snap → exact SF from vector geometry (assist layer)
 import material_groups  # within-job texture grouping → a selectable PREVIEW of material groups (assist layer)
 import auto_trim as auto_trim_mod  # derive corner/base/opening LF from face geometry (blueprint 1c) — suggestions only
+import dim_scale  # self-calibrate scale from the drawing's own dimension strings (blueprint 1b) — cross-check only
 from fastapi import FastAPI, UploadFile, File, BackgroundTasks, HTTPException, Body
 from fastapi.responses import Response
 from fastapi.middleware.cors import CORSMiddleware
@@ -480,6 +481,24 @@ def process(jid, pdf_bytes):
                                 scale_conf = False   # trips the existing calibrate-before-trusting safety
                                 auto_flags.append(f"⚠ Elevation markers imply {m_ftpi:.1f} ft/in but {used_ftpi:.1f} was used — calibrate before trusting SF")
                                 jlog(job, f"Page {pi+1}: markers imply {m_ftpi:.1f} ft/in vs {used_ftpi:.1f} used — flagged", "warn")
+                except Exception:
+                    pass
+                # DIMENSION-STRING SELF-CALIBRATION (blueprint 1b): the drawing's own "24'-0\""
+                # strings paired with their measured dim lines = the sheet's true scale.
+                # Cross-check only (same safety pattern as markers): confirm, or force calibrate.
+                try:
+                    ds = dim_scale.sheet_scale(pg)
+                    if ds:
+                        d_ftpi = ds[0] * 72.0
+                        used_ftpi = float(scale_val) if (scale_conf and scale_val) else 8.0
+                        agree = min(d_ftpi, used_ftpi) / max(d_ftpi, used_ftpi)
+                        if agree >= 0.95:
+                            auto_flags.append(f"✓ {ds[1]} dimension strings confirm the scale ({d_ftpi:.2f} ft/in)")
+                            jlog(job, f"Page {pi+1}: {ds[1]} dimension strings CONFIRM scale ({d_ftpi:.2f} ft/in)", "ok")
+                        else:
+                            scale_conf = False   # trips the existing calibrate-before-trusting safety
+                            auto_flags.append(f"⚠ {ds[1]} dimension strings imply {d_ftpi:.2f} ft/in but {used_ftpi:.1f} was used — calibrate before trusting SF")
+                            jlog(job, f"Page {pi+1}: dims imply {d_ftpi:.2f} ft/in vs {used_ftpi:.1f} used — flagged", "warn")
                 except Exception:
                     pass
             # aggregate the estimator's LINEAR (LF) measurements — trim/soffit/fascia (priced per LF)
