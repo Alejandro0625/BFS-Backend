@@ -702,6 +702,82 @@ def snap_fill_route(payload: dict = Body(...)):
     r["width"] = dims["width"]; r["height"] = dims["height"]
     return r
 
+@app.post("/split-shape")
+def split_shape(payload: dict = Body(...)):
+    """ESTIMATOR'S KNIFE: split a face along the structural line nearest the click — where
+    HIS material boundary lives (the drawing often can't show it; he knows it). Each half
+    keeps its share of the (already net) SF by area ratio; holes follow by containment.
+    payload: {jobId, page (1-based), points:[[nx,ny]..], area_sf, holes, click:[nx,ny]}"""
+    j = get_job(payload.get("jobId"))
+    if not j or not j.get("pdf"):
+        raise HTTPException(404, "job not found")
+    try:
+        from shapely.geometry import Polygon as SPoly, LineString, Point as SPoint
+        from shapely.ops import split as sh_split
+        page = int(payload.get("page", 1)) - 1
+        doc = fitz.open(stream=j["pdf"], filetype="pdf")
+        pg = doc[page]
+        W, H = pg.rect.width, pg.rect.height
+        geo = vector_hatch.page_geometry(pg)
+        doc.close()
+        pts = [(float(x) * W, float(y) * H) for x, y in payload.get("points", [])]
+        poly = SPoly(pts).buffer(0)
+        if poly.is_empty:
+            return {"status": "error", "error": "bad polygon"}
+        cx, cy = float(payload["click"][0]) * W, float(payload["click"][1]) * H
+        minx, miny, maxx, maxy = poly.bounds
+        # candidate structural lines near the click: long V (split left/right) or H (split bands)
+        best = None
+        for (x1, y1, x2, y2) in geo.get("segs", []):
+            dx, dy = abs(x2 - x1), abs(y2 - y1)
+            L = (dx * dx + dy * dy) ** 0.5
+            if L < 25:
+                continue
+            if dx < 0.05 * L:                      # vertical line: x ~ const
+                x = (x1 + x2) / 2
+                if minx + 4 < x < maxx - 4 and L >= 0.35 * (maxy - miny):
+                    d = abs(x - cx)
+                    if best is None or d < best[0]:
+                        best = (d, "v", x)
+            elif dy < 0.05 * L:                    # horizontal line: y ~ const
+                y = (y1 + y2) / 2
+                if miny + 4 < y < maxy - 4 and L >= 0.35 * (maxx - minx):
+                    d = abs(y - cy)
+                    if best is None or d < best[0]:
+                        best = (d, "h", y)
+        if best is None or best[0] > 0.06 * max(W, H):
+            # no structural line near the click — split exactly AT the click (still useful)
+            best = (0, "v", cx) if (maxy - miny) > (maxx - minx) else (0, "h", cy)
+        _, axis, c = best
+        cutter = LineString([(c, miny - 10), (c, maxy + 10)]) if axis == "v" else LineString([(minx - 10, c), (maxx + 10, c)])
+        parts = [g for g in sh_split(poly, cutter).geoms if g.area > 1e-6]
+        if len(parts) < 2:
+            return {"status": "error", "error": "line does not split the face"}
+        parts.sort(key=lambda g: -g.area)
+        parts = parts[:2] if len(parts) == 2 else [parts[0], max(parts[1:], key=lambda g: g.area)]
+        total_a = sum(g.area for g in parts)
+        sf = float(payload.get("area_sf", 0))
+        holes = payload.get("holes") or []
+        out = []
+        for g in parts:
+            ext = list(g.exterior.coords)
+            hp = []
+            for hh in holes:
+                try:
+                    hc = SPoly([(float(x) * W, float(y) * H) for x, y in hh]).centroid
+                    if g.contains(hc):
+                        hp.append(hh)
+                except Exception:
+                    pass
+            out.append({"points": [[round(x / W, 5), round(y / H, 5)] for x, y in ext[:-1]],
+                        "area_sf": round(sf * g.area / max(total_a, 1e-9), 1),
+                        "holes": hp})
+        return {"status": "ok", "shapes": out, "axis": axis,
+                "cut_at": round((c / W) if axis == "v" else (c / H), 5)}
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+
+
 @app.post("/learn")
 def learn(payload: dict = Body(...)):
     """Capture a manual/corrected takeoff as labeled training data (the flywheel).
