@@ -67,9 +67,31 @@ def find_marked_pdf(jobdir):
             continue
     return None
 
+def strip_annots(doc):
+    """Delete every annotation (popup children die with parents — tolerate)."""
+    for pi in range(len(doc)):
+        pg = doc[pi]
+        for _ in range(200):
+            a = pg.first_annot
+            if not a:
+                break
+            try:
+                pg.delete_annot(a)
+            except Exception:
+                break
+    return doc
+
+
+if __name__ != "__main__":
+    import sys as _s
+    _s.modules[__name__].__dict__.setdefault("results", [])
 results = []
 jobs_done = 0
-for job in sorted(os.listdir(ROOT)):
+if __name__ != "__main__":
+    _RUN = False
+else:
+    _RUN = True
+for job in (sorted(os.listdir(ROOT)) if _RUN else []):
     if jobs_done >= MAX_JOBS:
         break
     jd = os.path.join(ROOT, job)
@@ -89,10 +111,7 @@ for job in sorted(os.listdir(ROOT)):
         if not gold_by_pg:
             doc.close(); continue
         # SYNTHETIC CLEAN: strip every annotation
-        for pi in range(len(doc)):
-            pg = doc[pi]
-            for a in list(pg.annots() or []):
-                pg.delete_annot(a)
+        strip_annots(doc)
         clean = doc.tobytes()
         doc.close()
     except Exception as e:
@@ -148,13 +167,13 @@ for job in sorted(os.listdir(ROOT)):
         print(f"[{jobs_done}] {jrec['job'][:40]:<42} walls {len(jrec['walls']):>3}  OK {ok:>3}  "
               f"scale_conf={jrec['scale_conf']}", flush=True)
 
-json.dump(results, open(OUT, "w"), indent=1)
-# aggregate
-tw = sum(len(r["walls"]) for r in results)
-ok = sum(1 for r in results for w in r["walls"] if w["iou"] >= 0.7 and abs(w["got"] - w["gold"]) <= 0.15 * w["gold"])
-shape_ok = sum(1 for r in results for w in r["walls"] if w["iou"] >= 0.7)
-found = sum(1 for r in results for w in r["walls"] if w["iou"] >= 0.3)
-print(f"\n===== BENCHMARK: {len(results)} jobs, {tw} gold walls")
-print(f"  wall FOUND (IoU>=0.3):        {found:>4}  ({100*found/max(tw,1):.0f}%)")
-print(f"  shape RIGHT (IoU>=0.7):       {shape_ok:>4}  ({100*shape_ok/max(tw,1):.0f}%)")
-print(f"  MONEY-RIGHT (shape+SF<=15%):  {ok:>4}  ({100*ok/max(tw,1):.0f}%)")
+if _RUN:
+    json.dump(results, open(OUT, "w"), indent=1)
+    tw = sum(len(r["walls"]) for r in results)
+    ok = sum(1 for r in results for w in r["walls"] if w["iou"] >= 0.7 and abs(w["got"] - w["gold"]) <= 0.15 * w["gold"])
+    shape_ok = sum(1 for r in results for w in r["walls"] if w["iou"] >= 0.7)
+    found = sum(1 for r in results for w in r["walls"] if w["iou"] >= 0.3)
+    print(f"\n===== BENCHMARK: {len(results)} jobs, {tw} gold walls")
+    print(f"  wall FOUND (IoU>=0.3):        {found:>4}  ({100*found/max(tw,1):.0f}%)")
+    print(f"  shape RIGHT (IoU>=0.7):       {shape_ok:>4}  ({100*shape_ok/max(tw,1):.0f}%)")
+    print(f"  MONEY-RIGHT (shape+SF<=15%):  {ok:>4}  ({100*ok/max(tw,1):.0f}%)")
