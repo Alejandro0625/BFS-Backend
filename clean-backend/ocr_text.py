@@ -68,6 +68,56 @@ def last_error():
     return _ERR
 
 
+def read_levels(pdf_bytes, page_index, long_side=2200):
+    """Elevation MARKERS off a FLATTENED page via OCR boxes: [(y_display_pts, feet, label)].
+    Labels ('T.O. STEEL') and values ('139'-0\"') are often separate OCR rows — pair a value
+    row with a level-word row within ~30pt vertically."""
+    if not available():
+        return []
+    import re as _re
+    lab_re = _re.compile(r"\b(T\.?O\.?|B\.?O\.?|FIN|FLOOR|FLR|CEILING|ROOF|EAVE|RIDGE|PARAPET|GRADE|STEEL|WALL|FTG)\b", _re.I)
+    val_re = _re.compile(r"(\d{1,3})'\s*-?\s*(\d{1,2})?\"?")
+    try:
+        import numpy as np
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        pg = doc[page_index]
+        W, H = pg.rect.width, pg.rect.height
+        z = min(3.0, long_side / max(1, max(W, H)))
+        pix = pg.get_pixmap(matrix=fitz.Matrix(z, z), alpha=False)
+        img = np.frombuffer(pix.samples, np.uint8).reshape(pix.height, pix.width, pix.n)
+        doc.close()
+        res, _ = _ENGINE(img)
+        del img
+        rows = []
+        for row in (res or []):
+            try:
+                box, txt, conf = row[0], (row[1] or "").strip(), float(row[2])
+            except Exception:
+                continue
+            if conf < 0.55:
+                continue
+            ys = [p[1] for p in box]; xs = [p[0] for p in box]
+            rows.append({"x": (min(xs) + max(xs)) / 2 / z, "y": (min(ys) + max(ys)) / 2 / z, "t": txt})
+        out = []
+        for r in rows:
+            m = val_re.search(r["t"])
+            if not m:
+                continue
+            ft = int(m.group(1)) + (int(m.group(2)) if m.group(2) else 0) / 12.0
+            if not (0 <= ft <= 400):
+                continue
+            lab = r["t"] if lab_re.search(r["t"]) else ""
+            if not lab:
+                near = [q for q in rows if q is not r and abs(q["y"] - r["y"]) < 30 and abs(q["x"] - r["x"]) < 160 and lab_re.search(q["t"])]
+                if not near:
+                    continue                        # a bare dimension is NOT a level marker
+                lab = near[0]["t"]
+            out.append({"y": round(r["y"], 1), "ft": round(ft, 2), "label": lab[:40]})
+        return out[:40]
+    except Exception:
+        return []
+
+
 def read_materials(pdf_bytes, page_index, long_side=2200, max_lines=120):
     """Return a deduped list of MATERIAL spec lines OCR'd off one flattened page:
     [{text, conf}]. Empty if OCR unavailable or nothing material-like is read."""
