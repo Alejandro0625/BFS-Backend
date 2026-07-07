@@ -173,8 +173,10 @@ def bucket(pdf_bytes, page_index, point):
             # picks a pattern — return EVERY face on the page with that same pattern (all
             # elevations), each as its own already-welded, net-of-openings shape. The clicked
             # face is primary; the rest ride along as `siblings` so one click fills them all.
-            group = best.get("group") or best.get("material")
-            fam = [p for p in vpolys if (p.get("group") or p.get("material")) == group and len(p.get("points", [])) >= 3]
+            key = ((best.get("group") or best.get("material")), best.get("psig", "plain"))
+            fam = [p for p in vpolys
+                   if ((p.get("group") or p.get("material")), p.get("psig", "plain")) == key
+                   and len(p.get("points", [])) >= 3]
             sibs = [{"points": p["points"], "area_sf": p.get("area_sf", 0), "holes": p.get("holes", [])}
                     for p in fam if p is not best][:30]
             return {"status": "ok", "points": best["points"], "area_sf": best.get("area_sf", 0),
