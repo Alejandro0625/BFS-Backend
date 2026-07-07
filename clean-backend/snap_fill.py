@@ -430,7 +430,7 @@ def split_face_at_joints(pg, pts_norm, holes_norm, area_sf, W, H, click_norm, ft
         if len(pieces) < 2:
             return None
         total = sum(p_.area for p_ in pieces)
-        click_pt = SPt(click_norm[0] * W, click_norm[1] * H)
+        click_pt = SPt(click_norm[0] * W, click_norm[1] * H) if click_norm is not None else None
         out = []
         for p_ in pieces:
             # shave spur fingers (leader-line tails thinner than ~2ft) before measuring —
@@ -462,14 +462,19 @@ def split_face_at_joints(pg, pts_norm, holes_norm, area_sf, W, H, click_norm, ft
                 sf = max(0.0, (p_.area - hole_pt2)) * ft_pt * ft_pt
             else:
                 sf = area_sf * p_.area / total
-            out.append({"points": pts, "area_sf": round(sf, 1),
-                        "holes": hl, "contains_click": p_.contains(click_pt) or p_.distance(click_pt) < 2})
+            out.append({"points": pts, "area_sf": round(sf, 1), "holes": hl,
+                        "contains_click": bool(click_pt is not None and
+                                               (p_.contains(click_pt) or p_.distance(click_pt) < 2))})
         if not (ft_pt and ft_pt > 0):
             # ratio mode: rounding drift goes to the largest piece (sum EXACTLY preserved)
             drift = round(area_sf - sum(o["area_sf"] for o in out), 1)
             if abs(drift) >= 0.1:
                 max(out, key=lambda o: o["area_sf"])["area_sf"] = round(
                     max(out, key=lambda o: o["area_sf"])["area_sf"] + drift, 1)
+        if click_norm is None:              # first-paint mode: caller wants every piece
+            for o in out:
+                o.pop("contains_click", None)
+            return None, out
         prim = next((o for o in out if o.pop("contains_click", False)), None)
         others = [o for o in out if o is not prim]
         for o in others:
@@ -494,7 +499,12 @@ def bucket(pdf_bytes, page_index, point):
         vpolys, VW, VH, vinfo = vector_hatch.detect(pdf_bytes, page_index)
         hits = [p for p in (vpolys or []) if len(p.get("points", [])) >= 3 and _pip_norm(point, p["points"])]
         if hits:
-            best = max(hits, key=lambda p: p.get("area_sf", 0))   # if regions overlap, the largest wall wins
+            # faces are now per-wall pieces; overlapping candidates → the MOST SPECIFIC
+            # (smallest real) piece is what the estimator pointed at. Sub-60SF slivers
+            # still lose to the wall that contains them.
+            real = [p for p in hits if p.get("area_sf", 0) >= 60]
+            best = min(real, key=lambda p: p.get("area_sf", 0)) if real \
+                else max(hits, key=lambda p: p.get("area_sf", 0))
             # SELECT THE PATTERN, EVERYWHERE (the estimator's click-a-hatch vision): the click
             # picks a pattern — return EVERY face on the page with that same pattern (all
             # elevations), each as its own already-welded, net-of-openings shape. The clicked
@@ -523,6 +533,19 @@ def bucket(pdf_bytes, page_index, point):
                     prim_pts, prim_sf, prim_holes = prim["points"], prim["area_sf"], prim["holes"]
                     sibs = rest + sibs
                     n_joints = len(rest)
+                if ftp:
+                    # first-paint pieces carry ratio SF (page-sum safety); a bucket CLICK
+                    # is the estimator measuring THIS wall — give the geometric net,
+                    # the number his takeoff shows for it
+                    try:
+                        from shapely.geometry import Polygon as _SP
+                        pp = _SP([(x * VW, y * VH) for x, y in prim_pts]).buffer(0)
+                        hp = sum(abs(_SP([(q[0] * VW, q[1] * VH) for q in h]).area)
+                                 for h in (prim_holes or []) if len(h) >= 3)
+                        if not pp.is_empty:
+                            prim_sf = round(max(0.0, pp.area - hp) * ftp * ftp, 1)
+                    except Exception:
+                        pass
             except Exception:
                 pass
             return {"status": "ok", "points": prim_pts, "area_sf": prim_sf,
