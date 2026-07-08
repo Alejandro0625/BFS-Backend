@@ -921,6 +921,78 @@ def detect(pdf_bytes, page_index, zoom=None):
         polys = keep
     except Exception:
         pass
+    # EXTEND-TO-GRADE — DISABLED after failing its gates (2026-07-08). The convention is
+    # real (his west wall: fill stops at the base drip y1381, he measures to grade
+    # y1408) but the west grade line is mostly LIGHT/hidden ink (~200pt heavy of 607
+    # needed) so no safe evidence bar fires there, while story-line slivers made 664
+    # regress +7→+17%. Next attempt needs: 'no piece BELOW the candidate line' gate +
+    # accepting mixed-weight stitched grade ink. Reverted per never-worse.
+    if False and conf:
+        try:
+            import snap_fill as _sf2
+            dg = fitz.open(stream=pdf_bytes, filetype="pdf")
+            _vsx, _hsx, _vhx, _hhx, _oth = _sf2._heavy_lines(dg[page_index])
+            dg.close()
+            from shapely.geometry import Polygon as _P4, box as _box4
+            all_p4 = []
+            for p in polys:
+                try:
+                    all_p4.append((p, _P4([(x * W, y * H) for x, y in p["points"]]).buffer(0)))
+                except Exception:
+                    all_p4.append((p, None))
+            for p, poly4 in all_p4:
+                try:
+                    if poly4 is None or poly4.is_empty:
+                        continue
+                    bx0, by0, bx1, by1 = poly4.bounds
+                    pw = bx1 - bx0
+                    best = None
+                    # ground lines are drawn in segments (broken at bollards/stairs) —
+                    # the joint stitcher handles gaps and rejects dashes
+                    for (yy, sp, wdp, cov) in _sf2._joint_positions(_hsx, bx0 - 40, bx1 + 40,
+                                                                    0.9 * pw):
+                        if wdp < 1.0 or not (by1 + 2 < yy <= by1 + 36):
+                            continue                       # within ~4ft below the piece
+                        if best is None or yy < best:
+                            best = yy
+                    if best is None:
+                        continue
+                    gap_box = _box4(bx0 + 0.02 * pw, by1 - 2, bx1 - 0.02 * pw, best)
+                    # GRADE has nothing below/inside the strip; a STORY line has the next
+                    # wall there. Any other piece in the strip → this is not grade, skip.
+                    other_wall = False
+                    for p2, q4 in all_p4:
+                        if p2 is p or q4 is None or q4.is_empty:
+                            continue
+                        try:
+                            if q4.intersection(gap_box).area > 0.05 * gap_box.area:
+                                other_wall = True
+                                break
+                        except Exception:
+                            pass
+                    if other_wall:
+                        continue
+                    ext = poly4.union(gap_box)
+                    ext = ext.buffer(0)
+                    if ext.geom_type != "Polygon" or ext.area <= poly4.area:
+                        continue
+                    if ext.area > 1.35 * poly4.area:
+                        continue                           # never grow more than 35%
+                    ring = list(ext.exterior.coords)[:-1]
+                    p["points"] = [[round(px / W, 5), round(py / H, 5)] for px, py in ring]
+                    hp4 = 0.0
+                    for h in (p.get("holes") or []):
+                        try:
+                            hp4 += abs(_P4([(q[0] * W, q[1] * H) for q in h]).area)
+                        except Exception:
+                            pass
+                    p["area_sf"] = round(max(0.0, ext.area - hp4) * ft_pt * ft_pt, 1)
+                    p["label"] = f"~{round(p['area_sf']):,} SF"
+                    p.pop("sf_calc", None)
+                except Exception:
+                    pass
+        except Exception:
+            pass
     # every piece carries its arithmetic (gross − openings = net) — trust is showing
     # the math, not asking for belief
     if conf:
