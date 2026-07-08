@@ -19,24 +19,14 @@ GROUPS = [
 ]
 
 
-def _read_scale(doc, pi):
-    """Read the drawing scale as feet-per-inch, robustly. Returns (ft_per_in, confirmed).
-    confirmed=False means we could not read it → caller must FLAG (never trust a defaulted SF)."""
-    txt = ""
-    try:
-        txt += doc[pi].get_text() or ""
-    except Exception:
-        pass
-    try:
-        for a in (doc[pi].annots() or []):
-            txt += " " + (a.info.get("content", "") or "")
-    except Exception:
-        pass
-    # normalize smart quotes / primes to plain " and '
+def _parse_scale_text(txt):
+    """Extract candidate ft/in values from scale-notation text. Shared by the page-text,
+    annotation and OCR paths. (?<!\\d ) skips the fraction of a MIXED detail number like
+    `1 1/2\"=1'` — a detail scale, not 2.0 as the bare \"1/2\" would parse."""
     t = txt.replace("’", "'").replace("‘", "'").replace("”", '"').replace("“", '"').replace("″", '"').replace("′", "'")
-    # ELEVATION/PLAN scale — architectural fraction:  A/B" = 1'  (1/8"=1'-0", 3/16"=1'-0")  -> ft_per_in = B/A
-    # (?<!\d ) skips the fraction part of a MIXED detail number like `1 1/2"=1'` (which is 0.667 ft/in, a
-    #  detail scale — NOT 2.0 as the bare "1/2" would parse). Elevation SF depends only on these fractions.
+    # OCR quirk: the '1' of \"= 1'-0\"\" reads as I/l/| (Fleet: 'SCALE: 1/8\" = I'-0\"')
+    t = re.sub(r"=\s*[Il|]\s*'", "= 1'", t)
+    # architectural fraction:  A/B" = 1'  (1/8"=1'-0", 3/16"=1'-0")  -> ft_per_in = B/A
     arch = []
     for m in re.finditer(r"(?<!\d )(\d+)\s*/\s*(\d+)\s*\"?\s*(?:in\.?)?\s*=\s*1\s*'", t, re.I):
         a, b = int(m.group(1)), int(m.group(2))
@@ -48,17 +38,81 @@ def _read_scale(doc, pi):
         n = int(m.group(1))
         if n > 0:
             eng.append(float(n))
-    cands = arch or eng
-    if not cands:
-        return 8.0, False  # could not read — default, but flagged as unconfirmed (caller must force calibrate)
+    return arch or eng
+
+
+def _consensus(cands):
+    # confirmed only if UNAMBIGUOUS: one value, or clearly dominant — a wrong scale
+    # SQUARES into the SF (a 1/4" read as 1/8" = 4x the money)
     from collections import Counter
     cnt = Counter(round(c, 4) for c in cands); best, bn = cnt.most_common(1)[0]
     others = sum(v for k, v in cnt.items() if k != best)
-    # confirmed only if the scale is UNAMBIGUOUS: one value, or a clearly dominant one (repeated + outnumbers
-    # the rest). A sheet with an elevation scale AND a lone detail scale that don't agree → NOT confirmed →
-    # force calibrate, because a wrong scale squares into the SF (a 1/4" read as 1/8" = 4x the money).
     confirmed = (len(cnt) == 1) or (bn >= 2 and bn > others)
     return best, confirmed
+
+
+_SCALE_CACHE = {}
+
+
+def _read_scale(doc, pi):
+    """Read the drawing scale as feet-per-inch, robustly. Returns (ft_per_in, confirmed).
+    Source chain — the drawing states its scale three ways, take the first that speaks
+    with confidence: (1) page/annot TEXT scale note; (2) the drawing's own DIMENSION
+    STRINGS (its built-in ruler — covers sheets whose note lives elsewhere); (3) OCR of
+    the title-block strips (flattened sets draw the note as curves). confirmed=False →
+    caller must FLAG (never trust a defaulted SF)."""
+    txt = ""
+    try:
+        txt += doc[pi].get_text() or ""
+    except Exception:
+        pass
+    try:
+        for a in (doc[pi].annots() or []):
+            txt += " " + (a.info.get("content", "") or "")
+    except Exception:
+        pass
+    cands = _parse_scale_text(txt)
+    if cands:
+        best, confirmed = _consensus(cands)
+        if confirmed:
+            return best, True
+    # cache the expensive fallbacks per page CONTENT (bucket clicks re-enter constantly;
+    # content-hash key so two different jobs can never share a cached scale)
+    try:
+        import hashlib
+        key = (pi, hashlib.md5(doc[pi].read_contents()[:4096]).hexdigest())
+    except Exception:
+        key = None
+    if key is not None and key in _SCALE_CACHE:
+        return _SCALE_CACHE[key]
+    result = None
+    # (2) dimension strings: "24'-0\"" drawn over a measurable line IS the scale
+    try:
+        import dim_scale
+        ds = dim_scale.sheet_scale(doc[pi])
+        if ds:
+            result = (round(ds[0] * 72.0, 4), True)
+    except Exception:
+        pass
+    # (3) OCR the title block (textless/flattened sets)
+    if result is None:
+        try:
+            import ocr_text
+            if ocr_text.available():
+                oc = _parse_scale_text(ocr_text.read_scale_note(doc[pi]))
+                if oc:
+                    best, confirmed = _consensus(oc)
+                    if confirmed:
+                        result = (best, True)
+        except Exception:
+            pass
+    if result is None:
+        result = ((_consensus(cands)[0] if cands else 8.0), False)
+    if key is not None:
+        _SCALE_CACHE[key] = result
+        if len(_SCALE_CACHE) > 400:
+            _SCALE_CACHE.clear()
+    return result
 
 
 def _fill_holes(mask):
