@@ -528,6 +528,12 @@ def detect(pdf_bytes, page_index, zoom=None):
         sf = area_pt2 * ft_pt * ft_pt
         if sf < SMALL_MIN_SF:
             return
+        # single-region anti-sprawl: one region bigger than half the sheet in BOTH dims
+        # is never one wall (Fenn: an 8,617sf 'train' spanning 0.95x0.69 of the sheet —
+        # the weld-cluster guard never applied to single regions)
+        _dx = [x for x, _ in disp_pts]; _dy = [y for _, y in disp_pts]
+        if (max(_dx) - min(_dx)) > 0.55 * W and (max(_dy) - min(_dy)) > 0.55 * H:
+            return
         norm = [[round(x / W, 5), round(y / H, 5)] for (x, y) in disp_pts]
         cx = round(sum(p[0] for p in norm) / len(norm), 5)
         cy = round(sum(p[1] for p in norm) / len(norm), 5)
