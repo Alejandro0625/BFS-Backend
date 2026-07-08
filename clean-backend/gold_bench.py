@@ -169,26 +169,29 @@ for job in (sorted(os.listdir(ROOT)) if _RUN else []):
                     continue
             except Exception:
                 continue
-            best_iou, best_p = 0.0, None
+            # ASSEMBLED scoring — what the takeoff actually totals for this wall: every
+            # piece ≥50%-inside it, summed SF + union coverage. (Single-piece IoU can
+            # never score 205A's one-sweep-per-elevation walls against our N pieces,
+            # nor his one wall assembled from our splits — Fleet's lab metric, adopted.)
+            mine = []
             for pp, p in piece_polys:
                 try:
-                    iou = gp.intersection(pp).area / max(1e-9, gp.union(pp).area)
-                except Exception:
-                    iou = 0
-                if iou > best_iou:
-                    best_iou, best_p = iou, p
-            bsf = best_p["area_sf"] if best_p else 0
-            # geometric recompute of the matched piece (what a bucket click returns)
-            if best_p is not None and ft_pt:
-                try:
-                    pp = Polygon([(x * VW, y * VH) for x, y in best_p["points"]]).buffer(0)
-                    hp = sum(abs(Polygon([(q[0] * VW, q[1] * VH) for q in h]).area)
-                             for h in (best_p.get("holes") or []) if len(h) >= 3)
-                    bsf = round(max(0.0, pp.area - hp) * ft_pt * ft_pt, 1)
+                    if pp.intersection(gp).area >= 0.5 * pp.area:
+                        mine.append((pp, p))
                 except Exception:
                     pass
+            asf = sum(p.get("area_sf", 0) for _, p in mine)
+            cov = 0.0
+            try:
+                from shapely.ops import unary_union
+                if mine:
+                    u = unary_union([pp for pp, _ in mine])
+                    cov = u.intersection(gp).area / max(1e-9, gp.area)
+            except Exception:
+                pass
             jrec["walls"].append({"pg": pi + 1, "mat": g["mat"], "gold": g["sf"],
-                                  "got": bsf, "iou": round(best_iou, 2)})
+                                  "got": round(asf, 1), "iou": round(cov, 2),
+                                  "n_pieces": len(mine)})
         del piece_polys
     if jrec["walls"]:
         results.append(jrec)
@@ -204,6 +207,6 @@ if _RUN:
     shape_ok = sum(1 for r in results for w in r["walls"] if w["iou"] >= 0.7)
     found = sum(1 for r in results for w in r["walls"] if w["iou"] >= 0.3)
     print(f"\n===== BENCHMARK: {len(results)} jobs, {tw} gold walls")
-    print(f"  wall FOUND (IoU>=0.3):        {found:>4}  ({100*found/max(tw,1):.0f}%)")
-    print(f"  shape RIGHT (IoU>=0.7):       {shape_ok:>4}  ({100*shape_ok/max(tw,1):.0f}%)")
-    print(f"  MONEY-RIGHT (shape+SF<=15%):  {ok:>4}  ({100*ok/max(tw,1):.0f}%)")
+    print(f"  wall FOUND (cover>=0.3):        {found:>4}  ({100*found/max(tw,1):.0f}%)")
+    print(f"  covered (cover>=0.7):       {shape_ok:>4}  ({100*shape_ok/max(tw,1):.0f}%)")
+    print(f"  MONEY-RIGHT (cover+SF<=15%):  {ok:>4}  ({100*ok/max(tw,1):.0f}%)")
