@@ -803,10 +803,11 @@ def detect(pdf_bytes, page_index, zoom=None):
         try:
             from shapely.geometry import Polygon as _P2, Point as _Pt2, box as _box
             hair_v, hair_h = [], []
+            all_v, all_h = [], []        # ANY weight — door jambs are drawn heavier than hairlines
             for d in (fitz.open(stream=pdf_bytes, filetype="pdf")[page_index]).get_drawings():
                 wd = d.get("width") or 0
                 col = d.get("color")
-                if wd >= 0.7 or (col is not None and len(col) >= 3 and sum(col[:3]) / 3 >= 0.66):
+                if col is not None and len(col) >= 3 and sum(col[:3]) / 3 >= 0.66:
                     continue
                 for it in d.get("items") or []:
                     if it[0] != "l":
@@ -814,9 +815,13 @@ def detect(pdf_bytes, page_index, zoom=None):
                     p0 = fitz.Point(it[1]) * rot; p1 = fitz.Point(it[2]) * rot
                     dx, dy = abs(p1.x - p0.x), abs(p1.y - p0.y)
                     if dy >= 6 and dx <= 1.5:
-                        hair_v.append(((p0.x + p1.x) / 2, min(p0.y, p1.y), max(p0.y, p1.y)))
+                        all_v.append(((p0.x + p1.x) / 2, min(p0.y, p1.y), max(p0.y, p1.y)))
+                        if wd < 0.7:
+                            hair_v.append(all_v[-1])
                     elif dx >= 6 and dy <= 1.5:
-                        hair_h.append(((p0.y + p1.y) / 2, min(p0.x, p1.x), max(p0.x, p1.x)))
+                        all_h.append(((p0.y + p1.y) / 2, min(p0.x, p1.x), max(p0.x, p1.x)))
+                        if wd < 0.7:
+                            hair_h.append(all_h[-1])
             for p in polys:
                 grp = (p.get("group") or p.get("material") or "")
                 if grp.startswith("Panel wall"):
@@ -838,18 +843,26 @@ def detect(pdf_bytes, page_index, zoom=None):
                     clipped = poly.intersection(ext)
                     if clipped.geom_type == "MultiPolygon":
                         clipped = max(clipped.geoms, key=lambda g: g.area)
-                    if clipped.geom_type != "Polygon" or clipped.is_empty or \
-                       clipped.area < 0.5 * poly.area or clipped.area >= 0.995 * poly.area:
-                        continue
-                    ring = list(clipped.exterior.coords)[:-1]
-                    p["points"] = [[round(px / W, 5), round(py / H, 5)] for px, py in ring]
+                    if clipped.geom_type == "Polygon" and not clipped.is_empty and \
+                       0.5 * poly.area <= clipped.area < 0.995 * poly.area:
+                        ring = list(clipped.exterior.coords)[:-1]
+                        p["points"] = [[round(px / W, 5), round(py / H, 5)] for px, py in ring]
+                        poly = clipped
+                    # PATTERN-INTERRUPTION OPENINGS (how SHE deducts): courses/seams STOP
+                    # at a door — an aligned gap recurring across ≥5 pattern lines is an
+                    # opening even with no drawn frame (garage/man doors, flattened sets).
+                    gap_holes, gap_pt2 = _pattern_gap_openings(
+                        poly, hair_v, hair_h, p.get("holes") or [], W, H, ft_pt,
+                        jamb_v=all_v, jamb_h=all_h)
+                    if gap_holes:
+                        p["holes"] = (p.get("holes") or []) + gap_holes
                     hole_pt2 = 0.0
                     for h in (p.get("holes") or []):
                         try:
                             hole_pt2 += abs(_P2([(qq[0] * W, qq[1] * H) for qq in h]).area)
                         except Exception:
                             pass
-                    p["area_sf"] = round(max(0.0, clipped.area - hole_pt2) * ft_pt * ft_pt, 1)
+                    p["area_sf"] = round(max(0.0, poly.area - hole_pt2) * ft_pt * ft_pt, 1)
                     p["label"] = f"~{round(p['area_sf']):,} SF"
                 except Exception:
                     pass
@@ -898,6 +911,94 @@ def detect(pdf_bytes, page_index, zoom=None):
     for i, p in enumerate(polys):
         p["id"] = i
     return polys, W, H, {"ft_per_in": round(sc, 3), "scale_confirmed": conf}
+
+
+def _pattern_gap_openings(poly, hair_v, hair_h, existing_holes, W, H, ft_pt,
+                          jamb_v=None, jamb_h=None):
+    """Openings the way the estimator sees them: pattern lines STOP at doors/windows.
+    An aligned gap recurring across ≥5 consecutive pattern lines = an opening — no
+    drawn frame required. Returns (holes_norm, total_pt2). Conservative: plausible
+    door/window sizes only, skips anything overlapping an already-found hole, and
+    total deduction capped at 40% of the piece."""
+    from shapely.geometry import Point as _Pt3
+    from collections import defaultdict
+    x0b, y0b, x1b, y1b = poly.bounds
+    # dominant pattern orientation inside the piece
+    vlen = sum(min(hi, y1b) - max(lo, y0b) for (x, lo, hi) in hair_v
+               if x0b <= x <= x1b and min(hi, y1b) > max(lo, y0b))
+    hlen = sum(min(hi, x1b) - max(lo, x0b) for (y, lo, hi) in hair_h
+               if y0b <= y <= y1b and min(hi, x1b) > max(lo, x0b))
+    horiz = hlen >= vlen                 # courses run horizontally → gaps are vertical slots
+    rows = defaultdict(list)
+    if horiz:
+        for (y, lo, hi) in hair_h:
+            if y0b < y < y1b and poly.contains(_Pt3(max(lo, x0b) / 2 + min(hi, x1b) / 2, y)):
+                rows[round(y / 4)].append((max(lo, x0b), min(hi, x1b)))
+    else:
+        for (x, lo, hi) in hair_v:
+            if x0b < x < x1b and poly.contains(_Pt3(x, max(lo, y0b) / 2 + min(hi, y1b) / 2)):
+                rows[round(x / 4)].append((max(lo, y0b), min(hi, y1b)))
+    clusters = []                        # [ [g0,g1,rows_set] ]
+    for rk, segs in rows.items():
+        segs = sorted(s for s in segs if s[1] > s[0])
+        for (a0, a1), (b0, b1) in zip(segs, segs[1:]):
+            g = b0 - a1
+            if not (12 <= g <= 220):
+                continue
+            placed = False
+            for cl in clusters:
+                ovl = min(cl[1], b0) - max(cl[0], a1)
+                if ovl > 0.5 * min(g, cl[1] - cl[0]):
+                    cl[0] = (cl[0] + a1) / 2; cl[1] = (cl[1] + b0) / 2
+                    cl[2].add(rk); placed = True
+                    break
+            if not placed:
+                clusters.append([a1, b0, {rk}])
+    holes, tot = [], 0.0
+    max_ded = 0.4 * poly.area
+    jambs = (jamb_v if jamb_v is not None else hair_v) if horiz else \
+            (jamb_h if jamb_h is not None else hair_h)
+    def _jamb_at(c, lo, hi):
+        need = 0.6 * (hi - lo)
+        cov = sum(min(jhi, hi) - max(jlo, lo) for (jc, jlo, jhi) in jambs
+                  if abs(jc - c) <= 8 and min(jhi, hi) > max(jlo, lo))
+        return cov >= need
+    for g0, g1, rks in clusters:
+        if len(rks) < 5:
+            continue
+        span = (max(rks) - min(rks) + 1) * 4.0
+        wft = (g1 - g0) * ft_pt
+        hft = span * ft_pt
+        if not (1.2 <= wft <= 22 and hft >= 2.0) or wft * hft < 8:
+            continue
+        # a REAL opening has JAMBS: lines at both gap edges spanning it. Text/leader
+        # interruptions don't — this is what stops false deductions (1987 regressed
+        # -0% -> -10% without it; she deducts doors, not noise).
+        rlo, rhi = min(rks) * 4 - 2, max(rks) * 4 + 2
+        if not (_jamb_at(g0, rlo, rhi) and _jamb_at(g1, rlo, rhi)):
+            continue
+        if horiz:
+            r = (g0, min(rks) * 4 - 2, g1, max(rks) * 4 + 2)
+        else:
+            r = (min(rks) * 4 - 2, g0, max(rks) * 4 + 2, g1)
+        # never double-deduct a window the rect-detector already found
+        dup = False
+        for h in existing_holes:
+            hx = [q[0] * W for q in h]; hy = [q[1] * H for q in h]
+            ix = min(r[2], max(hx)) - max(r[0], min(hx))
+            iy = min(r[3], max(hy)) - max(r[1], min(hy))
+            if ix > 0 and iy > 0 and ix * iy > 0.3 * (r[2] - r[0]) * (r[3] - r[1]):
+                dup = True
+                break
+        if dup:
+            continue
+        a = (r[2] - r[0]) * (r[3] - r[1])
+        if tot + a > max_ded:
+            continue
+        tot += a
+        holes.append([[round(r[0] / W, 5), round(r[1] / H, 5)], [round(r[2] / W, 5), round(r[1] / H, 5)],
+                      [round(r[2] / W, 5), round(r[3] / H, 5)], [round(r[0] / W, 5), round(r[3] / H, 5)]])
+    return holes[:12], tot
 
 
 _TAG_RE = None
