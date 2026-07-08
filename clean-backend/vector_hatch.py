@@ -864,6 +864,19 @@ def detect(pdf_bytes, page_index, zoom=None):
                             pass
                     p["area_sf"] = round(max(0.0, poly.area - hole_pt2) * ft_pt * ft_pt, 1)
                     p["label"] = f"~{round(p['area_sf']):,} SF"
+                    # TRUST = SHOW THE ARITHMETIC: every wall carries its own math so
+                    # the estimator can verify any number in seconds, like checking a
+                    # colleague's takeoff. gross (drawn geometry) − openings = net.
+                    bx0, by0, bx1, by1 = poly.bounds
+                    p["sf_calc"] = {
+                        "gross_sf": round(poly.area * ft_pt * ft_pt, 1),
+                        "openings_sf": round(hole_pt2 * ft_pt * ft_pt, 1),
+                        "net_sf": p["area_sf"],
+                        "n_openings": len(p.get("holes") or []),
+                        "w_ft": round((bx1 - bx0) * ft_pt, 1),
+                        "h_ft": round((by1 - by0) * ft_pt, 1),
+                        "basis": "drawing geometry @ 1\"=%g'" % round(ft_pt * 72, 2),
+                    }
                 except Exception:
                     pass
         except Exception:
@@ -908,6 +921,38 @@ def detect(pdf_bytes, page_index, zoom=None):
         polys = keep
     except Exception:
         pass
+    # every piece carries its arithmetic (gross − openings = net) — trust is showing
+    # the math, not asking for belief
+    if conf:
+        try:
+            from shapely.geometry import Polygon as _P3
+            for p in polys:
+                if p.get("sf_calc"):
+                    continue
+                try:
+                    poly3 = _P3([(x * W, y * H) for x, y in p["points"]]).buffer(0)
+                    if poly3.is_empty:
+                        continue
+                    hp = 0.0
+                    for h in (p.get("holes") or []):
+                        try:
+                            hp += abs(_P3([(q[0] * W, q[1] * H) for q in h]).area)
+                        except Exception:
+                            pass
+                    bx0, by0, bx1, by1 = poly3.bounds
+                    p["sf_calc"] = {
+                        "gross_sf": round(poly3.area * ft_pt * ft_pt, 1),
+                        "openings_sf": round(hp * ft_pt * ft_pt, 1),
+                        "net_sf": p.get("area_sf", 0),
+                        "n_openings": len(p.get("holes") or []),
+                        "w_ft": round((bx1 - bx0) * ft_pt, 1),
+                        "h_ft": round((by1 - by0) * ft_pt, 1),
+                        "basis": "drawing geometry @ 1\"=%g'" % round(ft_pt * 72, 2),
+                    }
+                except Exception:
+                    pass
+        except Exception:
+            pass
     for i, p in enumerate(polys):
         p["id"] = i
     return polys, W, H, {"ft_per_in": round(sc, 3), "scale_confirmed": conf}
