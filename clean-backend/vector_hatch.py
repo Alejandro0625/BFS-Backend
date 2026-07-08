@@ -121,7 +121,7 @@ def _collect_axis(pg, axis, min_len=40, stitch=5):
     return lines, cross
 
 
-def _train_regions(pg, axis):
+def _train_regions(pg, axis, chain=False):
     W, H = pg.rect.width, pg.rect.height
     rot = pg.rotation_matrix
     lines, cross = _collect_axis(pg, axis)
@@ -150,6 +150,13 @@ def _train_regions(pg, axis):
             cj, a0j, a1j = lines[j]
             ov = min(a1i, a1j) - max(a0i, a0j)
             if ov > 0.5 * min(a1i - a0i, a1j - a0j):
+                union(i, j)
+            # FRAGMENTED COURSES (26-088 view 3: lap lines drawn as ~32pt dashes — they
+            # never overlap, so no cluster ever formed): fragments of the SAME course
+            # line (within 3pt) chain across gaps ≤18pt. Area stays honest — the strip
+            # integral sums only actual ink, never the gaps (the old window-bridging
+            # lesson stays enforced).
+            elif chain and abs(cj - ci) <= 3 and ov > -18:
                 union(i, j)
             j += 1
     groups = {}
@@ -446,7 +453,30 @@ def detect(pdf_bytes, page_index, zoom=None):
     ft_pt = sc / 72.0
 
     fills = _fill_regions(pg)
-    trains = _train_regions(pg, "v") + _train_regions(pg, "h")
+    # STRICT no-regression construction: no-chain regions are the canon (identical to
+    # prior behavior); chain-formed regions (fragmented courses, 26-088 view 3) are
+    # added ONLY where no canon region exists — new coverage is pure gain.
+    def _bbox_of_train(t):
+        part = t["lines"]
+        c0 = min(v[0] for v in part); c1_ = max(v[0] for v in part)
+        a0 = min(v[1] for v in part); a1 = max(v[2] for v in part)
+        return (a0, c0, a1, c1_) if t["axis"] == "h" else (c0, a0, c1_, a1)
+    trains = []
+    for ax in ("v", "h"):
+        base = _train_regions(pg, ax, chain=False)
+        extra = []
+        bbs = [_bbox_of_train(t) for t in base]
+        for t in _train_regions(pg, ax, chain=True):
+            tb = _bbox_of_train(t)
+            ta = max(1e-6, (tb[2] - tb[0]) * (tb[3] - tb[1]))
+            ov = 0.0
+            for bb in bbs:
+                ix = max(0, min(tb[2], bb[2]) - max(tb[0], bb[0]))
+                iy = max(0, min(tb[3], bb[3]) - max(tb[1], bb[1]))
+                ov += ix * iy
+            if ov / ta < 0.3:
+                extra.append(t)
+        trains += base + extra
     # structural snap targets: the page's long vertical Xs and horizontal Ys
     _vl, _hc = _collect_axis(pg, "v")
     snapx = sorted(set(c for (c, _, _) in _vl))[:800]
