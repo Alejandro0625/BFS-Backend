@@ -942,6 +942,7 @@ def detect(pdf_bytes, page_index, zoom=None):
             CH = max(1, int(CW * H / max(1, W)))
             sxc, syc = CW / W, CH / H
             by_col = {}
+            chips = {}                                # color key -> legend-chip display pos
             for d in pgc.get_drawings():
                 f = d.get("fill")
                 if not f or len(f) < 3:
@@ -955,6 +956,10 @@ def detect(pdf_bytes, page_index, zoom=None):
                 for it in d.get("items") or []:
                     if it[0] == "re":
                         r = it[1]
+                        # tiny color rect = a LEGEND CHIP — the sheet's own color->material map
+                        if (r.x1 - r.x0) < 24 and (r.y1 - r.y0) < 24 and key not in chips:
+                            cpt = fitz.Point((r.x0 + r.x1) / 2, (r.y0 + r.y1) / 2) * rotc
+                            chips[key] = (cpt.x, cpt.y)
                         cs = [(r.x0, r.y0), (r.x1, r.y0), (r.x1, r.y1), (r.x0, r.y1)]
                         pp = [fitz.Point(X, Y) * rotc for X, Y in cs]
                         cv2.fillPoly(m, [np.array([[int(p.x * sxc), int(p.y * syc)] for p in pp], np.int32)], 1)
@@ -965,6 +970,21 @@ def detect(pdf_bytes, page_index, zoom=None):
                         cur.append((p1.x, p1.y))
                 if len(cur) >= 3:
                     cv2.fillPoly(m, [np.array([[int(x * sxc), int(y * syc)] for x, y in cur], np.int32)], 1)
+            # read the legend row to the right of each chip = HER material name
+            col_names = {}
+            try:
+                wlist = []
+                for w in pgc.get_text("words"):
+                    wp = fitz.Point((w[0] + w[2]) / 2, (w[1] + w[3]) / 2) * rotc
+                    wlist.append((wp.x, wp.y, (w[4] or "").strip()))
+                for key, (cx_, cy_) in chips.items():
+                    row = sorted([(x, t) for (x, y, t) in wlist
+                                  if abs(y - cy_) < 9 and 0 < x - cx_ < 420 and t], key=lambda q: q[0])
+                    nm = " ".join(t for _, t in row)[:64].strip()
+                    if len(nm) >= 4:
+                        col_names[key] = nm
+            except Exception:
+                pass
             dcf.close()
             for key, (m, rgb) in by_col.items():
                 cnts, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -993,12 +1013,13 @@ def detect(pdf_bytes, page_index, zoom=None):
                         continue
                     cxc = round(sum(q[0] for q in normc) / len(normc), 5)
                     cyc = round(sum(q[1] for q in normc) / len(normc), 5)
+                    cname = col_names.get(key) or f"Color fill ({key})"
                     polys.append({"points": normc, "area_sf": round(sfc_, 1), "cx": cxc, "cy": cyc,
                                   "fill_color": rgb, "source": "vector",
-                                  "material": f"Color fill ({key})",
-                                  "category": f"Color fill ({key})",
-                                  "group": f"Color fill ({key})", "sf_exact": True,
-                                  "holes": [], "label": f"~{round(sfc_):,} SF"})
+                                  "material": cname, "category": cname,
+                                  "group": cname, "sf_exact": True,
+                                  "holes": [], "named_by_tag": bool(col_names.get(key)),
+                                  "label": f"~{round(sfc_):,} SF"})
         except Exception:
             pass
     # TAG-SEEDED AUTO-BUCKET (Avita convention: siding bands drawn BLANK, material only
