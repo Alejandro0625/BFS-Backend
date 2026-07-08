@@ -68,6 +68,33 @@ def last_error():
     return _ERR
 
 
+def read_scale_note(pg, zoom=3.0):
+    """OCR the title-block strips (bottom + right) of a FLATTENED page and return the raw
+    text — the caller parses scale notations from it. Textless sets draw 'SCALE: 1/8\" =
+    1'-0\"' as curves; this reads it back."""
+    if not available():
+        return ""
+    try:
+        import numpy as np
+        W, H = pg.rect.width, pg.rect.height
+        out = []
+        for clip in (fitz.Rect(0, H * 0.86, W, H), fitz.Rect(W * 0.80, 0, W, H)):
+            pix = pg.get_pixmap(matrix=fitz.Matrix(zoom, zoom), clip=clip, alpha=False)
+            img = np.frombuffer(pix.samples, np.uint8).reshape(pix.height, pix.width, pix.n)
+            res, _ = _ENGINE(img)
+            del img
+            for row in (res or []):
+                try:
+                    txt, conf = (row[1] or "").strip(), float(row[2])
+                except Exception:
+                    continue
+                if conf >= 0.5 and txt:
+                    out.append(txt)
+        return " ".join(out)
+    except Exception:
+        return ""
+
+
 def read_levels(pdf_bytes, page_index, long_side=2200):
     """Elevation MARKERS off a FLATTENED page via OCR boxes: [(y_display_pts, feet, label)].
     Labels ('T.O. STEEL') and values ('139'-0\"') are often separate OCR rows — pair a value
