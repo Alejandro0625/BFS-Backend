@@ -921,6 +921,19 @@ def detect(pdf_bytes, page_index, zoom=None):
         polys = keep
     except Exception:
         pass
+    # TAG-SEEDED AUTO-BUCKET (Avita convention: siding bands drawn BLANK, material only
+    # a repeated legend tag). Flood from each repeated tag within structural barriers →
+    # the labeled band. Virgin territory only; textless pages no-op (Fleet canary safe).
+    if conf:
+        try:
+            import snap_fill as _sf3
+            newp = _sf3.tag_seed_fill(pdf_bytes, page_index,
+                                      [p["points"] for p in polys],
+                                      max_new=max(0, MAX_REGIONS - len(polys)))
+            if newp:
+                polys += newp
+        except Exception:
+            pass
     # EXTEND-TO-GRADE — DISABLED after failing its gates (2026-07-08). The convention is
     # real (his west wall: fill stops at the base drip y1381, he measures to grade
     # y1408) but the west grade line is mostly LIGHT/hidden ink (~200pt heavy of 607
