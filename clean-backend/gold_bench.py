@@ -12,7 +12,7 @@ import vector_hatch, snap_fill
 
 ROOT = r"V:\Bids 2026\Siding Bids 2026\00 - Submitted"
 OUT = r"C:\Users\User\AppData\Local\Temp\claude\C--Users-User--claude-projects-C--Users-User-Downloads\7923c776-90d9-4429-bc6e-2042f5ab0117\scratchpad\gold_bench_results.json"
-MAX_JOBS = 12
+MAX_JOBS = 30
 MAX_PAGES = 6          # per doc — elevations live early in elevation-only files
 MAX_MB = 60
 
@@ -38,8 +38,13 @@ def gold_walls(pg):
         out.append({"pts": pts, "sf": sf, "mat": (a.info.get("subject") or "").strip()[:30]})
     return out
 
+_MATWORD = re.compile(r"panel|siding|lap\b|brick|eifs|metal|mtl|fiber|cement|stone|masonr|acm|pnl|side-|shake|board|batten|veneer|stucco|hardi|cedar|alum|corrug|soffit|azek|nichiha", re.I)
+
+
 def find_marked_pdf(jobdir):
-    """Prefer elevation-named files; else smallest marked pdf with sf-polygons."""
+    """Pick the file whose gold is a real CLADDING takeoff: prefer elevation-named files
+    and MATERIAL-named gold subjects; penalize site/logistics/civil sheets (26-040's
+    'Site Logistics & Phasing' gold = roof-footprint areas, not walls — poisoned the exam)."""
     cands = []
     try:
         for f in os.listdir(jobdir):
@@ -52,20 +57,30 @@ def find_marked_pdf(jobdir):
             score = 0
             fl = f.lower()
             if "elev" in fl: score += 10
+            if any(k in fl for k in ("site", "logistic", "phas", "civil", "demo ", "landsc")):
+                score -= 40
             if "no mark" in fl or "nomark" in fl or "clean" in fl: score -= 100
             cands.append((score, mb, fp))
     except Exception:
         return None
-    for score, mb, fp in sorted(cands, key=lambda t: (-t[0], t[1])):
+    scored = []
+    for score, mb, fp in sorted(cands, key=lambda t: (-t[0], t[1]))[:8]:
         try:
             doc = fitz.open(fp)
-            n_gold = sum(len(gold_walls(doc[i])) for i in range(min(len(doc), MAX_PAGES)))
+            walls = [w for i in range(min(len(doc), MAX_PAGES)) for w in gold_walls(doc[i])]
             doc.close()
-            if n_gold >= 2:
-                return fp
+            if len(walls) < 2:
+                continue
+            n_mat = sum(1 for w in walls if _MATWORD.search(w["mat"] or ""))
+            scored.append((score + 3 * min(n_mat, 8), fp, n_mat, len(walls)))
         except Exception:
             continue
-    return None
+    if not scored:
+        return None
+    scored.sort(key=lambda t: -t[0])
+    # if the best file's gold has NO material-named walls at all it's probably not a
+    # siding takeoff (footprints, phasing areas) — only accept it if nothing better exists
+    return scored[0][1]
 
 def strip_annots(doc):
     """Delete every annotation (popup children die with parents — tolerate)."""
@@ -91,13 +106,28 @@ if __name__ != "__main__":
     _RUN = False
 else:
     _RUN = True
+_MANIFEST = {}
+try:
+    _MANIFEST = json.load(open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                            "gold_manifest.json")))
+except Exception:
+    pass
 for job in (sorted(os.listdir(ROOT)) if _RUN else []):
     if jobs_done >= MAX_JOBS:
         break
     jd = os.path.join(ROOT, job)
     if not os.path.isdir(jd):
         continue
-    fp = find_marked_pdf(jd)
+    # FROZEN EXAM: the manifest pins job->file so every run grades the same test —
+    # heuristic re-picking changed the exam twice and made runs incomparable
+    if _MANIFEST:
+        mf = next((v for k, v in _MANIFEST.items() if job[:44] == k), None)
+        if mf is None:
+            continue
+        cand = [os.path.join(jd, f) for f in os.listdir(jd) if f.startswith(mf[:36])]
+        fp = cand[0] if cand else None
+    else:
+        fp = find_marked_pdf(jd)
     if not fp:
         continue
     try:
