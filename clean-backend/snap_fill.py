@@ -536,6 +536,87 @@ def split_face_at_joints(pg, pts_norm, holes_norm, area_sf, W, H, click_norm, ft
         return None
 
 
+def tag_seed_fill(pdf_bytes, page_index, avoid_polys, max_new=40):
+    """TAG-SEEDED AUTO-BUCKET (the Avita convention: siding bands drawn BLANK, material
+    stated only by a legend tag like 'SFC'). For each REPEATED material tag (≥3 uses on
+    the page — apartment/grid labels are unique, real material keys repeat), flood-fill
+    from the tag's location within structural barriers = the band the tag labels.
+    Returns new piece dicts; claims only territory outside `avoid_polys` (normalized)."""
+    import re as _re
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    pg = doc[page_index]
+    tag_re = _re.compile(r"^[A-Za-z]{1,6}[-–]?\d{0,2}$")
+    words = []
+    try:
+        for w in pg.get_text("words"):
+            t = (w[4] or "").strip().rstrip(".,;:")
+            if 2 <= len(t) <= 7 and tag_re.match(t) and any(c.isalpha() for c in t):
+                words.append(((w[0] + w[2]) / 2, (w[1] + w[3]) / 2, t.upper()))
+    except Exception:
+        pass
+    from collections import Counter
+    cnt = Counter(t for _, _, t in words)
+    seeds = [(x, y, t) for (x, y, t) in words if cnt[t] >= 3]
+    if not seeds:
+        doc.close()
+        return []
+    img, ftpx, sc, conf, z = _render(doc, page_index)
+    H, W = img.shape[:2]
+    struct, _ = _vector_struct(doc[page_index], z, H, W, min_len=4, width=3)
+    rotm = doc[page_index].rotation_matrix          # words are UNROTATED; render is display
+    doc.close()
+    if not struct.any() or not conf:
+        return []
+    free = (1 - struct).astype(np.uint8)
+    taken = np.zeros((H, W), np.uint8)
+    PW, PH = W / z, H / z
+    for poly in (avoid_polys or []):
+        try:
+            cnt2 = np.array([[int(px * W), int(py * H)] for px, py in poly], np.int32)
+            cv2.fillPoly(taken, [cnt2], 1)
+        except Exception:
+            pass
+    out = []
+    for (tx, ty, tag) in seeds:
+        if len(out) >= max_new:
+            break
+        dp = fitz.Point(tx, ty) * rotm
+        px, py = int(dp.x * z), int(dp.y * z)
+        px = min(max(px, 0), W - 1); py = min(max(py, 0), H - 1)
+        if taken[py, px] or free[py, px] == 0:
+            # nudge off the tag's own glyphs / already-claimed ground
+            y0n, x0n = max(0, py - 14), max(0, px - 14)
+            win_f = free[y0n:py + 14, x0n:px + 14]
+            win_t = taken[y0n:py + 14, x0n:px + 14]
+            ys, xs = np.where((win_f > 0) & (win_t == 0))
+            if len(xs) == 0:
+                continue
+            px, py = x0n + xs[0], y0n + ys[0]
+        ff = free.copy(); mask = np.zeros((H + 2, W + 2), np.uint8)
+        cv2.floodFill(ff, mask, (int(px), int(py)), 2)
+        region = (ff == 2).astype(np.uint8)
+        frac = int(region.sum()) / (H * W)
+        if frac > 0.08 or frac < 2e-5:
+            continue                                  # leaked or speck
+        if int((region & taken).sum()) > 0.2 * int(region.sum()):
+            continue                                  # someone else's wall
+        sf = int(region.sum()) * ftpx * ftpx
+        if not (40 <= sf <= 2500):
+            continue                                  # not a plausible band
+        poly = _poly_from_region(region, W, H)
+        if poly is None:
+            continue
+        taken |= region
+        xs2 = [a for a, _ in poly]; ys2 = [b for _, b in poly]
+        out.append({"points": poly, "area_sf": round(sf, 1),
+                    "cx": round(sum(xs2) / len(xs2), 5), "cy": round(sum(ys2) / len(ys2), 5),
+                    "fill_color": [0.45, 0.65, 0.9], "source": "vector",
+                    "material": tag, "category": tag, "group": tag,
+                    "sf_exact": True, "holes": [], "named_by_tag": True,
+                    "label": f"~{round(sf):,} SF"})
+    return out
+
+
 def bucket(pdf_bytes, page_index, point):
     """Click a wall -> exact polygon + SF. point = [nx, ny] normalized (DISPLAY coords).
 
