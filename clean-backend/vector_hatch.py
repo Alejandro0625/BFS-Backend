@@ -769,9 +769,13 @@ def detect(pdf_bytes, page_index, zoom=None):
             is_train = not ((p.get("group") or p.get("material") or "").startswith("Panel wall"))
             sp = None
             try:
+                # GEOMETRIC-NET piece SF when the scale is trusted (his 664 band: ratio
+                # mode gave 371 for a fully-covered wall — parents' strip-integral nets
+                # spread unevenly). The piece-level dedup below keeps totals honest.
                 sp = _sf.split_face_at_joints(pg2, p["points"], p.get("holes") or [],
                                               p.get("area_sf", 0), W, H, None,
-                                              ft_pt=None, filter_empty=is_train)
+                                              ft_pt=(ft_pt if conf else None),
+                                              filter_empty=is_train)
             except Exception:
                 sp = None
             if not sp or not sp[1] or len(sp[1]) < 2:
@@ -798,6 +802,36 @@ def detect(pdf_bytes, page_index, zoom=None):
     # Flattened sets (Fleet) have no text → automatic no-op → canary safe.
     try:
         polys = _tag_split(pdf_bytes, page_index, polys, snapx, W, H)
+    except Exception:
+        pass
+    # PIECE-LEVEL overlap dedup: with geometric-net piece SF, overlapping pieces from
+    # two parent faces would double-count — same honest shave as the face-level pass
+    # (biggest/fill first; drop >55% covered; shave partial overlaps' SF).
+    try:
+        import numpy as np, cv2
+        MW = 900
+        MH = max(1, int(MW * H / max(1, W)))
+        order = sorted(range(len(polys)), key=lambda i: (0 if (polys[i].get("material") or "").startswith("Panel wall") else 1, -polys[i]["area_sf"]))
+        covered = np.zeros((MH, MW), np.uint8)
+        keep = []
+        for i in order:
+            p = polys[i]
+            cnt = np.array([[int(x * MW), int(y * MH)] for x, y in p["points"]], np.int32)
+            m = np.zeros((MH, MW), np.uint8)
+            cv2.fillPoly(m, [cnt], 1)
+            a = int(m.sum())
+            if a == 0:
+                continue
+            ov = int((m & covered).sum()) / a
+            if ov > 0.9:
+                continue                 # true duplicate
+            if ov > 0.05:
+                # shave the SF, keep the piece — dropping cost a matched wall cross-job
+                p = dict(p); p["area_sf"] = round(p["area_sf"] * (1 - ov), 1)
+                p["label"] = f"~{round(p['area_sf']):,} SF"
+            covered |= m
+            keep.append(p)
+        polys = keep
     except Exception:
         pass
     for i, p in enumerate(polys):
