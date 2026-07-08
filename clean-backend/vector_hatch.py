@@ -927,6 +927,80 @@ def detect(pdf_bytes, page_index, zoom=None):
         polys = keep
     except Exception:
         pass
+    # COLOR-FILL READER (Avita's real language, seen in the gold overlay: siding drawn
+    # as SATURATED COLOR FILLS — teal=SFC-1, lavender=SFC-2; her rectangles hug those
+    # areas). Gray fills were always read; colored ones were ignored. Rasterize fill
+    # paths per color → connected regions = walls, grouped by color (bucket siblings).
+    if conf:
+        try:
+            import numpy as np, cv2
+            from collections import defaultdict
+            dcf = fitz.open(stream=pdf_bytes, filetype="pdf")
+            pgc = dcf[page_index]
+            rotc = pgc.rotation_matrix
+            CW = 1200
+            CH = max(1, int(CW * H / max(1, W)))
+            sxc, syc = CW / W, CH / H
+            by_col = {}
+            for d in pgc.get_drawings():
+                f = d.get("fill")
+                if not f or len(f) < 3:
+                    continue
+                if max(f[:3]) - min(f[:3]) < 0.10:
+                    continue                          # gray/white/black — not a color fill
+                key = "%.2f,%.2f,%.2f" % (f[0], f[1], f[2])
+                if key not in by_col:
+                    by_col[key] = (np.zeros((CH, CW), np.uint8), list(f[:3]))
+                m = by_col[key][0]
+                for it in d.get("items") or []:
+                    if it[0] == "re":
+                        r = it[1]
+                        cs = [(r.x0, r.y0), (r.x1, r.y0), (r.x1, r.y1), (r.x0, r.y1)]
+                        pp = [fitz.Point(X, Y) * rotc for X, Y in cs]
+                        cv2.fillPoly(m, [np.array([[int(p.x * sxc), int(p.y * syc)] for p in pp], np.int32)], 1)
+                cur = []
+                for it in d.get("items") or []:
+                    if it[0] == "l":
+                        p1 = fitz.Point(it[1]) * rotc
+                        cur.append((p1.x, p1.y))
+                if len(cur) >= 3:
+                    cv2.fillPoly(m, [np.array([[int(x * sxc), int(y * syc)] for x, y in cur], np.int32)], 1)
+            dcf.close()
+            for key, (m, rgb) in by_col.items():
+                cnts, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                for c in cnts:
+                    a_pt2 = cv2.contourArea(c) / (sxc * syc)
+                    sfc_ = a_pt2 * ft_pt * ft_pt
+                    if sfc_ < 40 or sfc_ > 20000:
+                        continue                      # legend chips are tiny; junk giants out
+                    eps = 0.006 * cv2.arcLength(c, True)
+                    ap = cv2.approxPolyDP(c, max(1.5, eps), True).reshape(-1, 2)
+                    if len(ap) < 3:
+                        continue
+                    normc = [[round(float(x) / sxc / W, 5), round(float(y) / syc / H, 5)] for x, y in ap]
+                    # virgin territory: never double-count a wall another reader measured
+                    nx0 = min(q[0] for q in normc); nx1 = max(q[0] for q in normc)
+                    ny0 = min(q[1] for q in normc); ny1 = max(q[1] for q in normc)
+                    clash = False
+                    for pex in polys:
+                        exs = [q[0] for q in pex["points"]]; eys = [q[1] for q in pex["points"]]
+                        ix = min(nx1, max(exs)) - max(nx0, min(exs))
+                        iy = min(ny1, max(eys)) - max(ny0, min(eys))
+                        if ix > 0 and iy > 0 and ix * iy > 0.3 * max(1e-9, (nx1 - nx0) * (ny1 - ny0)):
+                            clash = True
+                            break
+                    if clash:
+                        continue
+                    cxc = round(sum(q[0] for q in normc) / len(normc), 5)
+                    cyc = round(sum(q[1] for q in normc) / len(normc), 5)
+                    polys.append({"points": normc, "area_sf": round(sfc_, 1), "cx": cxc, "cy": cyc,
+                                  "fill_color": rgb, "source": "vector",
+                                  "material": f"Color fill ({key})",
+                                  "category": f"Color fill ({key})",
+                                  "group": f"Color fill ({key})", "sf_exact": True,
+                                  "holes": [], "label": f"~{round(sfc_):,} SF"})
+        except Exception:
+            pass
     # TAG-SEEDED AUTO-BUCKET (Avita convention: siding bands drawn BLANK, material only
     # a repeated legend tag). Flood from each repeated tag within structural barriers →
     # the labeled band. Virgin territory only; textless pages no-op (Fleet canary safe).
