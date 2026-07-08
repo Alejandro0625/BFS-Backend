@@ -760,9 +760,113 @@ def detect(pdf_bytes, page_index, zoom=None):
         polys = out_split[:MAX_REGIONS]
     except Exception:
         pass
+    # MATERIAL-TAG SPLIT (benchmark finding, 26-088: side-1|mt-5 walls are both drawn as
+    # 3in courses — geometry CANNOT split same-pattern different-material walls, but the
+    # architect TAGS each wall with its finish code and the estimator names walls BY those
+    # tags). Read short codes (MT-5, SIDE-1, B-1...) inside each face; ≥2 distinct tag
+    # territories → split at midlines snapped to structural lines, name pieces by tag.
+    # Flattened sets (Fleet) have no text → automatic no-op → canary safe.
+    try:
+        polys = _tag_split(pdf_bytes, page_index, polys, snapx, W, H)
+    except Exception:
+        pass
     for i, p in enumerate(polys):
         p["id"] = i
     return polys, W, H, {"ft_per_in": round(sc, 3), "scale_confirmed": conf}
+
+
+_TAG_RE = None
+
+
+def _tag_split(pdf_bytes, page_index, polys, snapx, W, H):
+    """Split faces at material-tag territories. Tags = short letter+digit codes
+    ("MT-5", "SIDE-1", "B2") — grid bubbles (single chars) and dimensions never match."""
+    global _TAG_RE
+    import re as _re
+    if _TAG_RE is None:
+        _TAG_RE = _re.compile(r"^[A-Za-z]{1,6}[-–]?\d{1,2}$")
+    doc_t = fitz.open(stream=pdf_bytes, filetype="pdf")
+    pg_t = doc_t[page_index]
+    words = []
+    try:
+        for w in pg_t.get_text("words"):
+            t = (w[4] or "").strip().rstrip(".,;:")
+            if 2 <= len(t) <= 8 and _TAG_RE.match(t) and any(c.isalpha() for c in t) \
+               and any(c.isdigit() for c in t):
+                words.append(((w[0] + w[2]) / 2, (w[1] + w[3]) / 2, t.upper()))
+    except Exception:
+        pass
+    doc_t.close()
+    if len(words) < 2:
+        return polys
+    from shapely.geometry import Polygon as _P, Point as _Pt, LineString as _LS
+    from shapely.ops import split as _split
+    out = []
+    for p in polys:
+        try:
+            poly = _P([(x * W, y * H) for x, y in p["points"]]).buffer(0)
+            if poly.is_empty:
+                out.append(p); continue
+            inside = [(x, y, t) for (x, y, t) in words if poly.contains(_Pt(x, y))]
+            tags = sorted(set(t for _, _, t in inside))
+            if len(tags) < 2:
+                if len(tags) == 1 and not p.get("named_by_tag"):
+                    q = dict(p); q["material"] = q["category"] = q["group"] = tags[0]
+                    q["named_by_tag"] = True
+                    out.append(q); continue
+                out.append(p); continue
+            # territories along x: cluster tag words by tag, cut at midpoints between
+            # adjacent DIFFERENT-tag clusters, snapped to the nearest structural line
+            cl = {}
+            for (x, y, t) in inside:
+                cl.setdefault(t, []).append(x)
+            marks = sorted((sum(v) / len(v), t) for t, v in cl.items())
+            cuts = []
+            for (xa, ta), (xb, tb) in zip(marks, marks[1:]):
+                if ta == tb or xb - xa < 40:
+                    continue
+                mid = (xa + xb) / 2
+                near = [s for s in snapx if xa + 8 < s < xb - 8]
+                cut = min(near, key=lambda s: abs(s - mid)) if near else mid
+                cuts.append(cut)
+            if not cuts:
+                out.append(p); continue
+            pieces = [poly]
+            x0b, y0b, x1b, y1b = poly.bounds
+            for cx_ in cuts[:6]:
+                nxt = []
+                for q_ in pieces:
+                    try:
+                        nxt.extend(list(_split(q_, _LS([(cx_, y0b - 5), (cx_, y1b + 5)])).geoms))
+                    except Exception:
+                        nxt.append(q_)
+                pieces = nxt
+            pieces = [q_ for q_ in pieces if q_.geom_type == "Polygon" and q_.area >= 0.04 * poly.area]
+            if len(pieces) < 2:
+                out.append(p); continue
+            total = sum(q_.area for q_ in pieces)
+            for q_ in pieces:
+                ring = list(q_.exterior.coords)[:-1]
+                pts = [[round(px / W, 5), round(py / H, 5)] for px, py in ring]
+                # name each piece by ITS tags (majority inside)
+                mine = [t for (x, y, t) in inside if q_.contains(_Pt(x, y))]
+                name = max(set(mine), key=mine.count) if mine else p.get("material", "")
+                holes = [h for h in (p.get("holes") or [])
+                         if q_.contains(_Pt(sum(a[0] for a in h) / len(h) * W,
+                                             sum(a[1] for a in h) / len(h) * H))]
+                nq = dict(p)
+                nq["points"] = pts
+                nq["area_sf"] = round(p.get("area_sf", 0) * q_.area / total, 1)
+                nq["holes"] = holes
+                nq["material"] = nq["category"] = nq["group"] = name
+                nq["named_by_tag"] = True
+                nq["label"] = f"~{round(nq['area_sf']):,} SF"
+                xs = [a for a, _ in pts]; ys = [b for _, b in pts]
+                nq["cx"] = round(sum(xs) / len(xs), 5); nq["cy"] = round(sum(ys) / len(ys), 5)
+                out.append(nq)
+        except Exception:
+            out.append(p)
+    return out
 
 
 def piece_signature(segs_disp, pts_disp, W, H):
