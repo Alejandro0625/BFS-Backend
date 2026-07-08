@@ -398,6 +398,36 @@ def split_face_at_joints(pg, pts_norm, holes_norm, area_sf, W, H, click_norm, ft
                     for q in parts:
                         out_.extend(_split_piece(q, depth + 1))
                     return out_
+            # PROJECTION EVIDENCE: drafters break a joint line at window bands — but a
+            # heavy joint drawn immediately ABOVE and BELOW this piece at the same x
+            # continues through it (the estimator extends it by eye). ≥25pt of heavy
+            # ink within 90pt on BOTH sides = a joint candidate even with no ink inside.
+            from collections import defaultdict as _dd
+            agg = _dd(lambda: [0.0, 0.0, False, False])
+            for (c, lo, hi, wdp) in vs:
+                if wdp < 1.0 or not (x0 + 12 < c < x1 - 12):
+                    continue
+                a_ = max(0.0, min(hi, y0) - max(lo, y0 - 60))
+                b_ = max(0.0, min(hi, y1 + 60) - max(lo, y1))
+                if a_ > 0 or b_ > 0:
+                    k = round(c / 3)
+                    agg[k][0] += a_; agg[k][1] += b_
+                    if a_ > 0 and hi >= y0 - 8:
+                        agg[k][2] = True       # ink resumes AT the piece edge above
+                    if b_ > 0 and lo <= y1 + 8:
+                        agg[k][3] = True       # ...and at the edge below
+            for k in sorted(agg, key=lambda kk: -(agg[kk][0] + agg[kk][1])):
+                a_, b_, ta_, tb_ = agg[k]
+                # a REAL interrupted joint touches both edges of the interruption;
+                # depth-limited so children don't cascade on weaker brackets
+                if a_ < 25 or b_ < 25 or not ta_ or not tb_ or depth > 1:
+                    continue
+                parts = _try_line(p_, LineString([(k * 3.0, y0 - 10), (k * 3.0, y1 + 10)]))
+                if parts:
+                    out_ = []
+                    for q in parts:
+                        out_.extend(_split_piece(q, depth + 1))
+                    return out_
             for y, sp, w, cov in phy[:10]:
                 ext = _width_at(p_, y)
                 if ext < 18 or cov < _JOINT_COVER * ext:
