@@ -453,6 +453,19 @@ def process(jid, pdf_bytes):
             auto_flags = []
             page_levels = []
             if auto:
+                # SOFFIT/RETURN SENTINEL — the historical money-loser was FORGETTING these
+                # (they hide in section views where area readers don't reach). If the sheet
+                # mentions them, the takeoff refuses to let them be forgotten.
+                try:
+                    _t = (pg.get_text() or "").upper()
+                    _hits = [k for k in ("SOFFIT", "CANOPY", "RETURN") if k in _t]
+                    if _hits:
+                        auto_flags.append("⚠ " + "/".join(h.title() + "s" for h in _hits) +
+                                          " on this job — often drawn in SECTION views the auto-read"
+                                          " doesn't measure yet. Verify their SF before bidding"
+                                          " (missed soffits/returns have cost real money).")
+                except Exception:
+                    pass
                 auto_flags.append("Read from the drawing's pattern vectors — confirm which walls are in your scope"
                                   if auto_engine == "vector" else "AI suggestion — verify SF before bidding")
                 if not scale_conf:
