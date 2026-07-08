@@ -794,6 +794,67 @@ def detect(pdf_bytes, page_index, zoom=None):
         polys = out_split[:MAX_REGIONS]
     except Exception:
         pass
+    # PATTERN-EXTENT TRIM (the owner's rule: "the overlay goes over the PATTERN"): the
+    # estimator's highlight hugs where the courses/seams actually stop; our pieces can
+    # include blank margin past the last course (664/989 bands ran +11-13% over). Clip
+    # each pattern piece to its own hairline-ink extent (+4pt). TRIM-ONLY — the SF can
+    # shrink toward the drawn pattern, never grow.
+    if conf:
+        try:
+            from shapely.geometry import Polygon as _P2, Point as _Pt2, box as _box
+            hair_v, hair_h = [], []
+            for d in (fitz.open(stream=pdf_bytes, filetype="pdf")[page_index]).get_drawings():
+                wd = d.get("width") or 0
+                col = d.get("color")
+                if wd >= 0.7 or (col is not None and len(col) >= 3 and sum(col[:3]) / 3 >= 0.66):
+                    continue
+                for it in d.get("items") or []:
+                    if it[0] != "l":
+                        continue
+                    p0 = fitz.Point(it[1]) * rot; p1 = fitz.Point(it[2]) * rot
+                    dx, dy = abs(p1.x - p0.x), abs(p1.y - p0.y)
+                    if dy >= 6 and dx <= 1.5:
+                        hair_v.append(((p0.x + p1.x) / 2, min(p0.y, p1.y), max(p0.y, p1.y)))
+                    elif dx >= 6 and dy <= 1.5:
+                        hair_h.append(((p0.y + p1.y) / 2, min(p0.x, p1.x), max(p0.x, p1.x)))
+            for p in polys:
+                grp = (p.get("group") or p.get("material") or "")
+                if grp.startswith("Panel wall"):
+                    continue             # plain fills have no pattern to trim to
+                try:
+                    poly = _P2([(x * W, y * H) for x, y in p["points"]]).buffer(0)
+                    if poly.is_empty:
+                        continue
+                    xs, ys = [], []
+                    for (x, lo, hi) in hair_v:
+                        if poly.contains(_Pt2(x, (lo + hi) / 2)):
+                            xs.append(x); ys += [lo, hi]
+                    for (y, lo, hi) in hair_h:
+                        if poly.contains(_Pt2((lo + hi) / 2, y)):
+                            ys.append(y); xs += [lo, hi]
+                    if len(xs) < 4 or len(ys) < 4:
+                        continue
+                    ext = _box(min(xs) - 4, min(ys) - 4, max(xs) + 4, max(ys) + 4)
+                    clipped = poly.intersection(ext)
+                    if clipped.geom_type == "MultiPolygon":
+                        clipped = max(clipped.geoms, key=lambda g: g.area)
+                    if clipped.geom_type != "Polygon" or clipped.is_empty or \
+                       clipped.area < 0.5 * poly.area or clipped.area >= 0.995 * poly.area:
+                        continue
+                    ring = list(clipped.exterior.coords)[:-1]
+                    p["points"] = [[round(px / W, 5), round(py / H, 5)] for px, py in ring]
+                    hole_pt2 = 0.0
+                    for h in (p.get("holes") or []):
+                        try:
+                            hole_pt2 += abs(_P2([(qq[0] * W, qq[1] * H) for qq in h]).area)
+                        except Exception:
+                            pass
+                    p["area_sf"] = round(max(0.0, clipped.area - hole_pt2) * ft_pt * ft_pt, 1)
+                    p["label"] = f"~{round(p['area_sf']):,} SF"
+                except Exception:
+                    pass
+        except Exception:
+            pass
     # MATERIAL-TAG SPLIT (benchmark finding, 26-088: side-1|mt-5 walls are both drawn as
     # 3in courses — geometry CANNOT split same-pattern different-material walls, but the
     # architect TAGS each wall with its finish code and the estimator names walls BY those
