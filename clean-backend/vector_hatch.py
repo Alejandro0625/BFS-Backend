@@ -17,7 +17,7 @@ import fitz
 import texture  # reuse the robust scale reader
 
 MIN_SF = 100          # REVERTED: 30 let junk specks become stepping stones that chained welds
-MAX_REGIONS = 40      # across the sheet into one sprawling blob (user-caught regression)
+MAX_REGIONS = 80      # across the sheet into one sprawling blob (user-caught regression)
 SMALL_MIN_SF = 30     # small faces (30-100 SF) survive ONLY via the discriminator below:
 SMALL_ADOPT_GAP = 0.06  # same pattern as a BIG face AND bbox within 6% of the sheet of that
                         # big face DIRECTLY (never small-to-small — no stepping-stone chains)
@@ -1017,9 +1017,40 @@ def detect(pdf_bytes, page_index, zoom=None):
                     polys.append({"points": normc, "area_sf": round(sfc_, 1), "cx": cxc, "cy": cyc,
                                   "fill_color": rgb, "source": "vector",
                                   "material": cname, "category": cname,
-                                  "group": cname, "sf_exact": True,
+                                  "group": cname, "sf_exact": True, "_colorpiece": True,
                                   "holes": [], "named_by_tag": bool(col_names.get(key)),
                                   "label": f"~{round(sfc_):,} SF"})
+        except Exception:
+            pass
+        # HER WALLS ARE PER-STORY: split color pieces at structural joints (the same
+        # senior-estimator splitter) — a two-story teal area becomes two walls, geometric SF
+        try:
+            import snap_fill as _sf4
+            d3 = fitz.open(stream=pdf_bytes, filetype="pdf")
+            pg3 = d3[page_index]
+            out_c = []
+            for p in polys:
+                if not p.pop("_colorpiece", False):
+                    out_c.append(p)
+                    continue
+                try:
+                    sp = _sf4.split_face_at_joints(pg3, p["points"], [], p.get("area_sf", 0),
+                                                   W, H, None, ft_pt=ft_pt, filter_empty=False)
+                except Exception:
+                    sp = None
+                if not sp or not sp[1] or len(sp[1]) < 2:
+                    out_c.append(p)
+                    continue
+                for piece in sp[1]:
+                    q = dict(p)
+                    q["points"] = piece["points"]
+                    q["area_sf"] = piece["area_sf"]
+                    q["label"] = f"~{round(piece['area_sf']):,} SF"
+                    xs4 = [x for x, _ in piece["points"]]; ys4 = [y for _, y in piece["points"]]
+                    q["cx"] = round(sum(xs4) / len(xs4), 5); q["cy"] = round(sum(ys4) / len(ys4), 5)
+                    out_c.append(q)
+            d3.close()
+            polys = out_c
         except Exception:
             pass
     # TAG-SEEDED AUTO-BUCKET (Avita convention: siding bands drawn BLANK, material only
@@ -1031,6 +1062,14 @@ def detect(pdf_bytes, page_index, zoom=None):
             newp = _sf3.tag_seed_fill(pdf_bytes, page_index,
                                       [p["points"] for p in polys],
                                       max_new=max(0, MAX_REGIONS - len(polys)))
+            _STOPN = {"FLOOR", "LEGEND", "BLDG", "SET", "OF", "GT", "TYP", "SIM", "REF",
+                      "LOWER", "LEVEL", "ROOF", "RIDGE", "MAX", "MIN", "GRADE", "TO",
+                      "SCALE", "PLAN", "ELEV", "NOTE", "NOTES"}
+            for p in (newp or []):
+                if (p.get("material") or "").upper() in _STOPN:
+                    # a drafting word seeded the fill — the AREA may be real, the NAME is not
+                    p["material"] = p["category"] = p["group"] = "Wall area (confirm)"
+                    p.pop("named_by_tag", None)
             if newp:
                 polys += newp
         except Exception:
