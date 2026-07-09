@@ -1205,6 +1205,10 @@ def detect(pdf_bytes, page_index, zoom=None):
     # from her gold: polygon = gross module box, SF = net of window-shaped holes).
     # Gates: page must carry a raster underlay (>=25% image coverage) — pure-vector
     # sheets (Fleet/Danbury) no-op; virgin territory only; scale-confirmed pages only.
+    # (Un-gating for unconfirmed photo sheets was TRIED 2026-07-09 and reverted: real
+    # photos don't segment into clean hue families — 26-195 stayed 0/19 while adding
+    # junk risk. Photo-sheet takeoff = its own future detector class; his convention
+    # there = 1/8" default scale, walls traced on the photo itself.)
     if conf:
         try:
             polys += _rendered_color_regions(pdf_bytes, page_index, polys, W, H, ft_pt,
@@ -1450,19 +1454,32 @@ def _rendered_color_regions(pdf_bytes, page_index, polys, W, H, ft_pt, max_new=4
                 if len(ap) < 3:
                     continue
                 norm = [[round((float(px) + x) / Wp, 5), round((float(py) + y) / Hp, 5)] for px, py in ap]
-                # virgin territory: never re-measure a wall another reader owns
+                # virgin territory: never re-measure a wall another reader owns — EXCEPT
+                # anonymous junk floods ('Wall area (confirm)' = tag seeds whose name was
+                # a drafting word): a color-measured module with her conventions beats an
+                # anonymous flood, so the rc piece REPLACES those (never named/color/train
+                # /soffit pieces).
                 nx0 = min(q[0] for q in norm); nx1 = max(q[0] for q in norm)
                 ny0 = min(q[1] for q in norm); ny1 = max(q[1] for q in norm)
                 clash = False
+                replaceable = []
                 for pex in polys + out:
                     exs = [q[0] for q in pex["points"]]; eys = [q[1] for q in pex["points"]]
                     ix = min(nx1, max(exs)) - max(nx0, min(exs))
                     iy = min(ny1, max(eys)) - max(ny0, min(eys))
                     if ix > 0 and iy > 0 and ix * iy > 0.3 * max(1e-9, (nx1 - nx0) * (ny1 - ny0)):
-                        clash = True
-                        break
+                        if (pex.get("material") == "Wall area (confirm)") and pex not in out:
+                            replaceable.append(pex)
+                        else:
+                            clash = True
+                            break
                 if clash:
                     continue
+                for pex in replaceable:
+                    try:
+                        polys.remove(pex)
+                    except ValueError:
+                        pass
                 gname = f"Rendered color {h0}-{h0+15}deg"
                 out.append({"points": norm, "area_sf": round(sf, 1),
                             "cx": round((nx0 + nx1) / 2, 5), "cy": round((ny0 + ny1) / 2, 5),
