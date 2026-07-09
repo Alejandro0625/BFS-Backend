@@ -1358,7 +1358,9 @@ def _rendered_color_regions(pdf_bytes, page_index, polys, W, H, ft_pt, max_new=4
     Hc = hsv[:, :, 0].astype(np.int16)
     S = hsv[:, :, 1].astype(np.float32) / 255.0
     V = hsv[:, :, 2].astype(np.float32) / 255.0
-    colored = ((S >= 0.10) & (S <= 0.75) & (V >= 0.45) & (V <= 0.99)).astype(np.uint8)
+    # V floor 0.28 (was 0.45): woodtone/dark-stained sidings render dark (26-162 lap
+    # V med 0.30, S 0.35) — saturation still fences out grays/shadows/linework
+    colored = ((S >= 0.10) & (S <= 0.75) & (V >= 0.28) & (V <= 0.99)).astype(np.uint8)
     del hsv, S, V
     out = []
     for h0 in range(0, 180, 15):
