@@ -1162,6 +1162,36 @@ def detect(pdf_bytes, page_index, zoom=None):
                     p["material"] = p["category"] = p["group"] = "Wall area (confirm)"
                     p.pop("named_by_tag", None)
             if newp:
+                # tag-seeded floods can swallow several walls (26-183: an EP12 flood of
+                # 1,218sf contains his 291sf ACM soffit) — run the same structural joint
+                # splitter color pieces get, geometric SF per piece
+                try:
+                    d6 = fitz.open(stream=pdf_bytes, filetype="pdf")
+                    pg6 = d6[page_index]
+                    split6 = []
+                    for p in newp:
+                        sp6 = None
+                        try:
+                            sp6 = _sf3.split_face_at_joints(pg6, p["points"], [],
+                                                            p.get("area_sf", 0), W, H, None,
+                                                            ft_pt=ft_pt, filter_empty=False)
+                        except Exception:
+                            sp6 = None
+                        if not sp6 or not sp6[1] or len(sp6[1]) < 2:
+                            split6.append(p)
+                            continue
+                        for piece in sp6[1]:
+                            q = dict(p)
+                            q["points"] = piece["points"]
+                            q["area_sf"] = piece["area_sf"]
+                            q["label"] = f"~{round(piece['area_sf']):,} SF"
+                            xs6 = [x for x, _ in piece["points"]]; ys6 = [y for _, y in piece["points"]]
+                            q["cx"] = round(sum(xs6) / len(xs6), 5); q["cy"] = round(sum(ys6) / len(ys6), 5)
+                            split6.append(q)
+                    d6.close()
+                    newp = split6
+                except Exception:
+                    pass
                 polys += newp
         except Exception:
             pass
