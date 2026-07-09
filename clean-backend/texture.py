@@ -52,6 +52,29 @@ def _consensus(cands):
 
 
 _SCALE_CACHE = {}
+_DOC_SCALES = {}      # doc-fingerprint -> {page: (scale, (W,H))} of NON-inherited confident reads
+
+
+def _doc_key(doc):
+    try:
+        import hashlib
+        return (doc.page_count, hashlib.md5(doc[0].read_contents()[:2048]).hexdigest())
+    except Exception:
+        return None
+
+
+def _register_scale(doc, pi, scale):
+    dk = _doc_key(doc)
+    if dk is None:
+        return
+    try:
+        r = doc[pi].rect
+        size = (round(r.width), round(r.height))
+    except Exception:
+        size = None
+    _DOC_SCALES.setdefault(dk, {})[pi] = (scale, size)
+    if len(_DOC_SCALES) > 200:
+        _DOC_SCALES.clear()
 
 
 def _read_scale(doc, pi):
@@ -59,7 +82,12 @@ def _read_scale(doc, pi):
     Source chain — the drawing states its scale three ways, take the first that speaks
     with confidence: (1) page/annot TEXT scale note; (2) the drawing's own DIMENSION
     STRINGS (its built-in ruler — covers sheets whose note lives elsewhere); (3) OCR of
-    the title-block strips (flattened sets draw the note as curves). confirmed=False →
+    the title-block strips (flattened sets draw the note as curves); (4) SET CONSENSUS
+    INHERITANCE — a page with NO scale evidence of its own inherits the value every
+    confident same-size sibling page of the SAME document agrees on (26-068 p6: the
+    printed note was an annotation, gone on blank sets; its siblings all read 3/16").
+    A page with ANY conflicting local evidence (ambiguous text cands, its own dim
+    scale) never inherits — mixed-scale detail sheets stay flagged. confirmed=False →
     caller must FLAG (never trust a defaulted SF)."""
     txt = ""
     try:
@@ -75,6 +103,7 @@ def _read_scale(doc, pi):
     if cands:
         best, confirmed = _consensus(cands)
         if confirmed:
+            _register_scale(doc, pi, best)
             return best, True
     # cache the expensive fallbacks per page CONTENT (bucket clicks re-enter constantly;
     # content-hash key so two different jobs can never share a cached scale)
@@ -84,7 +113,27 @@ def _read_scale(doc, pi):
     except Exception:
         key = None
     if key is not None and key in _SCALE_CACHE:
-        return _SCALE_CACHE[key]
+        cached = _SCALE_CACHE[key]
+        if cached[1]:
+            _register_scale(doc, pi, cached[0])
+            return cached
+        if not cands:
+            # unconfirmed cache entry: siblings may have registered since — retry the
+            # cheap inheritance check before returning the stale default
+            try:
+                dk = _doc_key(doc)
+                sibs = _DOC_SCALES.get(dk) or {}
+                r = doc[pi].rect
+                size = (round(r.width), round(r.height))
+                vals = {round(s, 4) for p, (s, sz) in sibs.items()
+                        if p != pi and sz == size}
+                if len(vals) == 1:
+                    fresh = (vals.pop(), True)
+                    _SCALE_CACHE[key] = fresh
+                    return fresh
+            except Exception:
+                pass
+        return cached
     result = None
     # (2) dimension strings: "24'-0\"" drawn over a measurable line IS the scale
     try:
@@ -92,6 +141,7 @@ def _read_scale(doc, pi):
         ds = dim_scale.sheet_scale(doc[pi])
         if ds:
             result = (round(ds[0] * 72.0, 4), True)
+            _register_scale(doc, pi, result[0])
     except Exception:
         pass
     # (3) OCR the title block (textless/flattened sets)
@@ -104,6 +154,23 @@ def _read_scale(doc, pi):
                     best, confirmed = _consensus(oc)
                     if confirmed:
                         result = (best, True)
+                        _register_scale(doc, pi, best)
+        except Exception:
+            pass
+    # (4) SET CONSENSUS INHERITANCE — only when this page has ZERO local evidence
+    # (no text cands, no dim scale, no OCR): every confident same-size sibling of
+    # this doc must agree on ONE value. Inherited pages are never re-registered as
+    # sources (no snowballing).
+    if result is None and not cands:
+        try:
+            dk = _doc_key(doc)
+            sibs = _DOC_SCALES.get(dk) or {}
+            r = doc[pi].rect
+            size = (round(r.width), round(r.height))
+            vals = {round(s, 4) for p, (s, sz) in sibs.items()
+                    if p != pi and sz == size}
+            if len(vals) == 1:
+                result = (vals.pop(), True)
         except Exception:
             pass
     if result is None:
