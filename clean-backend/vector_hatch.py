@@ -348,6 +348,32 @@ def _collect_rects(pg):
     return rects[:6000]
 
 
+def view_boxes(geo, W, H):
+    """Partition a multi-view sheet into its drawing-view blocks by clustering the ink.
+    Band/story logic must run PER VIEW — story lines stitched across separate elevation
+    views created phantom walls (band-detector v1 lesson)."""
+    try:
+        import numpy as np, cv2
+        GS = 48.0
+        gw, gh = int(W / GS) + 2, int(H / GS) + 2
+        m = np.zeros((gh, gw), np.uint8)
+        for (x1, y1, x2, y2) in (geo.get("segs") or [])[:30000]:
+            mx, my = int((x1 + x2) / 2 / GS), int((y1 + y2) / 2 / GS)
+            if 0 <= my < gh and 0 <= mx < gw:
+                m[my, mx] = 1
+        m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
+        n, lab, stats, _ = cv2.connectedComponentsWithStats(m)
+        out = []
+        for i in range(1, n):
+            x, y, w, h, area = stats[i]
+            if area < 10:
+                continue                 # note blocks / stray ticks
+            out.append((x * GS, y * GS, (x + w) * GS, (y + h) * GS))
+        return out
+    except Exception:
+        return []
+
+
 def page_geometry(pg):
     """One-pass page geometry for opening detection (display coords): rectangles + segments."""
     segs = []
@@ -1051,6 +1077,63 @@ def detect(pdf_bytes, page_index, zoom=None):
                     out_c.append(q)
             d3.close()
             polys = out_c
+        except Exception:
+            pass
+    # BAND DETECTOR v2 — PER VIEW (v1 lesson: story lines stitch across separate views).
+    # Within one drawing view: the zone between consecutive story lines, between outline
+    # verticals, CONTAINING a window (junk gate) and not already covered = a wall band.
+    if conf:
+        try:
+            import snap_fill as _sf5
+            db = fitz.open(stream=pdf_bytes, filetype="pdf")
+            pgb = db[page_index]
+            vsh, hsh, _vh5, _hh5, _o5 = _sf5._heavy_lines(pgb)
+            db.close()
+            win_rects = [(r[0], r[1], r[2], r[3]) for r in (geo.get("rects") or [])
+                         if 8 <= (r[2] - r[0]) <= 200 and 8 <= (r[3] - r[1]) <= 200]
+            def _covered_b(x0b, y0b, x1b, y1b):
+                for pex in polys:
+                    exs = [q[0] * W for q in pex["points"]]; eys = [q[1] * H for q in pex["points"]]
+                    ix = min(x1b, max(exs)) - max(x0b, min(exs))
+                    iy = min(y1b, max(eys)) - max(y0b, min(eys))
+                    if ix > 0 and iy > 0 and ix * iy > 0.25 * (x1b - x0b) * (y1b - y0b):
+                        return True
+                return False
+            added_b = 0
+            for (vx0, vy0, vx1, vy1) in view_boxes(geo, W, H):
+                vw, vh_ = vx1 - vx0, vy1 - vy0
+                if vw < 120 or vh_ < 80 or vx0 > 0.82 * W:
+                    continue             # skip note blocks and the title-block strip
+                vhs = [(c, lo, hi, wd) for (c, lo, hi, wd) in hsh if vy0 <= c <= vy1]
+                vvs = [(c, lo, hi, wd) for (c, lo, hi, wd) in vsh if vx0 <= c <= vx1]
+                story = sorted(y for (y, sp, wd, cov) in
+                               _sf5._joint_positions(vhs, vx0, vx1, 0.35 * vw))
+                outl = sorted(x for (x, sp, wd, cov) in
+                              _sf5._joint_positions(vvs, vy0, vy1, 0.35 * vh_))
+                for ya, yb in zip(story, story[1:]):
+                    bh = yb - ya
+                    if not (3.0 <= bh * ft_pt <= 16.0):
+                        continue
+                    for xa, xb in zip(outl, outl[1:]):
+                        bw = xb - xa
+                        if bw * ft_pt < 6.0 or added_b >= 12:
+                            continue
+                        wins = [w for w in win_rects
+                                if xa < (w[0] + w[2]) / 2 < xb and ya < (w[1] + w[3]) / 2 < yb]
+                        if not wins or _covered_b(xa, ya, xb, yb):
+                            continue
+                        sfb = bw * bh * ft_pt * ft_pt
+                        if not (40 <= sfb <= 2500):
+                            continue
+                        normb = [[round(xa / W, 5), round(ya / H, 5)], [round(xb / W, 5), round(ya / H, 5)],
+                                 [round(xb / W, 5), round(yb / H, 5)], [round(xa / W, 5), round(yb / H, 5)]]
+                        polys.append({"points": normb, "area_sf": round(sfb, 1),
+                                      "cx": round((xa + xb) / 2 / W, 5), "cy": round((ya + yb) / 2 / H, 5),
+                                      "fill_color": [0.55, 0.75, 0.95], "source": "vector",
+                                      "material": "Wall band (confirm)", "category": "Wall band (confirm)",
+                                      "group": "Wall band (confirm)", "sf_exact": True,
+                                      "holes": [], "label": f"~{round(sfb):,} SF"})
+                        added_b += 1
         except Exception:
             pass
     # TAG-SEEDED AUTO-BUCKET (Avita convention: siding bands drawn BLANK, material only
