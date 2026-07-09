@@ -557,6 +557,34 @@ def tag_seed_fill(pdf_bytes, page_index, avoid_polys, max_new=40):
     from collections import Counter
     cnt = Counter(t for _, _, t in words)
     seeds = [(x, y, t) for (x, y, t) in words if cnt[t] >= 3]
+    # LEADER-FOLLOWING SEEDS (Avita p5, Fenn: strips are UNFILLED — the tag points at
+    # its wall via a leader line). Follow each tag's leader to the tip; seed THERE.
+    try:
+        pgl = doc[page_index]
+        rotl = pgl.rotation_matrix
+        lsegs = []
+        for dd in pgl.get_drawings():
+            for it in dd.get("items") or []:
+                if it[0] != "l":
+                    continue
+                p1 = fitz.Point(it[1]); p2 = fitz.Point(it[2])
+                L = ((p1.x - p2.x) ** 2 + (p1.y - p2.y) ** 2) ** 0.5
+                if 20 <= L <= 320:
+                    lsegs.append((p1.x, p1.y, p2.x, p2.y))
+        for (wx, wy, t) in words:
+            if cnt[t] >= 3:
+                continue                          # already direct-seeded
+            for (ax, ay, bx, by) in lsegs:
+                da = ((ax - wx) ** 2 + (ay - wy) ** 2) ** 0.5
+                db = ((bx - wx) ** 2 + (by - wy) ** 2) ** 0.5
+                if min(da, db) > 18:
+                    continue                      # leader must START at the tag
+                tx2, ty2 = (bx, by) if da < db else (ax, ay)
+                tipd = fitz.Point(tx2, ty2) * rotl
+                seeds.append((tx2, ty2, t))
+                break
+    except Exception:
+        pass
     if not seeds:
         doc.close()
         return []
