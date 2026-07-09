@@ -583,6 +583,22 @@ def tag_seed_fill(pdf_bytes, page_index, avoid_polys, max_new=40):
                 tipd = fitz.Point(tx2, ty2) * rotl
                 seeds.append((tx2, ty2, t))
                 break
+        # SOFFIT/CANOPY leader seeds (the historical money-loser: these labels ALWAYS
+        # point at their surface via a leader — follow it, never seed at the label)
+        soff = []
+        for w in pgl.get_text("words"):
+            tt = (w[4] or "").strip().upper()
+            if "SOFFIT" in tt or "CANOPY" in tt:
+                soff.append(((w[0] + w[2]) / 2, (w[1] + w[3]) / 2))
+        for (wx, wy) in soff:
+            for (ax, ay, bx, by) in lsegs:
+                da = ((ax - wx) ** 2 + (ay - wy) ** 2) ** 0.5
+                db = ((bx - wx) ** 2 + (by - wy) ** 2) ** 0.5
+                if min(da, db) > 24:
+                    continue
+                tx2, ty2 = (bx, by) if da < db else (ax, ay)
+                seeds.append((tx2, ty2, "Soffit/canopy (confirm)"))
+                break
     except Exception:
         pass
     if not seeds:
