@@ -17,7 +17,9 @@ import fitz
 import texture  # reuse the robust scale reader
 
 MIN_SF = 100          # REVERTED: 30 let junk specks become stepping stones that chained welds
-MAX_REGIONS = 80      # across the sheet into one sprawling blob (user-caught regression)
+MAX_REGIONS = 120     # 80 capped out on 113-wall multifamily sheets (Avita p3/p4: real walls
+                      # were budget-starved); sprawl-era risks are held by the anti-sprawl
+                      # guard + per-reader gates, not the cap
 SMALL_MIN_SF = 30     # small faces (30-100 SF) survive ONLY via the discriminator below:
 SMALL_ADOPT_GAP = 0.06  # same pattern as a BIG face AND bbox within 6% of the sheet of that
                         # big face DIRECTLY (never small-to-small — no stepping-stone chains)
@@ -1197,6 +1199,18 @@ def detect(pdf_bytes, page_index, zoom=None):
                 polys += newp
         except Exception:
             pass
+    # RENDERED-ELEVATION COLOR READER (Avita p4/p5 language: sheets are tiled-JPEG
+    # underlays — the siding exists ONLY as image pixels, invisible to get_drawings
+    # forever. Segment saturated hue families in the RENDER; her convention measured
+    # from her gold: polygon = gross module box, SF = net of window-shaped holes).
+    # Gates: page must carry a raster underlay (>=25% image coverage) — pure-vector
+    # sheets (Fleet/Danbury) no-op; virgin territory only; scale-confirmed pages only.
+    if conf:
+        try:
+            polys += _rendered_color_regions(pdf_bytes, page_index, polys, W, H, ft_pt,
+                                             max_new=max(0, MAX_REGIONS - len(polys)))
+        except Exception:
+            pass
     # EXTEND-TO-GRADE — DISABLED after failing its gates (2026-07-08). The convention is
     # real (his west wall: fill stops at the base drip y1381, he measures to grade
     # y1408) but the west grade line is mostly LIGHT/hidden ink (~200pt heavy of 607
@@ -1304,6 +1318,166 @@ def detect(pdf_bytes, page_index, zoom=None):
     for i, p in enumerate(polys):
         p["id"] = i
     return polys, W, H, {"ft_per_in": round(sc, 3), "scale_confirmed": conf}
+
+
+def _rendered_color_regions(pdf_bytes, page_index, polys, W, H, ft_pt, max_new=40):
+    """Read siding drawn as RENDERED color (tiled-image underlay sheets, Avita profile).
+    HSV-mask saturated pixels -> 15-degree hue families -> connected components ->
+    white-column module splitting -> piece shape = hole-filled outline (her gross box),
+    SF = filled minus WINDOW-SHAPED holes only (her net; trim/text islands are wall).
+    Measured against her Avita gold: p3 41/42, p4 47/51, p5 18/20 found."""
+    import numpy as np, cv2
+    if max_new <= 0:
+        return []
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    try:
+        pg = doc[page_index]
+        # gate: the sheet must BE a raster underlay — pure-vector CAD no-ops here
+        img_area = 0.0
+        try:
+            for im in pg.get_images(full=True):
+                for r in pg.get_image_rects(im[0]):
+                    img_area += max(0, r.width) * max(0, r.height)
+        except Exception:
+            pass
+        if img_area < 0.25 * W * H:
+            return []
+        z = 4000.0 / max(W, H)
+        pix = pg.get_pixmap(matrix=fitz.Matrix(z, z))
+        img = np.frombuffer(pix.samples, np.uint8).reshape(pix.height, pix.width, pix.n)
+        if pix.n == 4:
+            img = cv2.cvtColor(img, cv2.COLOR_RGBA2RGB)
+        elif pix.n == 1:
+            return []
+        img = img[:, :, :3]
+    finally:
+        doc.close()
+    Hp, Wp = img.shape[:2]
+    ftpx = ft_pt / z                     # ft per point / px per point = ft per px
+    hsv = cv2.cvtColor(img, cv2.COLOR_RGB2HSV)
+    Hc = hsv[:, :, 0].astype(np.int16)
+    S = hsv[:, :, 1].astype(np.float32) / 255.0
+    V = hsv[:, :, 2].astype(np.float32) / 255.0
+    colored = ((S >= 0.10) & (S <= 0.75) & (V >= 0.45) & (V <= 0.99)).astype(np.uint8)
+    del hsv, S, V
+    out = []
+    for h0 in range(0, 180, 15):
+        if len(out) >= max_new:
+            break
+        fam = ((colored > 0) & (Hc >= h0) & (Hc < h0 + 15)).astype(np.uint8)
+        if int(fam.sum()) < 0.0004 * Hp * Wp:
+            continue
+        # representative color of the family (for the UI fill)
+        ys_f, xs_f = np.where(fam > 0)
+        samp = img[ys_f[::max(1, len(ys_f) // 500)], xs_f[::max(1, len(xs_f) // 500)]]
+        rgb = [round(float(c) / 255.0, 3) for c in samp.mean(axis=0)] if len(samp) else [0.6, 0.6, 0.4]
+        m = cv2.morphologyEx(fam, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
+        ncc, lbl, stats, _ = cv2.connectedComponentsWithStats(m, connectivity=8)
+        for ci in range(1, ncc):
+            if len(out) >= max_new:
+                break
+            a = stats[ci, cv2.CC_STAT_AREA]
+            if not (25 <= a * ftpx * ftpx <= 3500):
+                continue
+            x, y, w, h = stats[ci, 0], stats[ci, 1], stats[ci, 2], stats[ci, 3]
+            # title-block / margin strip: not building
+            if x / Wp > 0.86 or y / Hp > 0.92:
+                continue
+            comp = (lbl[y:y + h, x:x + w] == ci).astype(np.uint8)
+            subs = [comp]
+            if w > h * 1.6:
+                # split merged modules at white trim columns (her walls end at trim boards)
+                colf = comp.sum(axis=0) / float(h)
+                gaps = colf < 0.04
+                cuts = []
+                i = 0
+                while i < w:
+                    if gaps[i]:
+                        j = i
+                        while j < w and gaps[j]:
+                            j += 1
+                        if j - i >= 4 and i > 6 and w - j > 6:
+                            cuts.append((i, j))
+                        i = j
+                    else:
+                        i += 1
+                if cuts:
+                    subs = []
+                    prev = 0
+                    for (i, j) in cuts:
+                        seg = np.zeros_like(comp); seg[:, prev:i] = comp[:, prev:i]
+                        if seg.sum():
+                            subs.append(seg)
+                        prev = j
+                    seg = np.zeros_like(comp); seg[:, prev:] = comp[:, prev:]
+                    if seg.sum():
+                        subs.append(seg)
+            for sub in subs:
+                if len(out) >= max_new:
+                    break
+                if float(sub.sum()) * ftpx * ftpx < 25:
+                    continue
+                ff = sub.copy()
+                msk = np.zeros((h + 2, w + 2), np.uint8)
+                cv2.floodFill(ff, msk, (0, 0), 2)
+                filled = (sub | ((ff != 2) & (sub == 0)).astype(np.uint8))
+                holes_m = (filled & (sub == 0)).astype(np.uint8)
+                nh, hl, hstats, _ = cv2.connectedComponentsWithStats(holes_m, connectivity=8)
+                ded = 0.0
+                holes_norm = []
+                for hi in range(1, nh):
+                    ha = hstats[hi, cv2.CC_STAT_AREA]
+                    hw, hh2 = hstats[hi, 2], hstats[hi, 3]
+                    hsf = ha * ftpx * ftpx
+                    if hsf >= 5 and ha >= 0.35 * hw * hh2 and 0.15 <= hw / max(1, hh2) <= 6:
+                        ded += hsf
+                        hx, hy = hstats[hi, 0] + x, hstats[hi, 1] + y
+                        holes_norm.append([[round(hx / Wp, 5), round(hy / Hp, 5)],
+                                           [round((hx + hw) / Wp, 5), round(hy / Hp, 5)],
+                                           [round((hx + hw) / Wp, 5), round((hy + hh2) / Hp, 5)],
+                                           [round(hx / Wp, 5), round((hy + hh2) / Hp, 5)]])
+                gross = float(filled.sum()) * ftpx * ftpx
+                sf = gross - ded
+                if not (35 <= sf <= 2500):
+                    continue
+                cnts, _ = cv2.findContours(filled, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                if not cnts:
+                    continue
+                c = max(cnts, key=cv2.contourArea)
+                ap = cv2.approxPolyDP(c, 0.008 * cv2.arcLength(c, True), True).reshape(-1, 2)
+                if len(ap) < 3:
+                    continue
+                norm = [[round((float(px) + x) / Wp, 5), round((float(py) + y) / Hp, 5)] for px, py in ap]
+                # virgin territory: never re-measure a wall another reader owns
+                nx0 = min(q[0] for q in norm); nx1 = max(q[0] for q in norm)
+                ny0 = min(q[1] for q in norm); ny1 = max(q[1] for q in norm)
+                clash = False
+                for pex in polys + out:
+                    exs = [q[0] for q in pex["points"]]; eys = [q[1] for q in pex["points"]]
+                    ix = min(nx1, max(exs)) - max(nx0, min(exs))
+                    iy = min(ny1, max(eys)) - max(ny0, min(eys))
+                    if ix > 0 and iy > 0 and ix * iy > 0.3 * max(1e-9, (nx1 - nx0) * (ny1 - ny0)):
+                        clash = True
+                        break
+                if clash:
+                    continue
+                gname = f"Rendered color {h0}-{h0+15}deg"
+                out.append({"points": norm, "area_sf": round(sf, 1),
+                            "cx": round((nx0 + nx1) / 2, 5), "cy": round((ny0 + ny1) / 2, 5),
+                            "fill_color": rgb, "source": "vector",
+                            "material": "Rendered siding (confirm)",
+                            "category": "Rendered siding (confirm)",
+                            "group": gname, "sf_exact": True,
+                            "holes": holes_norm,
+                            "label": f"~{round(sf):,} SF",
+                            "sf_calc": {"gross_sf": round(gross, 1),
+                                        "openings_sf": round(ded, 1),
+                                        "net_sf": round(sf, 1),
+                                        "n_openings": len(holes_norm),
+                                        "w_ft": round(w * ftpx, 1),
+                                        "h_ft": round(h * ftpx, 1),
+                                        "basis": "rendered colors @ 1\"=%g'" % round(ft_pt * 72, 2)}})
+    return out
 
 
 def _pattern_gap_openings(poly, hair_v, hair_h, existing_holes, W, H, ft_pt,
