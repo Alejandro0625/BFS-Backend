@@ -1064,7 +1064,8 @@ def detect(pdf_bytes, page_index, zoom=None):
                                       max_new=max(0, MAX_REGIONS - len(polys)))
             _STOPN = {"FLOOR", "LEGEND", "BLDG", "SET", "OF", "GT", "TYP", "SIM", "REF",
                       "LOWER", "LEVEL", "ROOF", "RIDGE", "MAX", "MIN", "GRADE", "TO",
-                      "SCALE", "PLAN", "ELEV", "NOTE", "NOTES"}
+                      "SCALE", "PLAN", "ELEV", "NOTE", "NOTES", "THE", "OD", "ID", "AND", "FOR", "PER",
+                      "SEE", "ALL", "MAY", "TRIM", "FASC", "HORIZ", "VERT", "SIM", "TYPE"}
             for p in (newp or []):
                 if (p.get("material") or "").upper() in _STOPN:
                     # a drafting word seeded the fill — the AREA may be real, the NAME is not
