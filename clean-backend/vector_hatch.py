@@ -1104,8 +1104,15 @@ def detect(pdf_bytes, page_index, zoom=None):
                 vw, vh_ = vx1 - vx0, vy1 - vy0
                 if vw < 120 or vh_ < 80 or vx0 > 0.82 * W:
                     continue             # skip note blocks and the title-block strip
+                # residential story lines are drawn LIGHT (trim boards) — admit light
+                # stitched horizontals as story candidates too (window+covered gates and
+                # the 3-16ft band height filter keep lap courses and junk out)
                 vhs = [(c, lo, hi, wd) for (c, lo, hi, wd) in hsh if vy0 <= c <= vy1]
+                vhs += [(c, lo, hi, 0.9) for (c, lo, hi) in _hh5
+                        if vy0 <= c <= vy1 and (hi - lo) >= 0.35 * vw]
                 vvs = [(c, lo, hi, wd) for (c, lo, hi, wd) in vsh if vx0 <= c <= vx1]
+                vvs += [(c, lo, hi, 0.9) for (c, lo, hi) in _vh5
+                        if vx0 <= c <= vx1 and (hi - lo) >= 0.30 * vh_]
                 story = sorted(y for (y, sp, wd, cov) in
                                _sf5._joint_positions(vhs, vx0, vx1, 0.35 * vw))
                 outl = sorted(x for (x, sp, wd, cov) in
