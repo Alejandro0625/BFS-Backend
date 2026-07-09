@@ -836,7 +836,8 @@ def detect(pdf_bytes, page_index, zoom=None):
             from shapely.geometry import Polygon as _P2, Point as _Pt2, box as _box
             hair_v, hair_h = [], []
             all_v, all_h = [], []        # ANY weight — door jambs are drawn heavier than hairlines
-            for d in (fitz.open(stream=pdf_bytes, filetype="pdf")[page_index]).get_drawings():
+            _dtrim = fitz.open(stream=pdf_bytes, filetype="pdf")   # AUDIT FIX: was leaked
+            for d in _dtrim[page_index].get_drawings():
                 wd = d.get("width") or 0
                 col = d.get("color")
                 if col is not None and len(col) >= 3 and sum(col[:3]) / 3 >= 0.66:
@@ -854,6 +855,7 @@ def detect(pdf_bytes, page_index, zoom=None):
                         all_h.append(((p0.y + p1.y) / 2, min(p0.x, p1.x), max(p0.x, p1.x)))
                         if wd < 0.7:
                             hair_h.append(all_h[-1])
+            _dtrim.close()
             for p in polys:
                 grp = (p.get("group") or p.get("material") or "")
                 if grp.startswith("Panel wall"):
