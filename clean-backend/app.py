@@ -464,6 +464,14 @@ def process(jid, pdf_bytes):
                                           " on this job — often drawn in SECTION views the auto-read"
                                           " doesn't measure yet. Verify their SF before bidding"
                                           " (missed soffits/returns have cost real money).")
+                    # REWORK-CASCADE sentinel (93 Bennington loss: 'REMOVE AND REFABRICATE
+                    # panels that INTERFACE with the shifted wall' — scope written in notes,
+                    # never measured). Rework verbs = scope beyond the highlighted limits.
+                    if any(k in _t for k in ("REFABRICATE", "REMOVE AND REINSTALL", "REWORK",
+                                             "LIMITS OF WORK")):
+                        auto_flags.append("⚠ REWORK job — notes extend scope beyond the marked"
+                                          " limits (interfacing panels, returns, make-good)."
+                                          " Read every note on this sheet before pricing.")
                 except Exception:
                     pass
                 auto_flags.append("Read from the drawing's pattern vectors — confirm which walls are in your scope"
