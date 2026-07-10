@@ -481,6 +481,20 @@ def process(jid, pdf_bytes):
                     auto_flags.append("Scale could not be read on this sheet — calibrate before trusting SF (SF may be off several ×)")
                 else:
                     auto_flags.append(f"Scale read as 1\"={scale_val}' — verify")
+                # PER-VIEW SCALES (owner rule: never measure at a scale the drawing didn't
+                # state): pieces re-measured at their view's own printed scale say so; a
+                # piece in an AMBIGUOUS multi-scale zone is flagged, never silently priced.
+                try:
+                    n_vs = sum(1 for p in polys if p.get("view_scale"))
+                    if n_vs:
+                        vss = sorted({p["view_scale"] for p in polys if p.get("view_scale")})
+                        auto_flags.append(f"✓ {n_vs} region(s) measured at their view's own printed scale "
+                                          + ", ".join(f"1\"={v}'" for v in vss))
+                    if any(p.get("scale_risk") for p in polys):
+                        auto_flags.append("⚠ Multiple view scales printed near some regions — verify those "
+                                          "SF against the view's own scale before pricing")
+                except Exception:
+                    pass
                 # ELEVATION MARKERS (blueprint 1a): "T.O. STEEL 139'-0\"" texts give exact heights.
                 # When ≥2 markers agree they yield the sheet's TRUE vertical scale — the strongest
                 # possible check. Conservative: only speaks when the fit has real consensus.
