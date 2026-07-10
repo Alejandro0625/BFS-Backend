@@ -132,6 +132,10 @@ def _train_regions(pg, axis, chain=False):
     RX = max(abs(c1.x), abs(c2.x))
     RY = max(abs(c1.y), abs(c2.y))
     lines.sort()
+    # (Duplicate-stroke collapse was TRIED 2026-07-10 for 26-191A's 1pt double-stroke
+    # courses and REVERTED: it moved the Fleet canary (7749->7736/6452->6466) and cost
+    # a Danbury money wall while NOT capturing the target band — the band's failure is
+    # downstream of line clustering. Off-by-one-band capture needs a different design.)
     n = len(lines)
     parent = list(range(n))
 
@@ -1160,9 +1164,14 @@ def detect(pdf_bytes, page_index, zoom=None):
                       "LOWER", "LEVEL", "ROOF", "RIDGE", "MAX", "MIN", "GRADE", "TO",
                       "SCALE", "PLAN", "ELEV", "NOTE", "NOTES", "THE", "OD", "ID", "AND", "FOR", "PER",
                       "SEE", "ALL", "MAY", "TRIM", "FASC", "HORIZ", "VERT", "SIM", "TYPE"}
+            import re as _re6
             for p in (newp or []):
-                if (p.get("material") or "").upper() in _STOPN:
-                    # a drafting word seeded the fill — the AREA may be real, the NAME is not
+                mat6 = (p.get("material") or "").upper()
+                # a drafting word seeded the fill — the AREA may be real, the NAME is not.
+                # Single-letter+digit tags are SCHEDULE marks (W2=window, S2=storefront,
+                # L3=louver, grid bubbles A1/B2 — 26-191A named whole bands "W2"), never
+                # material names; real material keys carry 2+ letters (SF-1, MP_1, SS-2, EF1).
+                if mat6 in _STOPN or _re6.match(r"^[A-Z][-–_]?\d{1,2}$", mat6):
                     p["material"] = p["category"] = p["group"] = "Wall area (confirm)"
                     p.pop("named_by_tag", None)
             if newp:
