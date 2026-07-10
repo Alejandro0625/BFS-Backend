@@ -1328,9 +1328,92 @@ def detect(pdf_bytes, page_index, zoom=None):
                     pass
         except Exception:
             pass
+    # PER-VIEW SCALES (owner directive: never measure at a scale the drawing didn't
+    # state). Multi-view sheets print each view's own scale under its title (Q1
+    # BUILDING ELEVATION / 1/8"=1'-0"; details at 3/4"). Rule measured on Avita p5:
+    # a piece rescales ONLY when EVERY scale anchor below it agrees — any ambiguity
+    # (a neighboring detail's anchor in range) leaves the piece at page scale with a
+    # scale_risk flag instead of silently inventing a number. Perspective views
+    # ("3D VIEW") are never measurable — their pieces are dropped.
+    try:
+        polys = _apply_view_scales(pdf_bytes, page_index, polys, W, H, sc)
+    except Exception:
+        pass
     for i, p in enumerate(polys):
         p["id"] = i
     return polys, W, H, {"ft_per_in": round(sc, 3), "scale_confirmed": conf}
+
+
+def _apply_view_scales(pdf_bytes, page_index, polys, W, H, page_scale):
+    import texture as _tx
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    try:
+        pg = doc[page_index]
+        rot = pg.rotation_matrix
+        rows = {}
+        for w in pg.get_text("words"):
+            p = fitz.Point((w[0] + w[2]) / 2, (w[1] + w[3]) / 2) * rot
+            rows.setdefault(round(p.y / 6), []).append((p.x, p.y, (w[4] or "").strip()))
+    finally:
+        doc.close()
+    if not rows:
+        return polys
+    anchors = []
+    for k in sorted(rows):
+        ws = sorted(rows[k])
+        txt = " ".join(t for _, _, t in ws)
+        cands = _tx._parse_scale_text(txt)
+        if not cands:
+            continue
+        best, confd = _tx._consensus(cands)
+        if not confd:
+            continue
+        xs = [x for x, _, _ in ws]
+        ay = sum(y for _, y, _ in ws) / len(ws)
+        # view title often sits on the row above the scale note — carry it for the
+        # perspective test
+        above = " ".join(t for _, _, t in rows.get(k - 1, [])) + " " + \
+                " ".join(t for _, _, t in rows.get(k - 2, [])) + " " + txt
+        anchors.append((sum(xs) / len(xs), ay, best, above.upper()))
+    if not anchors:
+        return polys
+    diff = any(abs(s - page_scale) > 0.01 * page_scale for _, _, s, _ in anchors)
+    persp = any(("3D" in t or "PERSPECTIVE" in t or "ISOMETRIC" in t or "AXONOMET" in t)
+                for _, _, _, t in anchors)
+    if not diff and not persp:
+        return polys                       # single-scale sheet, nothing to do
+    keep = []
+    for p in polys:
+        xs = [x * W for x, _ in p["points"]]; ys = [y * H for _, y in p["points"]]
+        px0, px1, py1 = min(xs), max(xs), max(ys)
+        pw = px1 - px0
+        below = [(ay - py1, s, t) for (ax, ay, s, t) in anchors
+                 if ay >= py1 - 8 and (px0 - 0.6 * pw - 60) <= ax <= (px1 + 0.6 * pw + 60)
+                 and (ay - py1) <= 0.35 * H]
+        if not below:
+            keep.append(p)
+            continue
+        below.sort()
+        vals = {round(s, 4) for _, s, _ in below}
+        if len(vals) > 1:
+            p["scale_risk"] = True         # ambiguous view zone — verify, never invent
+            keep.append(p)
+            continue
+        d0, s0, t0 = below[0]
+        if "3D" in t0 or "PERSPECTIVE" in t0 or "ISOMETRIC" in t0 or "AXONOMET" in t0:
+            continue                       # perspective views are not measurable — drop
+        if abs(s0 - page_scale) > 0.01 * page_scale:
+            f2 = (s0 / page_scale) ** 2
+            p["area_sf"] = round(p["area_sf"] * f2, 1)
+            p["label"] = f"~{round(p['area_sf']):,} SF"
+            p["view_scale"] = s0
+            if p.get("sf_calc"):
+                for kk in ("gross_sf", "openings_sf", "net_sf"):
+                    if kk in p["sf_calc"]:
+                        p["sf_calc"][kk] = round(p["sf_calc"][kk] * f2, 1)
+                p["sf_calc"]["basis"] = "view scale 1\"=%g'" % round(s0, 2)
+        keep.append(p)
+    return keep
 
 
 def _rendered_color_regions(pdf_bytes, page_index, polys, W, H, ft_pt, max_new=40):
