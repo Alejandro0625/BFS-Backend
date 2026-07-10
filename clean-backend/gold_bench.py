@@ -17,6 +17,12 @@ MAX_PAGES = 6          # per doc — elevations live early in elevation-only fil
 MAX_MB = 60
 
 def gold_walls(pg):
+    """EXAM v2 (2026-07-10, per the 11-job gold audit): two contamination filters —
+    (1) 'AREA'/'Area Measurement' subjects are whole-floor GFA takeoffs, not walls
+    (26-205A: 4 of 6 golds were GFA polygons, one duplicated verbatim);
+    (2) identical polygons marked multiple times count ONCE, keeping the material-
+    named copy (26-031: same polygon marked as Area + FC + sheathing).
+    v1 baseline for comparison: 379 walls / found 177 / covered 167 / money 127."""
     W, H = pg.rect.width, pg.rect.height
     rot = pg.rotation_matrix
     out = []
@@ -30,13 +36,28 @@ def gold_walls(pg):
         sf = float(m.group(1).replace(",", ""))
         if sf < 40 or sf > 60000:
             continue
+        sub = (a.info.get("subject") or "").strip()
+        su = sub.upper()
+        if su == "AREA" or "AREA MEASUREMENT" in su:
+            continue                      # GFA / generic area — not a wall
         pts = []
         for v in a.vertices:
             vx, vy = (v[0], v[1]) if isinstance(v, (list, tuple)) else (v.x, v.y)
             p = fitz.Point(vx, vy) * rot
             pts.append((p.x / W, p.y / H))
-        out.append({"pts": pts, "sf": sf, "mat": (a.info.get("subject") or "").strip()[:30]})
-    return out
+        out.append({"pts": pts, "sf": sf, "mat": sub[:30]})
+    # dedupe identical polygons (same rounded vertex set) — keep the material-named copy
+    seen = {}
+    dedup = []
+    for g in out:
+        key = tuple(sorted((round(x, 4), round(y, 4)) for x, y in g["pts"]))
+        prev = seen.get(key)
+        if prev is None:
+            seen[key] = len(dedup)
+            dedup.append(g)
+        elif not _MATWORD.search(dedup[prev]["mat"] or "") and _MATWORD.search(g["mat"] or ""):
+            dedup[prev] = g               # replace the generic copy with the named one
+    return dedup
 
 _MATWORD = re.compile(r"panel|siding|lap\b|brick|eifs|metal|mtl|fiber|cement|stone|masonr|acm|pnl|side-|shake|board|batten|veneer|stucco|hardi|cedar|alum|corrug|soffit|azek|nichiha", re.I)
 
