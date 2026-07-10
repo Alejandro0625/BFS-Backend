@@ -1032,19 +1032,42 @@ def detect(pdf_bytes, page_index, zoom=None):
                     if len(ap) < 3:
                         continue
                     normc = [[round(float(x) / sxc / W, 5), round(float(y) / syc / H, 5)] for x, y in ap]
-                    # virgin territory: never double-count a wall another reader measured
+                    # virgin territory: never double-count a wall another reader measured —
+                    # EXCEPT anonymous junk floods ('Wall area (confirm)'): a drawn color
+                    # fill is the sheet's own statement of the material extent and beats
+                    # an unnamed flood (26-179: datum-named floods blocked the keynote
+                    # bands the reader had already built). Same rule the rc reader ships.
                     nx0 = min(q[0] for q in normc); nx1 = max(q[0] for q in normc)
                     ny0 = min(q[1] for q in normc); ny1 = max(q[1] for q in normc)
                     clash = False
+                    repl_c = []
+                    ca = max(1e-9, (nx1 - nx0) * (ny1 - ny0))
                     for pex in polys:
                         exs = [q[0] for q in pex["points"]]; eys = [q[1] for q in pex["points"]]
-                        ix = min(nx1, max(exs)) - max(nx0, min(exs))
-                        iy = min(ny1, max(eys)) - max(ny0, min(eys))
-                        if ix > 0 and iy > 0 and ix * iy > 0.3 * max(1e-9, (nx1 - nx0) * (ny1 - ny0)):
+                        ex0, ex1 = min(exs), max(exs); ey0, ey1 = min(eys), max(eys)
+                        ix = min(nx1, ex1) - max(nx0, ex0)
+                        iy = min(ny1, ey1) - max(ny0, ey0)
+                        if ix <= 0 or iy <= 0 or ix * iy <= 0.3 * ca:
+                            continue
+                        mat_e = pex.get("material") or ""
+                        ea = max(1e-9, (ex1 - ex0) * (ey1 - ey0))
+                        mutual = (ix * iy > 0.7 * ca) and (ix * iy > 0.7 * ea)
+                        if mat_e == "Wall area (confirm)" or \
+                           (mat_e.startswith("Panel wall") and mutual):
+                            # the gray fill is the BACKING of this colored band (mutual
+                            # cover) — the color IS the material statement, gray yields.
+                            # Gray fills without a color twin (Fleet) are never touched.
+                            repl_c.append(pex)
+                        else:
                             clash = True
                             break
                     if clash:
                         continue
+                    for pex in repl_c:
+                        try:
+                            polys.remove(pex)
+                        except ValueError:
+                            pass
                     cxc = round(sum(q[0] for q in normc) / len(normc), 5)
                     cyc = round(sum(q[1] for q in normc) / len(normc), 5)
                     cname = col_names.get(key) or f"Color fill ({key})"
@@ -1171,7 +1194,10 @@ def detect(pdf_bytes, page_index, zoom=None):
                 # Single-letter+digit tags are SCHEDULE marks (W2=window, S2=storefront,
                 # L3=louver, grid bubbles A1/B2 — 26-191A named whole bands "W2"), never
                 # material names; real material keys carry 2+ letters (SF-1, MP_1, SS-2, EF1).
-                if mat6 in _STOPN or _re6.match(r"^[A-Z][-–_]?\d{1,2}$", mat6):
+                if mat6 in _STOPN or _re6.match(r"^[A-Z][-–_]?\d{1,2}$", mat6) \
+                        or _re6.search(r"\b[BT]\.?O\.?\b", mat6):
+                    # datum/level phrases ("3 B.O. DECK - LOW", "T.O. WALL") are
+                    # elevation markers, never materials (26-179 named whole bands by them)
                     p["material"] = p["category"] = p["group"] = "Wall area (confirm)"
                     p.pop("named_by_tag", None)
             if newp:
@@ -1337,6 +1363,19 @@ def detect(pdf_bytes, page_index, zoom=None):
     # ("3D VIEW") are never measurable — their pieces are dropped.
     try:
         polys = _apply_view_scales(pdf_bytes, page_index, polys, W, H, sc)
+    except Exception:
+        pass
+    # SOURCE-AGNOSTIC junk-name pass: whatever reader named a piece, a name that is a
+    # schedule mark (W2), a grid bubble (A1), or a datum phrase (3 B.O. DECK - LOW,
+    # T.O. WALL) is never a material — keep the area, make the name honest (which also
+    # makes the piece replaceable by color/rc readers).
+    try:
+        import re as _re9
+        for p in polys:
+            m9 = (p.get("material") or "").upper()
+            if _re9.match(r"^[A-Z][-–_]?\d{1,2}$", m9) or _re9.search(r"\b[BT]\.?O\.?\b", m9):
+                p["material"] = p["category"] = p["group"] = "Wall area (confirm)"
+                p.pop("named_by_tag", None)
     except Exception:
         pass
     for i, p in enumerate(polys):
