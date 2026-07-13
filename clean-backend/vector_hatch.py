@@ -957,6 +957,7 @@ def detect(pdf_bytes, page_index, zoom=None):
                 p = dict(p); p["area_sf"] = round(p["area_sf"] * (1 - ov), 1)
                 p["label"] = f"~{round(p['area_sf']):,} SF"
             covered |= m
+            p["_mid_dedup"] = True       # early pieces: the final pass must never re-shave
             keep.append(p)
         polys = keep
     except Exception:
@@ -1365,6 +1366,64 @@ def detect(pdf_bytes, page_index, zoom=None):
         polys = _apply_view_scales(pdf_bytes, page_index, polys, W, H, sc)
     except Exception:
         pass
+    # FINAL OVERLAP DEDUP — LATE PIECES ONLY (26-204 corpus finding: the mid-pipeline
+    # shave runs before the color/rc/tag readers append, so late pieces could STACK —
+    # a 73sf wall collected a flood + two identical color pieces = 172sf). Early
+    # pieces (_mid_dedup) are the untouchable baseline: re-shaving them double-counts
+    # the shave (first attempt moved the Fleet canary — reverted to this form). Late
+    # pieces dedup against the baseline AND each other: >90% covered = duplicate.
+    try:
+        import numpy as np, cv2
+        MW9 = 900
+        MH9 = max(1, int(MW9 * H / max(1, W)))
+        covered9 = np.zeros((MH9, MW9), np.uint8)
+        early9 = [p for p in polys if p.get("_mid_dedup")]
+        late9 = [p for p in polys if not p.get("_mid_dedup")]
+        for p in early9:
+            cnt9 = np.array([[int(x * MW9), int(y * MH9)] for x, y in p["points"]], np.int32)
+            cv2.fillPoly(covered9, [cnt9], 1)
+        keep9 = list(early9)
+        kept_late9 = []                    # (group, bbox) of admitted late pieces
+        def _bb9(p):
+            xs = [x for x, _ in p["points"]]; ys = [y for _, y in p["points"]]
+            return (min(xs), min(ys), max(xs), max(ys))
+        for p in sorted(late9, key=lambda q: -q.get("area_sf", 0)):
+            cnt9 = np.array([[int(x * MW9), int(y * MH9)] for x, y in p["points"]], np.int32)
+            m9 = np.zeros((MH9, MW9), np.uint8)
+            cv2.fillPoly(m9, [cnt9], 1)
+            a9 = int(m9.sum())
+            if a9 == 0:
+                continue
+            bb = _bb9(p)
+            # TRUE DUPLICATE = a TWIN: same group, near-identical bbox (26-204's
+            # doubled color fill). A nested module inside its parent band is NOT a
+            # duplicate — dropping those lost 2 Avita walls. Twins only.
+            twin = False
+            for (g9, ob) in kept_late9:
+                if g9 != (p.get("group") or ""):
+                    continue
+                ix = min(bb[2], ob[2]) - max(bb[0], ob[0])
+                iy = min(bb[3], ob[3]) - max(bb[1], ob[1])
+                if ix <= 0 or iy <= 0:
+                    continue
+                inter = ix * iy
+                union = (bb[2]-bb[0])*(bb[3]-bb[1]) + (ob[2]-ob[0])*(ob[3]-ob[1]) - inter
+                if inter / max(union, 1e-12) >= 0.8:
+                    twin = True
+                    break
+            if twin:
+                continue
+            ov9 = int((m9 & covered9).sum()) / a9
+            if 0.25 < ov9 <= 0.9:
+                p = dict(p)
+                p["area_sf"] = round(p.get("area_sf", 0) * (1 - ov9), 1)
+                p["label"] = f"~{round(p['area_sf']):,} SF"
+            covered9 |= m9
+            kept_late9.append(((p.get("group") or ""), bb))
+            keep9.append(p)
+        polys = keep9
+    except Exception:
+        pass
     # SOURCE-AGNOSTIC junk-name pass: whatever reader named a piece, a name that is a
     # schedule mark (W2), a grid bubble (A1), or a datum phrase (3 B.O. DECK - LOW,
     # T.O. WALL) is never a material — keep the area, make the name honest (which also
@@ -1379,6 +1438,7 @@ def detect(pdf_bytes, page_index, zoom=None):
     except Exception:
         pass
     for i, p in enumerate(polys):
+        p.pop("_mid_dedup", None)
         p["id"] = i
     return polys, W, H, {"ft_per_in": round(sc, 3), "scale_confirmed": conf}
 
