@@ -620,6 +620,7 @@ def tag_seed_fill(pdf_bytes, page_index, avoid_polys, max_new=40):
             cv2.fillPoly(taken, [cnt2], 1)
         except Exception:
             pass
+    ink_cc = None                                     # lazy: labeled ink-density components
     out = []
     for (tx, ty, tag) in seeds:
         if len(out) >= max_new:
@@ -640,8 +641,34 @@ def tag_seed_fill(pdf_bytes, page_index, avoid_polys, max_new=40):
         cv2.floodFill(ff, mask, (int(px), int(py)), 2)
         region = (ff == 2).astype(np.uint8)
         frac = int(region.sum()) / (H * W)
+        if (frac > 0.08 or frac < 2e-5) and tag == "Soffit/canopy (confirm)":
+            # HATCH-CLAIM (26-213A RCP class): a soffit label pointing INTO dense
+            # cross-hatch — the barrier flood dies inside hatch (leak/speck). Claim
+            # the connected INK-DENSITY component at the tip instead.
+            if ink_cc is None:
+                ink = _linework(img)
+                # DENSITY mask, not dilation: hatch fill is DENSE ink; walls/leaders are
+                # sparse lines — dilation glued the hatch to the whole drawing (one giant
+                # CC, sprawl-rejected on 213A). Box-density self-bounds at the hatch edge.
+                dens = cv2.boxFilter(ink.astype(np.float32), -1, (25, 25))
+                ink_cc = cv2.connectedComponents((dens > 0.22).astype(np.uint8),
+                                                 connectivity=8)[1]
+            lab = ink_cc[py, px]
+            if lab == 0:
+                y0n, x0n = max(0, py - 10), max(0, px - 10)
+                win = ink_cc[y0n:py + 10, x0n:px + 10]
+                labs = win[win > 0]
+                lab = int(labs[0]) if len(labs) else 0
+            if lab > 0:
+                region = (ink_cc == lab).astype(np.uint8)
+                region = cv2.morphologyEx(region, cv2.MORPH_CLOSE, np.ones((9, 9), np.uint8))
+                frac = int(region.sum()) / (H * W)
         if frac > 0.08 or frac < 2e-5:
             continue                                  # leaked or speck
+        # anti-sprawl: a claimed region may never span most of the sheet
+        rys, rxs = np.where(region > 0)
+        if len(rxs) and (rxs.max() - rxs.min()) > 0.55 * W and (rys.max() - rys.min()) > 0.55 * H:
+            continue
         if int((region & taken).sum()) > 0.2 * int(region.sum()):
             continue                                  # someone else's wall
         sf = int(region.sum()) * ftpx * ftpx
