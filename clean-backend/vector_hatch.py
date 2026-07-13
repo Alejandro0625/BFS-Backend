@@ -1556,19 +1556,31 @@ def _rendered_color_regions(pdf_bytes, page_index, polys, W, H, ft_pt, max_new=4
     # V floor 0.28 (was 0.45): woodtone/dark-stained sidings render dark (26-162 lap
     # V med 0.30, S 0.35) — saturation still fences out grays/shadows/linework
     colored = ((S >= 0.10) & (S <= 0.75) & (V >= 0.28) & (V <= 0.99)).astype(np.uint8)
+    # GRAY value-band families (Regdate giant class: FC-2A panels are deliberate
+    # mid-gray S=0.00 V 0.44-0.66 — 35 of p34's 59 unfound walls). Saturation-zero
+    # pixels banded by VALUE; paper-white (V>0.85) and linework-black stay excluded.
+    # GRAY FAMILY v3 — EVIDENCE-BASED (debug dump 2026-07-12, Regdate p34 + Avita p3):
+    # true gray walls are SMALL modules 26-200sf at V-median 0.5-0.73; junk is DARK
+    # (V<=0.46 — all 15 of Avita p3's junk grays), BIG (447-1779sf roofs), or THIN
+    # lines (aspect>50). One mask, V 0.47-0.80; per-component gates below (size cap,
+    # aspect); gray pieces get NO replacement power (v1's eviction cost Avita walls).
+    fams = [("h", h0, ((colored > 0) & (Hc >= h0) & (Hc < h0 + 15)))
+            for h0 in range(0, 180, 15)]
+    fams.append(("g", 0, ((S < 0.08) & (V >= 0.47) & (V <= 0.80))))
     del hsv, S, V
     out = []
-    for h0 in range(0, 180, 15):
+    for _fk, h0, fam_b in fams:
         if len(out) >= max_new:
             break
-        fam = ((colored > 0) & (Hc >= h0) & (Hc < h0 + 15)).astype(np.uint8)
+        fam = fam_b.astype(np.uint8)
         if int(fam.sum()) < 0.0004 * Hp * Wp:
             continue
         # representative color of the family (for the UI fill)
         ys_f, xs_f = np.where(fam > 0)
         samp = img[ys_f[::max(1, len(ys_f) // 500)], xs_f[::max(1, len(xs_f) // 500)]]
         rgb = [round(float(c) / 255.0, 3) for c in samp.mean(axis=0)] if len(samp) else [0.6, 0.6, 0.4]
-        m = cv2.morphologyEx(fam, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
+        m = cv2.morphologyEx(fam, cv2.MORPH_CLOSE,
+                             np.ones((7, 7) if _fk == "g" else (3, 3), np.uint8))
         ncc, lbl, stats, _ = cv2.connectedComponentsWithStats(m, connectivity=8)
         for ci in range(1, ncc):
             if len(out) >= max_new:
@@ -1577,6 +1589,11 @@ def _rendered_color_regions(pdf_bytes, page_index, polys, W, H, ft_pt, max_new=4
             if not (25 <= a * ftpx * ftpx <= 3500):
                 continue
             x, y, w, h = stats[ci, 0], stats[ci, 1], stats[ci, 2], stats[ci, 3]
+            if _fk == "g":
+                # gray evidence gates: thin lines are borders/leaders; the size test
+                # moved to the hole test below (walls have window holes, roofs don't)
+                if max(w, h) > 20 * max(1, min(w, h)):
+                    continue
             # title-block / margin strip: not building
             if x / Wp > 0.86 or y / Hp > 0.92:
                 continue
@@ -1637,6 +1654,8 @@ def _rendered_color_regions(pdf_bytes, page_index, polys, W, H, ft_pt, max_new=4
                 sf = gross - ded
                 if not (35 <= sf <= 2500):
                     continue
+                if _fk == "g" and sf > 300 and len(holes_norm) < 2:
+                    continue   # big gray with no window holes = ROOF, not wall
                 cnts, _ = cv2.findContours(filled, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
                 if not cnts:
                     continue
@@ -1659,8 +1678,9 @@ def _rendered_color_regions(pdf_bytes, page_index, polys, W, H, ft_pt, max_new=4
                     ix = min(nx1, max(exs)) - max(nx0, min(exs))
                     iy = min(ny1, max(eys)) - max(ny0, min(eys))
                     if ix > 0 and iy > 0 and ix * iy > 0.3 * max(1e-9, (nx1 - nx0) * (ny1 - ny0)):
-                        if (pex.get("material") == "Wall area (confirm)") and pex not in out:
-                            replaceable.append(pex)
+                        if _fk == "h" and (pex.get("material") == "Wall area (confirm)") \
+                                and pex not in out:
+                            replaceable.append(pex)   # gray pieces never evict (v1 lesson)
                         else:
                             clash = True
                             break
@@ -1671,7 +1691,8 @@ def _rendered_color_regions(pdf_bytes, page_index, polys, W, H, ft_pt, max_new=4
                         polys.remove(pex)
                     except ValueError:
                         pass
-                gname = f"Rendered color {h0}-{h0+15}deg"
+                gname = (f"Rendered color {h0}-{h0+15}deg" if _fk == "h"
+                         else f"Rendered gray V{h0}-{h0+14}")
                 out.append({"points": norm, "area_sf": round(sf, 1),
                             "cx": round((nx0 + nx1) / 2, 5), "cy": round((ny0 + ny1) / 2, 5),
                             "fill_color": rgb, "source": "vector",
