@@ -1468,6 +1468,19 @@ def _roof_split(pdf_bytes, page_index, polys, W, H, ft_pt):
         h_lines, _ = _collect_axis(pg, "h", stitch=8)
         v_lines, _ = _collect_axis(pg, "v", stitch=8)
         rot = pg.rotation_matrix
+        # roofing PHRASES (row-assembled) for piece naming — Budget/Excel honesty
+        rows9 = {}
+        for w in pg.get_text("words"):
+            p9 = fitz.Point((w[0] + w[2]) / 2, (w[1] + w[3]) / 2) * rot
+            rows9.setdefault(round(p9.y / 6), []).append((p9.x, p9.y, (w[4] or "").strip()))
+        phrases = []
+        for k9 in sorted(rows9):
+            ws9 = sorted(rows9[k9])
+            t9 = " ".join(t for _, _, t in ws9)
+            if any(term in t9.upper() for term in _ROOF_TERMS):
+                xs9 = [x for x, _, _ in ws9]
+                phrases.append((sum(xs9) / len(xs9),
+                                sum(y for _, y, _ in ws9) / len(ws9), t9[:44]))
     finally:
         doc.close()
     from shapely.geometry import Polygon as _P, LineString as _LS
@@ -1537,8 +1550,16 @@ def _roof_split(pdf_bytes, page_index, polys, W, H, ft_pt):
             q["holes"] = []
             q.pop("sf_calc", None)
             xs9 = [c[0] for c in ring]; ys9 = [c[1] for c in ring]
-            q["cx"] = round(sum(xs9) / len(xs9) / W, 5)
-            q["cy"] = round(sum(ys9) / len(ys9) / H, 5)
+            cx9 = sum(xs9) / len(xs9); cy9 = sum(ys9) / len(ys9)
+            q["cx"] = round(cx9 / W, 5)
+            q["cy"] = round(cy9 / H, 5)
+            # name from the nearest roofing phrase (the drawing's own vocabulary)
+            if phrases:
+                d9, best9 = min(((ph[0] - cx9) ** 2 + (ph[1] - cy9) ** 2, ph[2])
+                                for ph in phrases)
+                if d9 ** 0.5 <= 0.3 * max(W, H):
+                    nm9 = best9.strip() + " (confirm)"
+                    q["material"] = q["category"] = q["group"] = nm9
             out.append(q)
     return out
 
