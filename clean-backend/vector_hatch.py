@@ -1355,6 +1355,11 @@ def detect(pdf_bytes, page_index, zoom=None):
                     pass
         except Exception:
             pass
+    # ROOF-PLAN split (vocab-gated to pages speaking real roofing language)
+    try:
+        polys = _roof_split(pdf_bytes, page_index, polys, W, H, ft_pt)
+    except Exception:
+        pass
     # PER-VIEW SCALES (owner directive: never measure at a scale the drawing didn't
     # state). Multi-view sheets print each view's own scale under its title (Q1
     # BUILDING ELEVATION / 1/8"=1'-0"; details at 3/4"). Rule measured on Avita p5:
@@ -1441,6 +1446,101 @@ def detect(pdf_bytes, page_index, zoom=None):
         p.pop("_mid_dedup", None)
         p["id"] = i
     return polys, W, H, {"ft_per_in": round(sc, 3), "scale_confirmed": conf}
+
+
+_ROOF_TERMS = ("MEMBRANE", "TPO", "EPDM", "CRICKET", "WALKWAY", "WALKING PAD",
+               "STANDING SEAM", "TAPERED INSULATION", "FULLY ADHERED", "BALLAST")
+
+
+def _roof_split(pdf_bytes, page_index, polys, W, H, ft_pt):
+    """ROOF-PLAN mode (26-045/26-183 p6 class): his roof zones = plan areas bounded by
+    ridge/valley/edge lines of ANY weight (measured: every membrane edge carries
+    378-11,112pt of aligned long ink, wd 1.0-5.0). On pages speaking ROOFING (>=2
+    distinct roof terms — 'ROOFING' alone appears in siding legends, not enough),
+    split large flood pieces recursively at long straight runs. SF = plan shoelace
+    (his convention, proven: implied scale exactly 8.00, NO pitch factor)."""
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    try:
+        pg = doc[page_index]
+        txt = (pg.get_text() or "").upper()
+        if sum(1 for t in _ROOF_TERMS if t in txt) < 2:
+            return polys
+        h_lines, _ = _collect_axis(pg, "h", stitch=8)
+        v_lines, _ = _collect_axis(pg, "v", stitch=8)
+        rot = pg.rotation_matrix
+    finally:
+        doc.close()
+    from shapely.geometry import Polygon as _P, LineString as _LS
+    from shapely.ops import split as _split_op
+
+    def parts_of(poly, depth):
+        if depth >= 4 or poly.area * ft_pt * ft_pt < 800:
+            return [poly]
+        bx0, by0, bx1, by1 = poly.bounds
+        best = None
+        for (c, a, b) in h_lines:
+            if not (by0 + 12 < c < by1 - 12):
+                continue
+            ov = min(b, bx1) - max(a, bx0)
+            if ov >= 0.6 * (bx1 - bx0):
+                d = abs(c - (by0 + by1) / 2)
+                if best is None or d < best[0]:
+                    best = (d, "h", c)
+        for (c, a, b) in v_lines:
+            if not (bx0 + 12 < c < bx1 - 12):
+                continue
+            ov = min(b, by1) - max(a, by0)
+            if ov >= 0.6 * (by1 - by0):
+                d = abs(c - (bx0 + bx1) / 2)
+                if best is None or d < best[0]:
+                    best = (d, "v", c)
+        if best is None:
+            return [poly]
+        _, ax, c = best
+        cutter = _LS([(bx0 - 5, c), (bx1 + 5, c)]) if ax == "h" else _LS([(c, by0 - 5), (c, by1 + 5)])
+        try:
+            pieces9 = [g for g in _split_op(poly, cutter).geoms
+                       if g.geom_type == "Polygon" and g.area * ft_pt * ft_pt >= 60]
+        except Exception:
+            return [poly]
+        if len(pieces9) < 2:
+            return [poly]
+        out9 = []
+        for g in pieces9:
+            out9.extend(parts_of(g, depth + 1))
+        return out9
+
+    out = []
+    for p in polys:
+        mat9 = (p.get("material") or "")
+        if p.get("area_sf", 0) < 400 or not (mat9 == "Wall area (confirm)" or p.get("named_by_tag")):
+            out.append(p)
+            continue
+        try:
+            poly = _P([(x * W, y * H) for x, y in p["points"]]).buffer(0)
+            if poly.is_empty or poly.geom_type != "Polygon":
+                out.append(p)
+                continue
+            parts = parts_of(poly, 0)
+        except Exception:
+            out.append(p)
+            continue
+        if len(parts) < 2:
+            out.append(p)
+            continue
+        for g in parts:
+            q = dict(p)
+            ring = list(g.exterior.coords)[:-1]
+            q["points"] = [[round(px / W, 5), round(py / H, 5)] for px, py in ring]
+            q["area_sf"] = round(g.area * ft_pt * ft_pt, 1)
+            q["label"] = f"~{round(q['area_sf']):,} SF"
+            q["holes"] = []
+            q.pop("sf_calc", None)
+            xs9 = [c[0] for c in ring]; ys9 = [c[1] for c in ring]
+            q["cx"] = round(sum(xs9) / len(xs9) / W, 5)
+            q["cy"] = round(sum(ys9) / len(ys9) / H, 5)
+            out.append(q)
+    return out
 
 
 def _apply_view_scales(pdf_bytes, page_index, polys, W, H, page_scale):
