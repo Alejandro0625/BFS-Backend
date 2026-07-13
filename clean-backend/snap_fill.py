@@ -594,8 +594,8 @@ def tag_seed_fill(pdf_bytes, page_index, avoid_polys, max_new=40):
             for (ax, ay, bx, by) in lsegs:
                 da = ((ax - wx) ** 2 + (ay - wy) ** 2) ** 0.5
                 db = ((bx - wx) ** 2 + (by - wy) ** 2) ** 0.5
-                if min(da, db) > 24:
-                    continue
+                if min(da, db) > 48:
+                    continue    # multi-word labels attach at the phrase start (213A: 40-65pt)
                 tx2, ty2 = (bx, by) if da < db else (ax, ay)
                 seeds.append((tx2, ty2, "Soffit/canopy (confirm)"))
                 break
