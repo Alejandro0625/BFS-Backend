@@ -1159,7 +1159,13 @@ def detect(pdf_bytes, page_index, zoom=None):
                             continue
                         wins = [w for w in win_rects
                                 if xa < (w[0] + w[2]) / 2 < xb and ya < (w[1] + w[3]) / 2 < yb]
-                        if not wins or _covered_b(xa, ya, xb, yb):
+                        # ALTERNATE CORROBORATION (26-191A off-by-one class): a band with
+                        # NO windows still counts when it is DENSE with course lines
+                        # (his 684sf upper band: ~95 stitched light rows; junk gaps have none)
+                        dense_b = sum(1 for (c5, lo5, hi5) in _hh5
+                                      if ya < c5 < yb and min(hi5, xb) - max(lo5, xa)
+                                      >= 0.5 * (xb - xa)) >= 6
+                        if (not wins and not dense_b) or _covered_b(xa, ya, xb, yb):
                             continue
                         sfb = bw * bh * ft_pt * ft_pt
                         if not (40 <= sfb <= 2500):
@@ -1427,6 +1433,41 @@ def detect(pdf_bytes, page_index, zoom=None):
             kept_late9.append(((p.get("group") or ""), bb))
             keep9.append(p)
         polys = keep9
+    except Exception:
+        pass
+    # JUNK-YIELDS-TO-NAMED (26-204 tail: a 73sf wall collected an anonymous flood PLUS
+    # the color piece that owns it — the flood must yield when NAMED color/rendered
+    # pieces cover >=60% of it; anonymous area is a guess, a drawn color is a statement)
+    try:
+        import numpy as np, cv2
+        MWj = 700
+        MHj = max(1, int(MWj * H / max(1, W)))
+        named_m = np.zeros((MHj, MWj), np.uint8)
+        n_named = 0
+        for p in polys:
+            mt = (p.get("material") or "")
+            if mt.startswith("Color fill") or mt.startswith("Rendered"):
+                cv2.fillPoly(named_m, [np.array([[int(x * MWj), int(y * MHj)]
+                                                 for x, y in p["points"]], np.int32)], 1)
+                n_named += 1
+        if n_named:
+            import re as _rej
+            def _junky(mt):
+                mtu = mt.upper()
+                return (mt == "Wall area (confirm)"
+                        or bool(_rej.match(r"^[A-Z][-–_]?\d{1,2}$", mtu))
+                        or bool(_rej.search(r"\b[BT]\.?O\.?\b", mtu)))
+            keepj = []
+            for p in polys:
+                if _junky(p.get("material") or ""):
+                    mj = np.zeros((MHj, MWj), np.uint8)
+                    cv2.fillPoly(mj, [np.array([[int(x * MWj), int(y * MHj)]
+                                                for x, y in p["points"]], np.int32)], 1)
+                    aj = int(mj.sum())
+                    if aj and int((mj & named_m).sum()) > 0.6 * aj:
+                        continue          # the color reading owns this territory
+                keepj.append(p)
+            polys = keepj
     except Exception:
         pass
     # SOURCE-AGNOSTIC junk-name pass: whatever reader named a piece, a name that is a
