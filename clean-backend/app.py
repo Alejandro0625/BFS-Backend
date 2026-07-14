@@ -565,6 +565,9 @@ def process(jid, pdf_bytes):
                 "flags": auto_flags + sf_warns,
                 "levels": page_levels,
                 "source": "texture-auto" if auto else "digitize",
+                # window/door COUNT surface (count-only takeoffs are a whole bid class):
+                # openings the readers detected and cut out of the SF on this page
+                "openingsCount": (sum(len(p.get("holes") or []) for p in polys) if auto else None),
             })
             extra = (f" + {n_lin_sf} linear run(s)" if n_lin_sf else "") + (f", {len(linear_items)} trim/LF item(s)" if linear_items else "")
             jlog(job, f"Page {pi+1}: " + (f"{len(polys)} AI-suggested zone(s)" if auto else f"{len(polys)} marked region(s){extra}") + f", {len(zones)} material(s)", "warn" if auto else "ok")
@@ -905,6 +908,131 @@ def autonomy_status():
     out.sort(key=lambda r: r["jobId"], reverse=True)
     avg = round(sum(r["agreement"] for r in out) / len(out)) if out else None
     return {"jobs": out[:40], "avg_agreement": avg, "n": len(out)}
+
+def process_compare(jid, data):
+    """THE KILLER DEMO: his marked takeoff vs the AI's blank-sheet takeoff on the SAME
+    drawing. Reads his Bluebeam polygons EXACTLY, strips them to a synthetic clean set,
+    runs the auto engine on it, grades every wall with the bench's assembled scoring
+    (pieces >=50%-inside the wall, summed SF + union coverage) — the frozen-exam
+    machinery, live in production, on the estimator's own job."""
+    j = get_job(jid)
+    try:
+        doc = fitz.open(stream=data, filetype="pdf")
+        his_by_pg = {}
+        for pi in range(min(doc.page_count, 8)):
+            pg = doc[pi]
+            pw, ph = pg.rect.width, pg.rect.height
+            his = [p for p in extract_page_polygons(pg, pw, ph, 8.0)
+                   if p.get("sf_exact") and 40 <= p["area_sf"] <= 60000]
+            if his:
+                his_by_pg[pi] = his
+        if not his_by_pg:
+            j["status"] = "error"
+            j["error"] = "No labeled takeoff polygons found — upload the estimator's marked Bluebeam set."
+            _persist_job(jid); return
+        for pi in range(doc.page_count):
+            pg = doc[pi]
+            for _ in range(400):
+                a = pg.first_annot
+                if not a:
+                    break
+                try:
+                    pg.delete_annot(a)
+                except Exception:
+                    break
+        clean = doc.tobytes()
+        doc.close()
+        j["pdf"] = clean                    # /page-image now serves the CLEAN drawing
+        import vector_hatch
+        from shapely.geometry import Polygon as _CP
+        from shapely.ops import unary_union as _cu
+        pages = []
+        for pi, his in sorted(his_by_pg.items()):
+            j["progress"] = {"label": f"AI takeoff on page {pi + 1}…", "pct": 20 + int(70 * len(pages) / max(1, len(his_by_pg)))}
+            _persist_job(jid)
+            try:
+                pieces, W, H, sinfo = vector_hatch.detect(clean, pi)
+            except Exception:
+                pieces, sinfo = [], {}
+            pp = []
+            for p in pieces:
+                try:
+                    q = _CP([(x, y) for x, y in p["points"]]).buffer(0)
+                    if not q.is_empty:
+                        pp.append((q, p))
+                except Exception:
+                    pass
+            walls = []
+            for g in his:
+                try:
+                    gq = _CP([(x, y) for x, y in g["points"]]).buffer(0)
+                except Exception:
+                    continue
+                mine = []
+                for q, p in pp:
+                    try:
+                        if q.intersection(gq).area >= 0.5 * q.area:
+                            mine.append((q, p))
+                    except Exception:
+                        pass
+                asf = sum(p.get("area_sf", 0) for _, p in mine)
+                cov = 0.0
+                try:
+                    if mine:
+                        cov = _cu([q for q, _ in mine]).intersection(gq).area / max(1e-9, gq.area)
+                except Exception:
+                    pass
+                walls.append({"sf": g["area_sf"], "mat": g.get("material") or "Wall",
+                              "got": round(asf, 1), "cov": round(cov, 2),
+                              "money": bool(cov >= 0.7 and abs(asf - g["area_sf"]) <= 0.15 * g["area_sf"])})
+            pages.append({
+                "page": pi + 1,
+                "his": [{"points": g["points"], "sf": g["area_sf"],
+                         "mat": (g.get("material") or "")[:40]} for g in his],
+                "ours": [{"points": p["points"], "sf": p.get("area_sf", 0),
+                          "mat": (p.get("material") or "")[:40],
+                          "holes": (p.get("holes") or [])[:12]} for p in pieces],
+                "hisTotal": round(sum(g["area_sf"] for g in his), 1),
+                "ourTotal": round(sum(p.get("area_sf", 0) for p in pieces), 1),
+                "walls": walls,
+                "scale_confirmed": bool(sinfo.get("scale_confirmed")),
+            })
+        nw = sum(len(p["walls"]) for p in pages)
+        nm = sum(1 for p in pages for w in p["walls"] if w["money"])
+        nf = sum(1 for p in pages for w in p["walls"] if w["cov"] >= 0.3)
+        j["compare"] = {"pages": pages,
+                        "summary": {"walls": nw, "found": nf, "money": nm,
+                                    "hisTotal": round(sum(p["hisTotal"] for p in pages), 1),
+                                    "ourTotal": round(sum(p["ourTotal"] for p in pages), 1)}}
+        j["status"] = "done"
+        j["progress"] = {"label": "Comparison ready", "pct": 100}
+        _persist_job(jid)
+    except Exception as e:
+        try:
+            j["status"] = "error"; j["error"] = f"compare failed: {e}"
+            _persist_job(jid)
+        except Exception:
+            pass
+
+@app.post("/compare")
+async def compare(background_tasks: BackgroundTasks, pdf: UploadFile = File(...)):
+    data = await pdf.read()
+    jid = f"{int(time.time() * 1000)}-{uuid.uuid4().hex[:6]}"
+    jobs[jid] = {"status": "processing", "phase": "compare", "log": [],
+                 "progress": {"label": "Reading the estimator's takeoff…", "pct": 5},
+                 "legend": [], "takeoffData": [], "scheduleData": None, "error": None,
+                 "polygons_by_page": {}, "dims_by_page": {}, "pdf": data}
+    _persist_job(jid); _evict_mem(); _gc_disk()
+    background_tasks.add_task(process_compare, jid, data)
+    return {"jobId": jid}
+
+@app.get("/compare-result/{jid}")
+def compare_result(jid: str):
+    j = get_job(jid)
+    if not j:
+        raise HTTPException(404, "job not found")
+    return {"status": j["status"], "progress": j.get("progress"),
+            "error": j.get("error"), "compare": j.get("compare")}
 
 @app.get("/learn-status")
 def learn_status():
