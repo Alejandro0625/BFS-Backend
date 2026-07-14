@@ -34,7 +34,14 @@ MAX_DISK_JOBS = int(os.environ.get("MAX_DISK_JOBS", "200"))  # cap volume: prune
 MAX_AUTO_PAGES = int(os.environ.get("MAX_AUTO_PAGES", "30"))  # cap texture auto-detect work per PDF
 
 app = FastAPI(title="BFS Clean Backend")
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+# CORS: browsers may only call this API from the app's own origins (the Vercel prod
+# domain + its preview builds + local dev). Non-browser clients (battery scripts,
+# curl) send no Origin header and are unaffected — CORS is a browser-side gate.
+app.add_middleware(CORSMiddleware,
+                   allow_origins=["https://bfs-estimator.vercel.app",
+                                  "http://localhost:5173", "http://127.0.0.1:5173"],
+                   allow_origin_regex=r"https://bfs-estimator[a-z0-9\-]*\.vercel\.app",
+                   allow_methods=["*"], allow_headers=["*"])
 jobs = {}  # jobId -> dict  (in-memory hot cache, bounded to MAX_MEM_JOBS)
 
 # ── durable, bounded job store ───────────────────────────────────────────────
@@ -855,6 +862,9 @@ def learn(payload: dict = Body(...)):
     jid = payload.get("jobId")
     job = get_job(jid)
     try:
+        # disk-fill guard: a single correction payload is KBs; anything huge is abuse
+        if len(json.dumps(payload)) > 40_000_000:
+            return {"ok": False, "error": "payload too large"}
         os.makedirs(CORR_DIR, exist_ok=True)
         ts = str(int(time.time() * 1000))
         d = os.path.join(CORR_DIR, ts)
