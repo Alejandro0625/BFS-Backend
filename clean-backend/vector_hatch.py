@@ -608,6 +608,15 @@ def detect(pdf_bytes, page_index, zoom=None):
         doc_d = fitz.open(stream=pdf_bytes, filetype="pdf")
         pg_d = doc_d[page_index]
         rot_d = pg_d.rotation_matrix
+        # ROOF pages are LAYERED by convention (membrane over crickets/pads = separate
+        # pay items): a cricket's diagonal hatch must never claim territory FROM the
+        # membrane host — patch-on-host stays wall-only (26-045 lost its money wall
+        # to a cricket patch on the first gate run).
+        try:
+            _txt_d = (pg_d.get_text() or "").upper()
+            roof_page_d = sum(1 for t in _ROOF_TERMS if t in _txt_d) >= 2
+        except Exception:
+            roof_page_d = False
         diag = []                       # (x0,y0,x1,y1,angle_deg,len) display coords
         for d in pg_d.get_drawings():
             for it in d.get("items") or []:
@@ -647,6 +656,7 @@ def detect(pdf_bytes, page_index, zoom=None):
                     cv2.fillPoly(taken, [cnt0], 1)
                 except Exception:
                     pass
+            _pm_buf = np.zeros((DH, DW), np.uint8)   # reusable host-mask buffer
             for fam_k in strong:
               fam = diag_by_fam.get(fam_k) or []
               if len(fam) < 25:
@@ -671,9 +681,54 @@ def detect(pdf_bytes, page_index, zoom=None):
                     continue            # anti-sprawl: site-plan / whole-sheet junk
                 cm = np.zeros((DH, DW), np.uint8)
                 cv2.drawContours(cm, [cnt], -1, 1, -1)
+                cm_area = max(1, int(cm.sum()))
                 inter = int((cm & taken).sum())
-                if inter > 0.2 * max(1, int(cm.sum())):
-                    continue            # already measured by the v/h/fill readers
+                _dbg = _os.environ.get("VH_DIAG_DEBUG")
+                if _dbg:
+                    print(f"[diag] fam{fam_k} cand sf={sf:.0f} px={cm_area} ov={inter/cm_area:.2f}", flush=True)
+                patch_hosts = None
+                if inter > 0.2 * cm_area:
+                    # PATCH-ON-HOST (26-235's renovation overlays): a dense single-family
+                    # hatch region drawn ON a much larger measured piece is the drawing
+                    # SAYING "this sub-area is a different material" — the hatch boundary
+                    # IS his wall. Claim it only when EVERY overlapping piece is >=3x the
+                    # candidate (true host, not a sibling double-read); the hosts get
+                    # shaved by the stolen fraction so the page total stays honest.
+                    if roof_page_d:
+                        continue        # layered roof convention: crickets ride ON the
+                                        # membrane, both are paid — never steal territory
+                    hosts = []
+                    ok_patch = True
+                    for pidx_ in range(len(polys)):
+                        try:
+                            _pm_buf[:] = 0
+                            cnt0 = np.array([[int(x * W * sx), int(y * H * sy)]
+                                             for x, y in polys[pidx_]["points"]], np.int32)
+                            cv2.fillPoly(_pm_buf, [cnt0], 1)
+                            ov0 = int((cm & _pm_buf).sum())
+                            if ov0 > 0.05 * cm_area:
+                                pa0 = int(_pm_buf.sum())
+                                if _dbg:
+                                    print(f"[diag]   vs piece[{pidx_}] '{(polys[pidx_].get('material') or '?')[:22]}' "
+                                          f"sf={polys[pidx_].get('area_sf')} px={pa0} ratio={pa0/cm_area:.1f}", flush=True)
+                                if pa0 >= 3 * cm_area:
+                                    hosts.append((pidx_, ov0, pa0))
+                                elif ov0 >= 0.5 * pa0:
+                                    # the candidate covers MOST of this piece: it is a
+                                    # backing/partial read of the same zone (26-235's
+                                    # 518sf gray fill under his 275 patch) — it yields
+                                    # at the piece-level dedup, it does not block.
+                                    hosts.append((pidx_, ov0, pa0))
+                                else:
+                                    ok_patch = False
+                                    break
+                        except Exception:
+                            pass
+                    if not ok_patch or not hosts:
+                        if _dbg:
+                            print(f"[diag]   REJECT: ok_patch={ok_patch} hosts={len(hosts)}", flush=True)
+                        continue        # comparable-size overlap = double-read, reject
+                    patch_hosts = hosts
                 # THE PURITY GATE: >=70% of the diagonal ink inside this region must be
                 # this one angle family. True hatch is parallel; text/arrow zones carry
                 # every angle and can never pass.
@@ -688,6 +743,8 @@ def detect(pdf_bytes, page_index, zoom=None):
                         if int(ang2 // 8) == fam_k:
                             fam_ink += L2
                 if tot_ink < 300 or fam_ink < 0.7 * tot_ink:
+                    if _dbg:
+                        print(f"[diag]   PURITY kill: tot_ink={tot_ink:.0f} fam_frac={fam_ink/max(tot_ink,1):.2f}", flush=True)
                     continue
                 eps = 0.008 * max(bw, bh)
                 ap = cv2.approxPolyDP(cnt, max(2.0, eps), True)
@@ -712,13 +769,22 @@ def detect(pdf_bytes, page_index, zoom=None):
                 norm = [[round(x / W, 5), round(y / H, 5)] for (x, y) in disp_pts]
                 cx = round(sum(p[0] for p in norm) / len(norm), 5)
                 cy = round(sum(p[1] for p in norm) / len(norm), 5)
-                polys.append({"points": norm, "area_sf": round(sf, 1), "cx": cx, "cy": cy,
-                              "fill_color": [0.85, 0.45, 0.25], "source": "vector",
-                              "material": "Hatched area (masonry/EIFS)",
-                              "category": "Hatched area (masonry/EIFS)",
-                              "group": "Hatched area (masonry/EIFS)", "sf_exact": True,
-                              "holes": holes_norm[:24],
-                              "label": f"~{round(sf):,} SF"})
+                rec = {"points": norm, "area_sf": round(sf, 1), "cx": cx, "cy": cy,
+                       "fill_color": [0.85, 0.45, 0.25], "source": "vector",
+                       "material": "Hatched area (masonry/EIFS)",
+                       "category": "Hatched area (masonry/EIFS)",
+                       "group": "Hatched area (masonry/EIFS)", "sf_exact": True,
+                       "holes": holes_norm[:24],
+                       "label": f"~{round(sf):,} SF"}
+                if patch_hosts:
+                    # NO host shave here — downstream split/trim recompute host SF
+                    # geometrically (a shave would be erased, or double-charged on the
+                    # no-split path). Territory accounting happens ONCE, at the piece-
+                    # level dedup: patches take priority there and hosts get shaved by
+                    # the actual final overlap.
+                    rec["patch"] = True
+                    taken |= cm         # patched territory is spoken for
+                polys.append(rec)
     except Exception:
         pass
 
@@ -741,6 +807,13 @@ def detect(pdf_bytes, page_index, zoom=None):
             if a == 0:
                 continue
             ov = int((m & covered).sum()) / a
+            if p.get("patch"):
+                # patch-on-host piece: its host was ALREADY shaved by exactly this
+                # overlap when the patch claimed it — dropping or re-shaving here
+                # would double-charge the same territory.
+                covered |= m
+                keep.append(p)
+                continue
             if ov > 0.55:
                 continue
             if ov > 0.05:
@@ -938,8 +1011,16 @@ def detect(pdf_bytes, page_index, zoom=None):
         import numpy as np, cv2
         MW = 900
         MH = max(1, int(MW * H / max(1, W)))
-        order = sorted(range(len(polys)), key=lambda i: (0 if (polys[i].get("material") or "").startswith("Panel wall") else 1, -polys[i]["area_sf"]))
+        # PATCH pieces (hatch overlays accepted on a host — 26-235's MP-1) go FIRST:
+        # the drawn hatch boundary is the drawing's own statement of a sub-area wall,
+        # so the patch claims its territory and the host pieces get shaved by the
+        # actual overlap here (the ONE place territory is charged).
+        order = sorted(range(len(polys)), key=lambda i: (
+            0 if polys[i].get("patch") else
+            (1 if (polys[i].get("material") or "").startswith("Panel wall") else 2),
+            -polys[i]["area_sf"]))
         covered = np.zeros((MH, MW), np.uint8)
+        patch_cov = None                 # territory claimed by patch pieces
         keep = []
         for i in order:
             p = polys[i]
@@ -952,11 +1033,20 @@ def detect(pdf_bytes, page_index, zoom=None):
             ov = int((m & covered).sum()) / a
             if ov > 0.9:
                 continue                 # true duplicate
+            if patch_cov is not None and not p.get("patch"):
+                grp0 = (p.get("group") or p.get("material") or "")
+                if (grp0.startswith("Panel wall") or grp0.startswith("Wall area")) and \
+                   int((m & patch_cov).sum()) >= 0.5 * a:
+                    continue             # generic backing mostly under a patch: yields
             if ov > 0.05:
                 # shave the SF, keep the piece — dropping cost a matched wall cross-job
                 p = dict(p); p["area_sf"] = round(p["area_sf"] * (1 - ov), 1)
                 p["label"] = f"~{round(p['area_sf']):,} SF"
             covered |= m
+            if p.get("patch"):
+                if patch_cov is None:
+                    patch_cov = np.zeros((MH, MW), np.uint8)
+                patch_cov |= m
             p["_mid_dedup"] = True       # early pieces: the final pass must never re-shave
             keep.append(p)
         polys = keep
