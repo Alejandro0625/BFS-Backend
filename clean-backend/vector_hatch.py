@@ -381,7 +381,12 @@ def view_boxes(geo, W, H):
 
 
 def page_geometry(pg):
-    """One-pass page geometry for opening detection (display coords): rectangles + segments."""
+    """One-pass page geometry for opening detection (display coords): rectangles + segments.
+    (Stride-subsampling the >30k overflow was TRIED 2026-07-14 and REVERTED: Fleet p2 is
+    itself a >30k-seg page — resampling changed its opening evidence and moved the canary
+    6452→6737, compare money 7→5. The 26-191A blindness fix needs a design that leaves
+    <=30k-consumer behavior byte-identical on ALL pages, e.g. a separate full-coverage
+    seg set for view detection only — banked with the v13-era band work.)"""
     segs = []
     try:
         rot = pg.rotation_matrix
@@ -1347,6 +1352,21 @@ def detect(pdf_bytes, page_index, zoom=None):
                                              max_new=max(0, MAX_REGIONS - len(polys)))
         except Exception:
             pass
+    # v13 BOUNDARY-MODEL READER (env-gated: VH_V13=1 + V13_ONNX path). Trained on 369
+    # of HIS OWN takeoff pages to predict wall interior + HIS per-wall boundaries —
+    # the decision no drawn-geometry rule can derive on rendered sheets. ADDITIVE
+    # ONLY: raster-underlay pages, scale-confirmed, virgin territory. Fair-eval
+    # 2026-07-14: Regdate p34 58/78 walls found (whole rule engine: ~25 that page).
+    if conf:
+        try:
+            import os as _osv
+            # activates when the v13 model file EXISTS (uploading the model IS the
+            # switch); VH_V13_OFF=1 force-disables. _v13_regions no-ops without the file.
+            if not _osv.environ.get("VH_V13_OFF"):
+                polys += _v13_regions(pdf_bytes, page_index, polys, W, H, ft_pt,
+                                      max_new=max(0, MAX_REGIONS - len(polys)))
+        except Exception:
+            pass
     # EXTEND-TO-GRADE — DISABLED after failing its gates (2026-07-08). The convention is
     # real (his west wall: fill stops at the base drip y1381, he measures to grade
     # y1408) but the west grade line is mostly LIGHT/hidden ink (~200pt heavy of 607
@@ -1765,6 +1785,122 @@ def _apply_view_scales(pdf_bytes, page_index, polys, W, H, page_scale):
                 p["sf_calc"]["basis"] = "view scale 1\"=%g'" % round(s0, 2)
         keep.append(p)
     return keep
+
+
+_V13_SESS = None
+
+
+def _v13_regions(pdf_bytes, page_index, polys, W, H, ft_pt, max_new=40):
+    """v13 BOUNDARY MODEL (Unet resnet34, 3-class: bg / wall interior / HIS wall
+    boundary) as an additional reader. Render at the training scale (1536 long side),
+    tile 768 with softmax-averaged overlap, then WATERSHED: seeds = interior split at
+    boundaries, grown back over interior|boundary so each wall regains its full extent
+    (full-band charge = the best of 4 measured configs, v13_eval_multi 2026-07-14).
+    Gates mirror the rc reader: raster-underlay pages only, virgin territory only."""
+    import os as _os
+    import numpy as np, cv2
+    if max_new <= 0:
+        return []
+    mp = _os.environ.get("V13_ONNX", "/data/model_v13.onnx")
+    if not _os.path.isfile(mp):
+        return []
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    try:
+        pg = doc[page_index]
+        img_area = 0.0
+        try:
+            for im in pg.get_images(full=True):
+                for r in pg.get_image_rects(im[0]):
+                    img_area += max(0, r.width) * max(0, r.height)
+        except Exception:
+            pass
+        if img_area < 0.25 * W * H:
+            return []
+        z = 1536.0 / max(W, H)
+        pix = pg.get_pixmap(matrix=fitz.Matrix(z, z), alpha=False)
+        img = np.frombuffer(pix.samples, np.uint8).reshape(pix.height, pix.width, pix.n)[:, :, :3].copy()
+    finally:
+        doc.close()
+    global _V13_SESS
+    if _V13_SESS is None:
+        import onnxruntime as ort
+        _V13_SESS = ort.InferenceSession(mp, providers=["CPUExecutionProvider"])
+    ih, iw = img.shape[:2]
+    T = 768
+    prob = np.zeros((3, ih, iw), np.float32)
+    cnt = np.zeros((ih, iw), np.float32)
+    for y0 in sorted(set(list(range(0, max(1, ih - T + 1), T // 2)) + [max(0, ih - T)])):
+        for x0 in sorted(set(list(range(0, max(1, iw - T + 1), T // 2)) + [max(0, iw - T)])):
+            tile = img[y0:y0 + T, x0:x0 + T]
+            th, tw = tile.shape[:2]
+            pad = np.zeros((T, T, 3), np.uint8)
+            pad[:th, :tw] = tile
+            x = (pad.astype(np.float32) / 255.0).transpose(2, 0, 1)[None]
+            lg = _V13_SESS.run(None, {"input": x})[0][0]
+            e = np.exp(lg - lg.max(0, keepdims=True))
+            sm = e / e.sum(0, keepdims=True)
+            prob[:, y0:y0 + th, x0:x0 + tw] += sm[:, :th, :tw]
+            cnt[y0:y0 + th, x0:x0 + tw] += 1
+    prob /= np.maximum(cnt, 1)[None]
+    cls = prob.argmax(0).astype(np.uint8)
+    del prob, cnt
+    inter = (cls == 1).astype(np.uint8)
+    bnd = (cls == 2).astype(np.uint8)
+    bd = cv2.dilate(bnd, np.ones((3, 3), np.uint8))
+    ns, seed_lab = cv2.connectedComponents((inter & (1 - bd)).astype(np.uint8), 8)
+    full_mask = ((inter | bnd) > 0).astype(np.uint8)
+    markers = np.zeros((ih, iw), np.int32)
+    markers[full_mask == 0] = 1
+    markers[seed_lab > 0] = seed_lab[seed_lab > 0] + 1
+    cv2.watershed(cv2.cvtColor(img, cv2.COLOR_RGB2BGR), markers)
+    lab = np.where((markers >= 2) & (full_mask > 0), markers - 1, 0).astype(np.int32)
+    px2pt = 1.0 / z
+    exist = []
+    for p in polys:
+        try:
+            xs = [q[0] for q in p["points"]]
+            ys = [q[1] for q in p["points"]]
+            exist.append((min(xs), min(ys), max(xs), max(ys)))
+        except Exception:
+            pass
+    out = []
+    for i in range(1, ns):
+        m = (lab == i).astype(np.uint8)
+        a_px = int(m.sum())
+        sf = a_px * (px2pt ** 2) * (ft_pt ** 2)
+        if sf < 40 or sf > 20000:
+            continue
+        cs, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not cs:
+            continue
+        c = max(cs, key=cv2.contourArea)
+        ap = cv2.approxPolyDP(c, 0.01 * cv2.arcLength(c, True), True).reshape(-1, 2)
+        if len(ap) < 3:
+            continue
+        norm = [[round(float(px) * px2pt / W, 5), round(float(py) * px2pt / H, 5)] for px, py in ap]
+        nx0 = min(q[0] for q in norm); nx1 = max(q[0] for q in norm)
+        ny0 = min(q[1] for q in norm); ny1 = max(q[1] for q in norm)
+        ca = max(1e-9, (nx1 - nx0) * (ny1 - ny0))
+        clash = False
+        for (ex0, ey0, ex1, ey1) in exist:
+            ix = min(nx1, ex1) - max(nx0, ex0)
+            iy = min(ny1, ey1) - max(ny0, ey0)
+            if ix > 0 and iy > 0 and ix * iy > 0.3 * ca:
+                clash = True
+                break
+        if clash:
+            continue
+        cx = round(sum(q[0] for q in norm) / len(norm), 5)
+        cy = round(sum(q[1] for q in norm) / len(norm), 5)
+        out.append({"points": norm, "area_sf": round(sf, 1), "cx": cx, "cy": cy,
+                    "fill_color": [0.45, 0.55, 0.9], "source": "vector",
+                    "material": "Wall area (AI boundary, confirm)",
+                    "category": "Wall area (AI boundary, confirm)",
+                    "group": "Wall area (AI boundary, confirm)", "sf_exact": True,
+                    "holes": [], "label": f"~{round(sf):,} SF"})
+        if len(out) >= max_new:
+            break
+    return out
 
 
 def _rendered_color_regions(pdf_bytes, page_index, polys, W, H, ft_pt, max_new=40):
