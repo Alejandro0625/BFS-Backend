@@ -1190,12 +1190,19 @@ def snap_points(jid: str, page: int):
     return {"points": norm, "width": W, "height": H, "count": len(norm)}
 
 @app.post("/admin/upload-model")
-async def upload_model(model: UploadFile = File(...), key: str = ""):
-    """One-time: load the trained ONNX model onto the volume so RAW drawings get model auto-markup.
-    Guarded by ADMIN_KEY. Persists to /data (survives redeploys)."""
+async def upload_model(model: UploadFile = File(...), key: str = "", slot: str = ""):
+    """One-time: load a trained ONNX model onto the volume. Guarded by ADMIN_KEY.
+    slot="" -> the extent model (/data/model.onnx, v11 path); slot="v13" -> the
+    boundary model (/data/model_v13.onnx) — its PRESENCE activates the v13 reader."""
     if key != os.environ.get("ADMIN_KEY", "bfs-model-load"):
         raise HTTPException(403, "bad key")
     data = await model.read()
+    if slot == "v13":
+        path = os.environ.get("V13_ONNX", "/data/model_v13.onnx")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as fh:
+            fh.write(data)
+        return {"ok": True, "bytes": len(data), "slot": "v13"}
     path = os.environ.get("MODEL_ONNX", "/data/model.onnx")
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "wb") as fh:
