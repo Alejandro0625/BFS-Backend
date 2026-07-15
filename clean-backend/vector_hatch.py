@@ -16,6 +16,35 @@ import math
 import fitz
 import texture  # reuse the robust scale reader
 
+# PROCESS-WIDE get_drawings CACHE (SLA profiler 2026-07-15: the SAME page's vector
+# content was parsed 18-24x per detect() — ~25s of a 73s page). Same page content →
+# same parse; every caller treats the result as READ-ONLY (verified by the byte-
+# identical exam gate). No-arg calls only; argful calls pass through untouched.
+_GD_ORIG = fitz.Page.get_drawings
+_GD_CACHE = {}
+
+
+def _gd_cached(self, *a, **k):
+    if a or k:
+        return _GD_ORIG(self, *a, **k)
+    try:
+        import hashlib as _gd_hash
+        c = self.read_contents() or b""
+        key = (self.number, len(c), _gd_hash.md5(c[:4096]).hexdigest())
+        del c
+    except Exception:
+        return _GD_ORIG(self)
+    hit = _GD_CACHE.get(key)
+    if hit is None:
+        hit = _GD_ORIG(self)
+        if len(_GD_CACHE) > 24:
+            _GD_CACHE.clear()
+        _GD_CACHE[key] = hit
+    return hit
+
+
+fitz.Page.get_drawings = _gd_cached
+
 MIN_SF = 100          # REVERTED: 30 let junk specks become stepping stones that chained welds
 MAX_REGIONS = 120     # 80 capped out on 113-wall multifamily sheets (Avita p3/p4: real walls
                       # were budget-starved); sprawl-era risks are held by the anti-sprawl
