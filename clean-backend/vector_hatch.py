@@ -1148,7 +1148,10 @@ def detect(pdf_bytes, page_index, zoom=None):
                         mat_e = pex.get("material") or ""
                         ea = max(1e-9, (ex1 - ex0) * (ey1 - ey0))
                         mutual = (ix * iy > 0.7 * ca) and (ix * iy > 0.7 * ea)
-                        if mat_e == "Wall area (confirm)" or \
+                        import re as _rec
+                        _junk_e = bool(_rec.match(r"^[A-Z][-–_]?\d{1,2}$", (mat_e or "").upper())
+                                       or _rec.search(r"\b[BT]\.?O\.?\b", (mat_e or "").upper()))
+                        if mat_e == "Wall area (confirm)" or _junk_e or \
                            (mat_e.startswith("Panel wall") and mutual):
                             # the gray fill is the BACKING of this colored band (mutual
                             # cover) — the color IS the material statement, gray yields.
@@ -1158,6 +1161,13 @@ def detect(pdf_bytes, page_index, zoom=None):
                             clash = True
                             break
                     if clash:
+                        try:
+                            import os as _osc
+                            if _osc.environ.get("VH_COLOR_DEBUG"):
+                                print(f"[color] veto {sfc_:.0f}sf region by "
+                                      f"'{(mat_e or '?')[:32]}' ({pex.get('area_sf')}sf)", flush=True)
+                        except Exception:
+                            pass
                         continue
                     for pex in repl_c:
                         try:
@@ -1870,9 +1880,25 @@ def _v13_regions(pdf_bytes, page_index, polys, W, H, ft_pt, max_new=40):
         sf = a_px * (px2pt ** 2) * (ft_pt ** 2)
         if sf < 40 or sf > 20000:
             continue
-        cs, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        cs, hier_v = cv2.findContours(m, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
         if not cs:
             continue
+        # ROOF DISCRIMINATOR (viz-diagnosed over-bias: gray gables read as wall):
+        # a big piece with <2 window-shaped holes is a roof — size can't separate
+        # walls from roofs, fenestration can (the gray reader's proven rule).
+        if sf > 300:
+            win_holes = 0
+            for ci_v, cc in enumerate(cs):
+                if hier_v is None or hier_v[0][ci_v][3] == -1:
+                    continue            # outer ring, not a hole
+                ha = cv2.contourArea(cc)
+                hsf = ha * (px2pt ** 2) * (ft_pt ** 2)
+                hx, hy, hw, hh = cv2.boundingRect(cc)
+                if hsf >= 5 and hw > 0 and hh > 0 and \
+                   0.15 <= hw / hh <= 6.0 and ha >= 0.35 * hw * hh:
+                    win_holes += 1
+            if win_holes < 2:
+                continue
         c = max(cs, key=cv2.contourArea)
         ap = cv2.approxPolyDP(c, 0.01 * cv2.arcLength(c, True), True).reshape(-1, 2)
         if len(ap) < 3:
