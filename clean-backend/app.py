@@ -1135,6 +1135,27 @@ def evidence_pdf(jid: str, materials: str = ""):
     y += 6; cov.draw_line((50, y), (500, y), color=(0.8, 0.83, 0.87)); y += 22
     cov.insert_text((50, y), "TOTAL", fontsize=12, color=(0.05, 0.11, 0.18))
     cov.insert_text((360, y), f"{tot:,.0f} SF", fontsize=12, color=(0.05, 0.11, 0.18))
+    # BID-READINESS block: provenance + verify-first — the questions a GC exec asks.
+    y += 34
+    cov.insert_text((50, y), "How these numbers were measured", fontsize=11, color=(0.05, 0.11, 0.18)); y += 16
+    cov.insert_text((50, y), "Every region is read from the drawing's own geometry (seams, fills, tags,", fontsize=8.5, color=(0.35, 0.4, 0.45)); y += 12
+    cov.insert_text((50, y), "trained boundary model) and carries its arithmetic: gross - openings = net.", fontsize=8.5, color=(0.35, 0.4, 0.45)); y += 18
+    nflag = 0
+    flagged = []
+    for el in j.get("takeoffData", []):
+        for fl in (el.get("flags") or []):
+            nflag += 1
+            if len(flagged) < 6 and not str(fl).startswith("✓"):
+                flagged.append((el.get("pageNumber"), str(fl)[:86]))
+    unver = [el.get("pageNumber") for el in j.get("takeoffData", [])
+             if el.get("scaleSource") == "default"]
+    cov.insert_text((50, y), "Verify first:", fontsize=10, color=(0.7, 0.35, 0.05)); y += 14
+    if unver:
+        cov.insert_text((58, y), f"- Pages {', '.join(str(p) for p in unver[:8])}: scale unconfirmed - calibrate before trusting SF", fontsize=8.5, color=(0.55, 0.3, 0.05)); y += 12
+    for pn9, fl in flagged:
+        cov.insert_text((58, y), f"- p{pn9}: {fl}", fontsize=8.5, color=(0.55, 0.3, 0.05)); y += 12
+    if not unver and not flagged:
+        cov.insert_text((58, y), "- No open flags. All scales confirmed.", fontsize=8.5, color=(0.15, 0.5, 0.25)); y += 12
     # each page: OUTLINE each kept region in its color + label the SF (a real marked-up sheet)
     for el in j.get("takeoffData", []):
         pn = el.get("pageNumber")
