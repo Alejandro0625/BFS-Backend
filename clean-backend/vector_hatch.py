@@ -1992,6 +1992,7 @@ def _v13_regions(pdf_bytes, page_index, polys, W, H, ft_pt, max_new=40):
     boundaries, grown back over interior|boundary so each wall regains its full extent
     (full-band charge = the best of 4 measured configs, v13_eval_multi 2026-07-14).
     Gates mirror the rc reader: raster-underlay pages only, virgin territory only."""
+    global _V13_SESS
     import os as _os
     import numpy as np, cv2
     if max_new <= 0:
@@ -2027,7 +2028,29 @@ def _v13_regions(pdf_bytes, page_index, polys, W, H, ft_pt, max_new=40):
             except Exception:
                 pass
             if fa < 0.15 * W * H:
-                return []
+                # SELF-GATING PROBE (Essex/Fenn class: 0-1% raster, ~4% fills, yet v13
+                # standalone finds 15-37 walls on their line-rendered elevations — every
+                # hand gate excludes them). Let the MODEL decide: one cheap 384px
+                # inference; proceed only when wall-interior response >= 8% of the page.
+                try:
+                    if _V13_SESS is None:
+                        import onnxruntime as ort
+                        _V13_SESS = ort.InferenceSession(mp, providers=["CPUExecutionProvider"])
+                    zp = 384.0 / max(W, H)
+                    d9p = fitz.open(stream=pdf_bytes, filetype="pdf")
+                    pixp = d9p[page_index].get_pixmap(matrix=fitz.Matrix(zp, zp), alpha=False)
+                    imp = np.frombuffer(pixp.samples, np.uint8).reshape(pixp.height, pixp.width, pixp.n)[:, :, :3]
+                    d9p.close()
+                    ph9, pw9 = imp.shape[:2]
+                    padp = np.zeros((384, 384, 3), np.uint8)
+                    padp[:min(384, ph9), :min(384, pw9)] = imp[:384, :384]
+                    xp = (padp.astype(np.float32) / 255.0).transpose(2, 0, 1)[None]
+                    lgp = _V13_SESS.run(None, {"input": xp})[0][0]
+                    interp = (lgp.argmax(0) == 1)[:min(384, ph9), :min(384, pw9)]
+                    if float(interp.mean()) < 0.08:
+                        return []
+                except Exception:
+                    return []
         # PERF BUDGET (77-page load test measured ~40s/page with inference — a huge
         # set must never cost an hour): cap v13 inference to V13_MAX_PAGES per doc.
         # The frozen exam reads <=6 pages/job, so the cap never binds there.
@@ -2046,7 +2069,6 @@ def _v13_regions(pdf_bytes, page_index, polys, W, H, ft_pt, max_new=40):
         img = np.frombuffer(pix.samples, np.uint8).reshape(pix.height, pix.width, pix.n)[:, :, :3].copy()
     finally:
         doc.close()
-    global _V13_SESS
     if _V13_SESS is None:
         import onnxruntime as ort
         _V13_SESS = ort.InferenceSession(mp, providers=["CPUExecutionProvider"])
