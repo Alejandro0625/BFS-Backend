@@ -167,13 +167,29 @@ _JOINT_STITCH = 8.0        # collinear gaps ≤8pt bridge (line broken by ticks/
 _JOINT_MIN_PIECE_FRAC = 0.02  # drop split slivers under 2% of the face
 
 
+_HL_CACHE = {}
+
+
 def _heavy_lines(pg):
     """H/V strokes in display coords, split HEAVY (structure) vs HAIRLINE (pattern).
     Ink classes are RELATIVE to this sheet (a human reads 'the heaviest ink here', not
     absolute points): outline-class = ≥85% of the sheet's max stroke, heavy = ≥45%.
     Fleet: max 1.56 → heavy ≥0.70 (1.32+1.56), outline ≥1.33 (1.56 only) — identical to
     the absolute rules it was tuned on; sheets drawn lighter now classify the same way.
-    Returns (vs_heavy, hs_heavy, vs_hair, hs_hair, outline_th)."""
+    Returns (vs_heavy, hs_heavy, vs_hair, hs_hair, outline_th).
+    CACHED per page content (SLA profiler 2026-07-15: called ~10x/page — every
+    split_face_at_joints re-derived it; ~30s of a 50s page was THIS function). Same
+    inputs → same outputs; callers only iterate the returned lists, never mutate."""
+    try:
+        import hashlib as _hl_hash
+        _hl_c = pg.read_contents() or b""
+        _key = (pg.number, len(_hl_c), _hl_hash.md5(_hl_c[:4096]).hexdigest())
+        del _hl_c
+        hit = _HL_CACHE.get(_key)
+        if hit is not None:
+            return hit
+    except Exception:
+        _key = None
     rot = pg.rotation_matrix
     drawings = pg.get_drawings()
     wmax = 0.0
@@ -208,7 +224,15 @@ def _heavy_lines(pg):
                 (vs if heavy else vh).append(((p0.x + p1.x) / 2, min(p0.y, p1.y), max(p0.y, p1.y), wd))
             elif dx >= 8 and dy <= 1.5:
                 (hs if heavy else hh).append(((p0.y + p1.y) / 2, min(p0.x, p1.x), max(p0.x, p1.x), wd))
-    return vs, hs, [(c, a, b) for c, a, b, _ in vh], [(c, a, b) for c, a, b, _ in hh], outline_th
+    _hl_out = (vs, hs, [(c, a, b) for c, a, b, _ in vh], [(c, a, b) for c, a, b, _ in hh], outline_th)
+    try:
+        if _key is not None:
+            if len(_HL_CACHE) > 48:
+                _HL_CACHE.clear()
+            _HL_CACHE[_key] = _hl_out
+    except Exception:
+        pass
+    return _hl_out
 
 
 def _content_differs(vs_hair, hs_hair, axis, c, b0, b1, lo, hi):
