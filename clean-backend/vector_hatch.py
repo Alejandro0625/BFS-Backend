@@ -1798,6 +1798,7 @@ def _apply_view_scales(pdf_bytes, page_index, polys, W, H, page_scale):
 
 
 _V13_SESS = None
+_V13_BUDGET = {}    # doc fingerprint -> pages already inferred (perf guard, huge sets)
 
 
 def _v13_regions(pdf_bytes, page_index, polys, W, H, ft_pt, max_new=40):
@@ -1843,6 +1844,19 @@ def _v13_regions(pdf_bytes, page_index, polys, W, H, ft_pt, max_new=40):
                 pass
             if fa < 0.15 * W * H:
                 return []
+        # PERF BUDGET (77-page load test measured ~40s/page with inference — a huge
+        # set must never cost an hour): cap v13 inference to V13_MAX_PAGES per doc.
+        # The frozen exam reads <=6 pages/job, so the cap never binds there.
+        try:
+            fp_key = (len(pdf_bytes), hash(pdf_bytes[:4096]))
+            n_run = _V13_BUDGET.get(fp_key, 0)
+            if n_run >= int(_os.environ.get("V13_MAX_PAGES", "8")):
+                return []
+            _V13_BUDGET[fp_key] = n_run + 1
+            if len(_V13_BUDGET) > 300:
+                _V13_BUDGET.clear()
+        except Exception:
+            pass
         z = 1536.0 / max(W, H)
         pix = pg.get_pixmap(matrix=fitz.Matrix(z, z), alpha=False)
         img = np.frombuffer(pix.samples, np.uint8).reshape(pix.height, pix.width, pix.n)[:, :, :3].copy()
