@@ -49,6 +49,17 @@ jobs = {}  # jobId -> dict  (in-memory hot cache, bounded to MAX_MEM_JOBS)
 # Now: keep a small hot set in RAM, persist each job to the volume, rehydrate on demand.
 def _job_dir(jid): return os.path.join(JOBS_DIR, str(jid))
 
+BIG_PDF_BYTES = int(os.environ.get("BIG_PDF_BYTES", str(200 * 1024 * 1024)))
+
+def _load_pdf_bytes(path):
+    """HEAVY-DOC SAFETY, phase 1: uploads now STREAM to disk (no doubled RAM while a
+    giant uploads+parses). Processing still loads bytes — PyMuPDF rejects mmap objects
+    ('bad stream: mmap.mmap', tested 2026-07-15), so true zero-copy needs the
+    path-based refactor (every fitz.open(stream=...) site accepts a file path via a
+    small _open() helper). That is phase 2 — its own gated cycle."""
+    with open(path, "rb") as fh:
+        return fh.read()
+
 def _persist_job(jid):
     """Snapshot a job to the volume so it survives eviction + restarts. Best-effort (no-op if no volume)."""
     job = jobs.get(jid)
@@ -73,7 +84,7 @@ def _load_job(jid):
         for k in ("polygons_by_page", "dims_by_page"):  # JSON stringifies int page keys → restore them
             meta[k] = {int(kk): vv for kk, vv in (meta.get(k) or {}).items()}
         p = os.path.join(d, "input.pdf")
-        meta["pdf"] = open(p, "rb").read() if os.path.exists(p) else None
+        meta["pdf"] = _load_pdf_bytes(p) if os.path.exists(p) else None
         return meta
     except Exception:
         return None
@@ -94,15 +105,29 @@ def _evict_mem():
         if jobs[jid].get("status") in ("done", "error"):
             _persist_job(jid); jobs.pop(jid, None)
 
+MAX_DISK_GB = float(os.environ.get("MAX_DISK_GB", "20"))   # heavy-doc safety: cap SIZE too
+
 def _gc_disk():
-    """Keep the volume bounded — prune the oldest persisted job folders."""
+    """Keep the volume bounded — prune oldest job folders by COUNT and by TOTAL SIZE
+    (200 giant sets could fill the volume long before the count cap fires)."""
     try:
         if not os.path.isdir(JOBS_DIR): return
         dirs = [os.path.join(JOBS_DIR, d) for d in os.listdir(JOBS_DIR)]
         dirs = [d for d in dirs if os.path.isdir(d)]
-        if len(dirs) <= MAX_DISK_JOBS: return
+        def _dsize(d):
+            t = 0
+            try:
+                for f in os.listdir(d):
+                    t += os.path.getsize(os.path.join(d, f))
+            except Exception:
+                pass
+            return t
         dirs.sort(key=lambda d: os.path.getmtime(d))
-        for d in dirs[:-MAX_DISK_JOBS]:
+        total = sum(_dsize(d) for d in dirs)
+        budget = MAX_DISK_GB * 1024 ** 3
+        while dirs and (len(dirs) > MAX_DISK_JOBS or total > budget):
+            d = dirs.pop(0)
+            total -= _dsize(d)
             shutil.rmtree(d, ignore_errors=True)
     except Exception:
         pass
@@ -645,8 +670,19 @@ def process(jid, pdf_bytes):
 # ── endpoints ──────────────────────────────────────────────────────────────
 @app.post("/analyze")
 async def analyze(background_tasks: BackgroundTasks, pdf: UploadFile = File(...)):
-    data = await pdf.read()
     jid = f"{int(time.time() * 1000)}-{uuid.uuid4().hex[:6]}"  # collision-proof (no same-ms overwrite)
+    # STREAM the upload to disk in chunks — never hold a whole giant set in RAM.
+    # (await pdf.read() on a 1GB file was the OOM vector for heavy documents.)
+    d = _job_dir(jid)
+    os.makedirs(d, exist_ok=True)
+    path = os.path.join(d, "input.pdf")
+    with open(path, "wb") as fh:
+        while True:
+            chunk = await pdf.read(8 * 1024 * 1024)
+            if not chunk:
+                break
+            fh.write(chunk)
+    data = _load_pdf_bytes(path)
     jobs[jid] = {"status": "queued", "phase": "idle", "log": [], "progress": {"label": "Queued", "pct": 0},
                  "legend": [], "takeoffData": [], "scheduleData": None, "error": None,
                  "polygons_by_page": {}, "dims_by_page": {}, "pdf": data}
@@ -1026,8 +1062,17 @@ def process_compare(jid, data):
 
 @app.post("/compare")
 async def compare(background_tasks: BackgroundTasks, pdf: UploadFile = File(...)):
-    data = await pdf.read()
     jid = f"{int(time.time() * 1000)}-{uuid.uuid4().hex[:6]}"
+    d = _job_dir(jid)
+    os.makedirs(d, exist_ok=True)
+    path = os.path.join(d, "input.pdf")
+    with open(path, "wb") as fh:
+        while True:
+            chunk = await pdf.read(8 * 1024 * 1024)
+            if not chunk:
+                break
+            fh.write(chunk)
+    data = _load_pdf_bytes(path)
     jobs[jid] = {"status": "processing", "phase": "compare", "log": [],
                  "progress": {"label": "Reading the estimator's takeoff…", "pct": 5},
                  "legend": [], "takeoffData": [], "scheduleData": None, "error": None,
@@ -1209,6 +1254,34 @@ async def upload_model(model: UploadFile = File(...), key: str = "", slot: str =
         fh.write(data)
     model_infer.reset()
     return {"ok": True, "bytes": len(data), "model_available": model_infer.available()}
+
+@app.get("/admin/export-corrections")
+def export_corrections(key: str = "", since: str = ""):
+    """Flywheel export: every /learn label captured by the live app (renames, deletes,
+    splits, bucket confirms, final-* answer keys) as one JSON payload — the raw
+    material for the v14 dataset. Labels only (PDFs stay on the volume; fetch a
+    specific correction's drawing separately if needed). Key-gated like upload-model."""
+    if key != os.environ.get("ADMIN_KEY", "bfs-model-load"):
+        raise HTTPException(403, "bad key")
+    out = []
+    try:
+        for d in sorted(os.listdir(CORR_DIR)):
+            if since and d <= since:
+                continue
+            lp = os.path.join(CORR_DIR, d, "labels.json")
+            if not os.path.isfile(lp):
+                continue
+            try:
+                with open(lp, encoding="utf-8") as fh:
+                    rec = json.load(fh)
+                rec["_ts"] = d
+                rec["_has_pdf"] = os.path.isfile(os.path.join(CORR_DIR, d, "drawing.pdf"))
+                out.append(rec)
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return {"n": len(out), "corrections": out}
 
 @app.get("/health")
 def health():
