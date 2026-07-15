@@ -1181,6 +1181,7 @@ def detect(pdf_bytes, page_index, zoom=None):
                                   "fill_color": rgb, "source": "vector",
                                   "material": cname, "category": cname,
                                   "group": cname, "sf_exact": True, "_colorpiece": True,
+                                  "stmt": True,   # drawn color = a STATEMENT; outranks floods at dedup
                                   "holes": [], "named_by_tag": bool(col_names.get(key)),
                                   "label": f"~{round(sfc_):,} SF"})
         except Exception:
@@ -1515,10 +1516,38 @@ def detect(pdf_bytes, page_index, zoom=None):
             cv2.fillPoly(covered9, [cnt9], 1)
         keep9 = list(early9)
         kept_late9 = []                    # (group, bbox) of admitted late pieces
+        # masks of ANONYMOUS early pieces (unnamed floods / datum-named / grid marks):
+        # a drawn STATEMENT may reclaim territory from these — an anonymous flood is a
+        # guess, and the guess yields (never the other way around). Real material-named
+        # early pieces stay untouchable.
+        import re as _re9b
+        def _anon9(q):
+            mt = (q.get("material") or "").upper()
+            return (mt == "WALL AREA (CONFIRM)"
+                    or bool(_re9b.match(r"^[A-Z][-–_]?\d{1,2}$", mt))
+                    or bool(_re9b.search(r"\b[BT]\.?O\.?\b", mt)))
+        anon9 = []
+        anon_mask9 = np.zeros((MH9, MW9), np.uint8)
+        for q in early9:
+            if _anon9(q):
+                qm = np.zeros((MH9, MW9), np.uint8)
+                cv2.fillPoly(qm, [np.array([[int(x * MW9), int(y * MH9)]
+                                            for x, y in q["points"]], np.int32)], 1)
+                qa = int(qm.sum())
+                if qa:
+                    anon9.append((q, qm, qa))
+                    anon_mask9 |= qm
         def _bb9(p):
             xs = [x for x, _ in p["points"]]; ys = [y for _, y in p["points"]]
             return (min(xs), min(ys), max(xs), max(ys))
-        for p in sorted(late9, key=lambda q: -q.get("area_sf", 0)):
+        # OWNERSHIP RESOLUTION: drawn STATEMENTS (color/rendered pieces) claim their
+        # territory before anonymous floods, regardless of size — 26-179's 2743sf
+        # EPT-1 flood was shaving the 1632sf keynote band that matches his 1693 wall.
+        def _prio9(q):
+            m9n = (q.get("material") or "")
+            is_stmt = bool(q.get("stmt")) or m9n.startswith("Color fill") or m9n.startswith("Rendered")
+            return (0 if is_stmt else 1, -q.get("area_sf", 0))
+        for p in sorted(late9, key=_prio9):
             cnt9 = np.array([[int(x * MW9), int(y * MH9)] for x, y in p["points"]], np.int32)
             m9 = np.zeros((MH9, MW9), np.uint8)
             cv2.fillPoly(m9, [cnt9], 1)
@@ -1544,8 +1573,31 @@ def detect(pdf_bytes, page_index, zoom=None):
                     break
             if twin:
                 continue
-            ov9 = int((m9 & covered9).sum()) / a9
+            ov_px9 = int((m9 & covered9).sum())
+            ov9 = ov_px9 / a9
+            is_stmt9 = bool(p.get("stmt")) or (p.get("material") or "").startswith(("Color fill", "Rendered"))
+            if 0.25 < ov9 <= 0.9 and is_stmt9 and anon9:
+                # STATEMENT RECLAIM: the part of this overlap sitting on anonymous
+                # early floods is not a real conflict — the flood guessed, the drawn
+                # color states. Shave those floods by the claimed fraction instead,
+                # and only charge the statement for overlap with REAL named pieces.
+                anon_ov9 = int((m9 & anon_mask9).sum())
+                eff9 = (ov_px9 - anon_ov9) / a9
+                if eff9 <= 0.25:
+                    for q, qm, qa in anon9:
+                        ovq = int((m9 & qm).sum())
+                        if ovq > 0.02 * qa:
+                            q["area_sf"] = round(max(0.0, q["area_sf"] * (1 - ovq / qa)), 1)
+                            q["label"] = f"~{round(q['area_sf']):,} SF"
+                    ov9 = eff9      # statement keeps its SF (minus any real conflict)
             if 0.25 < ov9 <= 0.9:
+                try:
+                    import os as _os9
+                    if _os9.environ.get("VH_LATE_DEBUG"):
+                        print(f"[late] SHAVE {p.get('area_sf')}sf '{(p.get('material') or '?')[:26]}' "
+                              f"stmt={bool(p.get('stmt'))} ov={ov9:.2f}", flush=True)
+                except Exception:
+                    pass
                 p = dict(p)
                 p["area_sf"] = round(p.get("area_sf", 0) * (1 - ov9), 1)
                 p["label"] = f"~{round(p['area_sf']):,} SF"
