@@ -1373,6 +1373,109 @@ def detect(pdf_bytes, page_index, zoom=None):
                     newp = split6
                 except Exception:
                     pass
+                # FLOOD SNAP-OUT (217A measured truth: the soffit legs already TOUCH —
+                # the -24% is the flood stopping ~10pt INSIDE the drawn border line).
+                # Rect-like tag floods (fill >=80% of own bbox) expand each edge OUT to
+                # the nearest heavy line within 12pt that spans >=60% of the edge; SF
+                # recomputed from the expanded rect. Never shrinks, never crosses ink.
+                try:
+                    import snap_fill as _sf8
+                    d8 = fitz.open(stream=pdf_bytes, filetype="pdf")
+                    vs8, hs8, _v8, _h8, _o8 = _sf8._heavy_lines(d8[page_index])
+                    d8.close()
+                    from shapely.geometry import Polygon as _P8
+                    for p in newp:
+                        try:
+                            poly8 = _P8([(x * W, y * H) for x, y in p["points"]]).buffer(0)
+                            if poly8.is_empty:
+                                continue
+                            bx0, by0, bx1, by1 = poly8.bounds
+                            bw8, bh8 = bx1 - bx0, by1 - by0
+                            if bw8 <= 0 or bh8 <= 0 or poly8.area < 0.8 * bw8 * bh8:
+                                continue        # only rect-like floods snap out
+                            nx0, ny0, nx1, ny1 = bx0, by0, bx1, by1
+                            for (yc, lo8, hi8, wd8) in hs8:
+                                if min(hi8, bx1) - max(lo8, bx0) < 0.6 * bw8:
+                                    continue
+                                if by0 - 12 <= yc < by0:
+                                    ny0 = min(ny0, yc)
+                                elif by1 < yc <= by1 + 12:
+                                    ny1 = max(ny1, yc)
+                            for (xc, lo8, hi8, wd8) in vs8:
+                                if min(hi8, by1) - max(lo8, by0) < 0.6 * bh8:
+                                    continue
+                                if bx0 - 12 <= xc < bx0:
+                                    nx0 = min(nx0, xc)
+                                elif bx1 < xc <= bx1 + 12:
+                                    nx1 = max(nx1, xc)
+                            if (nx0, ny0, nx1, ny1) == (bx0, by0, bx1, by1):
+                                continue
+                            p["points"] = [[round(nx0 / W, 5), round(ny0 / H, 5)],
+                                           [round(nx1 / W, 5), round(ny0 / H, 5)],
+                                           [round(nx1 / W, 5), round(ny1 / H, 5)],
+                                           [round(nx0 / W, 5), round(ny1 / H, 5)]]
+                            p["area_sf"] = round((nx1 - nx0) * (ny1 - ny0) * ft_pt * ft_pt, 1)
+                            p["label"] = f"~{round(p['area_sf']):,} SF"
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+                # (L-corner notch kept below — inert on 217A per measurements, may serve
+                # true gapped-corner jobs; harmless: pure-gain + exam-gated.)
+                try:
+                    def _bb7(p):
+                        xs7 = [x * W for x, _ in p["points"]]; ys7 = [y * H for _, y in p["points"]]
+                        return (min(xs7), min(ys7), max(xs7), max(ys7))
+                    notches = 0
+                    for i7 in range(len(newp)):
+                        if notches >= 6:
+                            break
+                        for j7 in range(i7 + 1, len(newp)):
+                            A, B = newp[i7], newp[j7]
+                            if (A.get("material") or "") != (B.get("material") or ""):
+                                continue
+                            a = _bb7(A); b = _bb7(B)
+                            aw, ah = a[2] - a[0], a[3] - a[1]
+                            bw, bh = b[2] - b[0], b[3] - b[1]
+                            if aw >= ah and bh > bw:
+                                hz, vt = a, b       # horizontal leg, vertical leg
+                            elif ah > aw and bw >= bh:
+                                hz, vt = b, a
+                            else:
+                                continue
+                            n7 = (vt[0], hz[1], vt[2], hz[3])   # corner square
+                            if n7[2] - n7[0] <= 0 or n7[3] - n7[1] <= 0:
+                                continue
+                            # adjacency: notch must sit just past each leg (gap <= 8pt)
+                            gx = min(abs(n7[0] - hz[2]), abs(hz[0] - n7[2]))
+                            gy = min(abs(n7[1] - vt[3]), abs(vt[1] - n7[3]))
+                            if gx > 8 or gy > 8:
+                                continue
+                            # no overlap with either leg
+                            if not (n7[2] <= hz[0] + 2 or n7[0] >= hz[2] - 2):
+                                continue
+                            if not (n7[3] <= vt[1] + 2 or n7[1] >= vt[3] - 2):
+                                continue
+                            nsf = (n7[2] - n7[0]) * (n7[3] - n7[1]) * ft_pt * ft_pt
+                            a_sf = A.get("area_sf", 0); b_sf = B.get("area_sf", 0)
+                            if nsf < 4 or nsf > 0.6 * max(1e-9, min(a_sf, b_sf)):
+                                continue
+                            normn = [[round(n7[0] / W, 5), round(n7[1] / H, 5)],
+                                     [round(n7[2] / W, 5), round(n7[1] / H, 5)],
+                                     [round(n7[2] / W, 5), round(n7[3] / H, 5)],
+                                     [round(n7[0] / W, 5), round(n7[3] / H, 5)]]
+                            newp.append({"points": normn, "area_sf": round(nsf, 1),
+                                         "cx": round((n7[0] + n7[2]) / 2 / W, 5),
+                                         "cy": round((n7[1] + n7[3]) / 2 / H, 5),
+                                         "fill_color": A.get("fill_color"), "source": "vector",
+                                         "material": A.get("material"),
+                                         "category": A.get("category"),
+                                         "group": A.get("group"), "sf_exact": True,
+                                         "holes": [], "label": f"~{round(nsf):,} SF"})
+                            notches += 1
+                            break
+                except Exception:
+                    pass
                 polys += newp
         except Exception:
             pass
