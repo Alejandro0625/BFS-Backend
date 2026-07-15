@@ -1825,7 +1825,24 @@ def _v13_regions(pdf_bytes, page_index, polys, W, H, ft_pt, max_new=40):
         except Exception:
             pass
         if img_area < 0.25 * W * H:
-            return []
+            # not a raster underlay — but Avalon/Rivers-Edge/Essex render their siding
+            # as VECTOR FILLS (0-1% image, yet fully 'rendered' to the eye; v13 found
+            # 30/15/37 walls there standalone). Admit pages whose non-white fill paths
+            # cover >=15% of the sheet; sparse-line CAD sheets (Fleet) stay excluded.
+            fa = 0.0
+            try:
+                for d in pg.get_drawings():
+                    f = d.get("fill")
+                    if not f or len(f) < 3 or min(f[:3]) > 0.93:
+                        continue
+                    for it in d.get("items") or []:
+                        if it[0] == "re":
+                            r = it[1]
+                            fa += abs((r.x1 - r.x0) * (r.y1 - r.y0))
+            except Exception:
+                pass
+            if fa < 0.15 * W * H:
+                return []
         z = 1536.0 / max(W, H)
         pix = pg.get_pixmap(matrix=fitz.Matrix(z, z), alpha=False)
         img = np.frombuffer(pix.samples, np.uint8).reshape(pix.height, pix.width, pix.n)[:, :, :3].copy()
@@ -1898,6 +1915,8 @@ def _v13_regions(pdf_bytes, page_index, polys, W, H, ft_pt, max_new=40):
                    0.15 <= hw / hh <= 6.0 and ha >= 0.35 * hw * hh:
                     win_holes += 1
             if win_holes < 2:
+                if _os.environ.get("VH_V13_DEBUG"):
+                    print(f"[v13] cand {sf:.0f}sf DIES: roof-cap (holes {win_holes})", flush=True)
                 continue
         c = max(cs, key=cv2.contourArea)
         ap = cv2.approxPolyDP(c, 0.01 * cv2.arcLength(c, True), True).reshape(-1, 2)
@@ -1915,6 +1934,8 @@ def _v13_regions(pdf_bytes, page_index, polys, W, H, ft_pt, max_new=40):
                 clash = True
                 break
         if clash:
+            if _os.environ.get("VH_V13_DEBUG"):
+                print(f"[v13] cand {sf:.0f}sf DIES: virgin clash", flush=True)
             continue
         cx = round(sum(q[0] for q in norm) / len(norm), 5)
         cy = round(sum(q[1] for q in norm) / len(norm), 5)
