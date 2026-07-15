@@ -92,7 +92,34 @@ def compute(polys, pw, ph, ft_per_pt):
                 bx, by = hp[(j + 1) % m]
                 open_pt += math.hypot(bx - ax, by - ay)
 
-    v_ft = _dedupe(edges_v, "v") * ft_per_pt
+    # EXTERIOR-ONLY CORNERS (LF bench 2026-07-15: autoTrim ran 2.67x over — after
+    # first-paint splitting EVERY interior joint's vertical edge counted as a corner;
+    # his takeoffs price BUILDING corners). A vertical line is exterior when cladding
+    # exists on only ONE side of it; interior joints (pieces on both sides) are panel
+    # joints, not corner trim.
+    bbs = []
+    for p in polys:
+        xs = [x * pw for x, _ in (p.get("points") or [])]
+        ys = [y * ph for _, y in (p.get("points") or [])]
+        if xs and ys:
+            bbs.append((min(xs), min(ys), max(xs), max(ys)))
+    ext_v = []
+    for (x0, y0, x1, y1) in edges_v:
+        xc = (x0 + x1) / 2
+        ylo, yhi = min(y0, y1), max(y0, y1)
+        left = right = False
+        for (bx0, by0, bx1, by1) in bbs:
+            if min(yhi, by1) - max(ylo, by0) < 0.3 * (yhi - ylo):
+                continue
+            if bx0 < xc - 4:
+                left = True
+            if bx1 > xc + 4:
+                right = True
+            if left and right:
+                break
+        if not (left and right):
+            ext_v.append((x0, y0, x1, y1))
+    v_ft = _dedupe(ext_v, "v") * ft_per_pt
     diag_ft = diag_pt * ft_per_pt
     open_ft = open_pt * ft_per_pt
 
