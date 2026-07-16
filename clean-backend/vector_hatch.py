@@ -1661,7 +1661,11 @@ def detect(pdf_bytes, page_index, zoom=None):
         anon9 = []
         anon_mask9 = np.zeros((MH9, MW9), np.uint8)
         for q in early9:
-            if _anon9(q):
+            # reclaimable: anonymous floods AND tag-flood FRINGES (179 measured: EPT-1
+            # commits only 17% of itself to the statement's zone — an overshoot, not a
+            # claim; the statement is 71% committed. Tag floods keep their core, lose
+            # their fringe: the per-piece shave below is proportional by construction).
+            if _anon9(q) or (q.get("named_by_tag") and not q.get("stmt")):
                 qm = np.zeros((MH9, MW9), np.uint8)
                 cv2.fillPoly(qm, [np.array([[int(x * MW9), int(y * MH9)]
                                             for x, y in q["points"]], np.int32)], 1)
