@@ -124,30 +124,17 @@ def compute(polys, pw, ph, ft_per_pt):
     open_ft = open_pt * ft_per_pt
 
     # Base & top trim is the building's ground line + roofline — the silhouette width
-    # run twice. PER VIEW-CLUSTER (LF bench iter-2: multi-view sheets hold several
-    # elevations stacked vertically; one page-wide silhouette under-counts them, and
-    # unrelated views inflate each other). Cluster faces by VERTICAL bands (views are
-    # stacked rows on a sheet), silhouette per cluster, sum.
-    boxes = []
+    # run twice. SINGLE-SILHOUETTE (per-view clustering TRIED twice 2026-07-16 and
+    # REVERTED: no fixed y-gap separates stacked VIEWS from stacked WALL BANDS of one
+    # elevation — 0.02 doubled Fleet's base&top, 0.08 still +60%; the reference job's
+    # correctness outranks the multi-view aggregate. True per-view needs view_boxes-
+    # class view detection — banked with the elevation-classifier work.)
+    x_spans = []
     for p in polys:
         xs = [x for x, _ in (p.get("points") or [])]
-        ys = [y for _, y in (p.get("points") or [])]
-        if xs and ys:
-            boxes.append((min(xs) * pw, min(ys) * ph, max(xs) * pw, max(ys) * ph))
-    clusters = []
-    # iter-3: 8% gap bar — stacked walls of ONE elevation (Fleet tower/base bands sit
-    # ~2-6% apart) must stay ONE view; separate view rows on multi-view sheets sit
-    # further apart. (0.02 doubled Fleet's base&top — battery spot-check caught it.)
-    GAP = 0.08 * ph
-    for b in sorted(boxes, key=lambda t: t[1]):
-        for cl in clusters:
-            if not (b[3] < cl["y0"] - GAP or b[1] > cl["y1"] + GAP):
-                cl["y0"] = min(cl["y0"], b[1]); cl["y1"] = max(cl["y1"], b[3])
-                cl["spans"].append((b[0], b[2]))
-                break
-        else:
-            clusters.append({"y0": b[1], "y1": b[3], "spans": [(b[0], b[2])]})
-    silhouette_pt = sum(_union_len(cl["spans"]) for cl in clusters)
+        if xs:
+            x_spans.append((min(xs) * pw, max(xs) * pw))
+    silhouette_pt = _union_len(x_spans)
     base_top_ft = 2.0 * silhouette_pt * ft_per_pt
     # (interior horizontal boundaries are intentionally NOT reported: on toothed weld
     #  outlines they are geometry noise, not real band-transition trim — a wrong LF number
