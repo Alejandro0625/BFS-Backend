@@ -123,15 +123,27 @@ def compute(polys, pw, ph, ft_per_pt):
     diag_ft = diag_pt * ft_per_pt
     open_ft = open_pt * ft_per_pt
 
-    # Base & top trim is the building's ground line + roofline — i.e. the silhouette width
-    # run twice, NOT every internal horizontal boundary between stacked bands. Union the
-    # x-spans of all faces to get the true clad width, then double it (base + top).
-    x_spans = []
+    # Base & top trim is the building's ground line + roofline — the silhouette width
+    # run twice. PER VIEW-CLUSTER (LF bench iter-2: multi-view sheets hold several
+    # elevations stacked vertically; one page-wide silhouette under-counts them, and
+    # unrelated views inflate each other). Cluster faces by VERTICAL bands (views are
+    # stacked rows on a sheet), silhouette per cluster, sum.
+    boxes = []
     for p in polys:
         xs = [x for x, _ in (p.get("points") or [])]
-        if xs:
-            x_spans.append((min(xs) * pw, max(xs) * pw))
-    silhouette_pt = _union_len(x_spans)
+        ys = [y for _, y in (p.get("points") or [])]
+        if xs and ys:
+            boxes.append((min(xs) * pw, min(ys) * ph, max(xs) * pw, max(ys) * ph))
+    clusters = []
+    for b in sorted(boxes, key=lambda t: t[1]):
+        for cl in clusters:
+            if not (b[3] < cl["y0"] - 0.02 * ph or b[1] > cl["y1"] + 0.02 * ph):
+                cl["y0"] = min(cl["y0"], b[1]); cl["y1"] = max(cl["y1"], b[3])
+                cl["spans"].append((b[0], b[2]))
+                break
+        else:
+            clusters.append({"y0": b[1], "y1": b[3], "spans": [(b[0], b[2])]})
+    silhouette_pt = sum(_union_len(cl["spans"]) for cl in clusters)
     base_top_ft = 2.0 * silhouette_pt * ft_per_pt
     # (interior horizontal boundaries are intentionally NOT reported: on toothed weld
     #  outlines they are geometry noise, not real band-transition trim — a wrong LF number
