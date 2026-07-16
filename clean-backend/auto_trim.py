@@ -135,9 +135,13 @@ def compute(polys, pw, ph, ft_per_pt):
         if xs and ys:
             boxes.append((min(xs) * pw, min(ys) * ph, max(xs) * pw, max(ys) * ph))
     clusters = []
+    # iter-3: 8% gap bar — stacked walls of ONE elevation (Fleet tower/base bands sit
+    # ~2-6% apart) must stay ONE view; separate view rows on multi-view sheets sit
+    # further apart. (0.02 doubled Fleet's base&top — battery spot-check caught it.)
+    GAP = 0.08 * ph
     for b in sorted(boxes, key=lambda t: t[1]):
         for cl in clusters:
-            if not (b[3] < cl["y0"] - 0.02 * ph or b[1] > cl["y1"] + 0.02 * ph):
+            if not (b[3] < cl["y0"] - GAP or b[1] > cl["y1"] + GAP):
                 cl["y0"] = min(cl["y0"], b[1]); cl["y1"] = max(cl["y1"], b[3])
                 cl["spans"].append((b[0], b[2]))
                 break
