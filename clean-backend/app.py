@@ -1156,6 +1156,44 @@ def evidence_pdf(jid: str, materials: str = ""):
         cov.insert_text((58, y), f"- p{pn9}: {fl}", fontsize=8.5, color=(0.55, 0.3, 0.05)); y += 12
     if not unver and not flagged:
         cov.insert_text((58, y), "- No open flags. All scales confirmed.", fontsize=8.5, color=(0.15, 0.5, 0.25)); y += 12
+    # PER-WALL TABLE page(s): every zone with its page, SF, and reader provenance —
+    # the wall-by-wall receipt a reviewer can check against the drawing in seconds.
+    def _reader_of(z):
+        m = str(z.get("materialName") or "")
+        src9 = str(z.get("source") or "")
+        if "bluebeam" in src9:
+            return "Your markup (exact)"
+        for pre, nm in (("Hatched area", "Hatch reader"), ("Color fill", "Drawn color"),
+                        ("Rendered", "Rendered reader"), ("Wall area (AI boundary", "AI boundary model"),
+                        ("Wall band", "Story-band"), ("Wall area", "Structural flood"),
+                        ("Panel wall", "Drawn fill")):
+            if m.startswith(pre):
+                return nm
+        return "Drawing geometry"
+    rows = []
+    for el in j.get("takeoffData", []):
+        for z in el.get("zones", []):
+            if keep(z.get("materialName"), z.get("category")):
+                rows.append((el.get("pageNumber"), str(z.get("materialName") or "Material")[:38],
+                             z.get("netArea", 0), _reader_of(z)))
+    rows.sort(key=lambda r: -r[2])
+    ty = 792
+    tp = None
+    for i9, (pn9, mat9, sf9, rd9) in enumerate(rows[:120]):
+        if ty > 720:
+            tp = out.new_page(width=612, height=792)
+            tp.insert_text((50, 50), "Wall-by-wall detail", fontsize=13, color=(0.05, 0.11, 0.18))
+            tp.insert_text((50, 72), "Page", fontsize=8.5, color=(0.4, 0.45, 0.5))
+            tp.insert_text((90, 72), "Material / wall", fontsize=8.5, color=(0.4, 0.45, 0.5))
+            tp.insert_text((360, 72), "Net SF", fontsize=8.5, color=(0.4, 0.45, 0.5))
+            tp.insert_text((430, 72), "Measured by", fontsize=8.5, color=(0.4, 0.45, 0.5))
+            tp.draw_line((50, 80), (562, 80), color=(0.8, 0.83, 0.87))
+            ty = 96
+        tp.insert_text((50, ty), f"p{pn9}", fontsize=9)
+        tp.insert_text((90, ty), mat9, fontsize=9)
+        tp.insert_text((360, ty), f"{sf9:,.0f}", fontsize=9)
+        tp.insert_text((430, ty), rd9, fontsize=8.5, color=(0.35, 0.4, 0.45))
+        ty += 15
     # each page: OUTLINE each kept region in its color + label the SF (a real marked-up sheet)
     for el in j.get("takeoffData", []):
         pn = el.get("pageNumber")
