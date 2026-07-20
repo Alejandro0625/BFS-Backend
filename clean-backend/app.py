@@ -665,6 +665,30 @@ def process(jid, pdf_bytes):
                               f"(flattened set): {', '.join(m['text'] for m in ocr_mats[:3])}", "ok")
         except Exception:
             pass
+        # JOB-LEVEL SOFFIT/RETURN CROSS-CHECK (the $500K recall guard — BOTH paths):
+        # if ANY page of the set mentions soffits (or panel/canopy returns) but the
+        # finished takeoff contains no zone named for them, flag it loudly. Flags
+        # only — SF is never touched.
+        try:
+            _sr_pages = []
+            _sdoc2 = fitz.open(stream=pdf_bytes, filetype="pdf")
+            for _pi2 in range(len(_sdoc2)):
+                _t2 = (_sdoc2[_pi2].get_text() or "").upper()
+                if "SOFFIT" in _t2 or ("RETURN" in _t2 and ("PANEL" in _t2 or "CANOPY" in _t2 or "ACM" in _t2)):
+                    _sr_pages.append(_pi2 + 1)
+            _sdoc2.close()
+            if _sr_pages and job["takeoffData"]:
+                _named = any(("soffit" in str(z.get("materialName") or z.get("category") or "").lower())
+                             or ("return" in str(z.get("materialName") or z.get("category") or "").lower())
+                             for e in job["takeoffData"] for z in e["zones"])
+                if not _named:
+                    job["takeoffData"][-1].setdefault("flags", []).append(
+                        "⚠ JOB CHECK: the drawings mention soffits/returns on page(s) "
+                        + ", ".join(map(str, _sr_pages[:6])) + ("…" if len(_sr_pages) > 6 else "")
+                        + " but NO soffit/return zone exists in this takeoff — confirm they are"
+                          " measured or excluded before bidding (missed soffits have cost real money).")
+        except Exception:
+            pass
         total = sum(z["netArea"] for e in job["takeoffData"] for z in e["zones"])
         if auto_tried:  # never fail silently: say what the AI actually looked at
             jlog(job, f"Auto-detect scanned {auto_tried} page(s), found cladding on {auto_hits}", "warn" if auto_hits == 0 else "ok")
