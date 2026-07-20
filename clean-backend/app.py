@@ -1221,6 +1221,23 @@ def evidence_pdf(jid: str, materials: str = ""):
     return Response(content=data, media_type="application/pdf",
                     headers={"Content-Disposition": f'attachment; filename="BFS_Evidence_{jid}.pdf"'})
 
+@app.post("/bid-excel")
+def bid_excel_endpoint(payload: dict = Body(...)):
+    """Template-v2 BFS proposal workbook: clones the estimator's real letterhead
+    template (bid_template_v2.xlsx) and fills it her way — per-page quantity
+    addition formulas (=2049+321), Amount=Qty*Conv*Rate, TOTAL linked. Validated
+    13/13 cell-identical against the submitted 26-262 Malden bid."""
+    import bid_excel as _be
+    try:
+        data = _be.fill_bid(payload or {})
+    except Exception as ex:
+        raise HTTPException(500, f"bid excel failed: {ex}")
+    name = ((payload.get("job_number") or "bid") + " - " + (payload.get("job_name") or "proposal"))
+    safe = "".join(ch for ch in name if ch not in '\\/:*?"<>|')[:80]
+    return Response(content=data,
+                    media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    headers={"Content-Disposition": f'attachment; filename="{safe}.xlsx"'})
+
 @app.post("/scope-read")
 async def scope_read(pdf: UploadFile = File(...)):
     """Extract text (+ estimator's checkmarks/notes) from a scope PDF so the Scope tab can read PDFs, not just Excel."""
