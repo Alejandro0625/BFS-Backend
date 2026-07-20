@@ -1314,6 +1314,87 @@ async def upload_model(model: UploadFile = File(...), key: str = "", slot: str =
     model_infer.reset()
     return {"ok": True, "bytes": len(data), "model_available": model_infer.available()}
 
+@app.post("/split-suggest")
+def split_suggest(payload: dict = Body(...)):
+    """✂ SUGGESTIONS: v13's boundary channel proposes cut lines inside a selected
+    piece (probe-proven: boundary ink sits ON the estimator's wall edges at median
+    1.00). The estimator accepts with one click — and every accepted cut becomes
+    boundary supervision for v14. payload: {jobId, page(1-based), points([[x,y]..]
+    normalized)} → {cuts: [{axis:'v'|'h', pos: normalized, span:[a,b]}]}"""
+    jid = payload.get("jobId")
+    page = int(payload.get("page") or 0)
+    pts = payload.get("points") or []
+    j = get_job(jid)
+    if not j or not j.get("pdf") or page < 1 or len(pts) < 3:
+        raise HTTPException(400, "bad request")
+    import numpy as np, cv2
+    mp = os.environ.get("V13_ONNX", "/data/model_v13.onnx")
+    if not os.path.isfile(mp):
+        return {"cuts": [], "note": "boundary model not present"}
+    try:
+        doc = fitz.open(stream=j["pdf"], filetype="pdf")
+        pg = doc[page - 1]
+        W, H = pg.rect.width, pg.rect.height
+        z = 1536.0 / max(W, H)
+        pix = pg.get_pixmap(matrix=fitz.Matrix(z, z), alpha=False)
+        img = np.frombuffer(pix.samples, np.uint8).reshape(pix.height, pix.width, pix.n)[:, :, :3].copy()
+        doc.close()
+        import vector_hatch as _vh
+        if _vh._V13_SESS is None:
+            import onnxruntime as ort
+            _vh._V13_SESS = ort.InferenceSession(mp, providers=["CPUExecutionProvider"])
+        ih, iw = img.shape[:2]
+        T = 768
+        prob = np.zeros((3, ih, iw), np.float32)
+        cnt = np.zeros((ih, iw), np.float32)
+        for y0 in sorted(set(list(range(0, max(1, ih - T + 1), T // 2)) + [max(0, ih - T)])):
+            for x0 in sorted(set(list(range(0, max(1, iw - T + 1), T // 2)) + [max(0, iw - T)])):
+                tile = img[y0:y0 + T, x0:x0 + T]
+                th, tw = tile.shape[:2]
+                pad = np.zeros((T, T, 3), np.uint8)
+                pad[:th, :tw] = tile
+                x = (pad.astype(np.float32) / 255.0).transpose(2, 0, 1)[None]
+                lg = _vh._V13_SESS.run(None, {"input": x})[0][0]
+                e = np.exp(lg - lg.max(0, keepdims=True))
+                sm = e / e.sum(0, keepdims=True)
+                prob[:, y0:y0 + th, x0:x0 + tw] += sm[:, :th, :tw]
+                cnt[y0:y0 + th, x0:x0 + tw] += 1
+        prob /= np.maximum(cnt, 1)[None]
+        bnd = (prob.argmax(0) == 2).astype(np.uint8)
+        m = np.zeros((ih, iw), np.uint8)
+        cv2.fillPoly(m, [np.array([[int(px * W * z), int(py * H * z)] for px, py in pts], np.int32)], 1)
+        inside = bnd & m
+        col = inside.sum(0); hgt = m.sum(0)
+        row = inside.sum(1); wid = m.sum(1)
+        xs = [px * W * z for px, py in pts]; ys = [py * H * z for px, py in pts]
+        x0b, x1b, y0b, y1b = int(min(xs)), int(max(xs)), int(min(ys)), int(max(ys))
+        raw = []
+        for cx in range(x0b + 4, min(x1b - 4, iw)):
+            if hgt[cx] > 8 and col[cx] >= 0.6 * hgt[cx]:
+                raw.append(("v", cx))
+        for cy in range(y0b + 4, min(y1b - 4, ih)):
+            if wid[cy] > 8 and row[cy] >= 0.6 * wid[cy]:
+                raw.append(("h", cy))
+        cuts = []
+        for ax in ("v", "h"):
+            ps = sorted(c for a, c in raw if a == ax)
+            i = 0
+            while i < len(ps):
+                k = i
+                while k + 1 < len(ps) and ps[k + 1] - ps[k] <= 3:
+                    k += 1
+                c = (ps[i] + ps[k]) / 2
+                if ax == "v":
+                    cuts.append({"axis": "v", "pos": round(c / z / W, 5),
+                                 "span": [round(y0b / z / H, 5), round(y1b / z / H, 5)]})
+                else:
+                    cuts.append({"axis": "h", "pos": round(c / z / H, 5),
+                                 "span": [round(x0b / z / W, 5), round(x1b / z / W, 5)]})
+                i = k + 1
+        return {"cuts": cuts[:8]}
+    except Exception as e:
+        return {"cuts": [], "note": f"suggest failed: {e}"}
+
 @app.get("/admin/export-corrections")
 def export_corrections(key: str = "", since: str = ""):
     """Flywheel export: every /learn label captured by the live app (renames, deletes,
