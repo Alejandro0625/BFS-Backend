@@ -42,6 +42,20 @@ app.add_middleware(CORSMiddleware,
                                   "http://localhost:5173", "http://127.0.0.1:5173"],
                    allow_origin_regex=r"https://bfs-estimator[a-z0-9\-]*\.vercel\.app",
                    allow_methods=["*"], allow_headers=["*"])
+
+# ---- APP LOCK (#32, ships DARK): set env BFS_APP_KEY on Railway to require
+# X-BFS-Key on every request (health + CORS preflight exempt). Unset = open,
+# exactly today's behavior. Flip = one env var, no deploy.
+_APP_KEY = os.environ.get("BFS_APP_KEY", "")
+
+@app.middleware("http")
+async def _app_lock(request, call_next):
+    if _APP_KEY and request.method != "OPTIONS" and request.url.path != "/health":
+        supplied = request.headers.get("x-bfs-key") or request.query_params.get("key")
+        if supplied != _APP_KEY:
+            from fastapi.responses import JSONResponse
+            return JSONResponse({"detail": "locked"}, status_code=401)
+    return await call_next(request)
 jobs = {}  # jobId -> dict  (in-memory hot cache, bounded to MAX_MEM_JOBS)
 
 # ── durable, bounded job store ───────────────────────────────────────────────
