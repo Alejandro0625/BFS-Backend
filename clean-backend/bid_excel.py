@@ -75,6 +75,8 @@ def fill_bid(jobdata):
         s1[f"B{r}"] = _txt(incl[i]) if i < len(incl) else None
 
     # ---- estimate rows: Quantity = per-page addition formula (the house style)
+    from openpyxl.worksheet.datavalidation import DataValidation
+    from openpyxl.comments import Comment
     for i, m in enumerate(mats):
         r = _MAT_ROWS[i]
         pages = sorted((m.get("per_page") or {}).items(), key=lambda kv: int(kv[0]))  # JSON keys are strings
@@ -88,9 +90,37 @@ def fill_bid(jobdata):
         est[f"G{r}"] = f"=C{r}*E{r}*F{r}"
         if m.get("sub"):
             est[f"B{r+1}"] = _txt(m["sub"])
+        # winning-rate DROPDOWN on the Rate cell: pick low/suggested/high and the
+        # =C*E*F amount updates instantly; typing a custom rate stays allowed.
+        sug = m.get("suggest") or {}
+        vals = []
+        for k in ("lo", "med", "hi"):
+            v = sug.get(k)
+            if isinstance(v, (int, float)) and v > 0 and v not in vals:
+                vals.append(v)
+        if vals:
+            fm = ",".join(str(int(v)) if v == int(v) else str(v) for v in vals)
+            dv = DataValidation(type="list", formula1=f'"{fm}"', allow_blank=True,
+                                showErrorMessage=False, showDropDown=False)
+            est.add_data_validation(dv)
+            dv.add(f"F{r}")
+            lab = " / ".join(f"${v:g}" for v in vals)
+            est[f"F{r}"].comment = Comment(
+                f"BFS winning rates for this material: {lab}\n(low / suggested / high — from bids we actually won; dropdown or type your own)",
+                "BFS Price Engine")
     for j, l in enumerate((jobdata.get("lumps") or [])[:1]):
         est[f"B{_LUMP_ROW}"] = _txt(l.get("desc") or "")
         est[f"G{_LUMP_ROW}"] = l.get("amount") or 0
+
+    # ---- specifications block: GC + building height (labels live in col A)
+    for r in range(30, 50):
+        lab = str(est[f"A{r}"].value or "").lower()
+        if "height" in lab and jobdata.get("height"):
+            est[f"C{r}"] = _txt(f"{jobdata['height']}'")
+        elif lab.strip() == "gc" and gc.get("company"):
+            est[f"C{r}"] = _txt(gc["company"])
+        elif lab.startswith("location") and jobdata.get("job_name"):
+            est[f"C{r}"] = _txt(jobdata["job_name"])
 
     # ---- checklist header
     ck["C5"] = _txt(jobdata.get("estimator") or "")
