@@ -104,9 +104,14 @@ def fill_bid(jobdata):
                                 showErrorMessage=False, showDropDown=False)
             est.add_data_validation(dv)
             dv.add(f"F{r}")
-            lab = " / ".join(f"${v:g}" for v in vals)
+            names = {}
+            if isinstance(sug.get("med"), (int, float)): names[sug["med"]] = "Suggested"
+            if isinstance(sug.get("hi"), (int, float)): names.setdefault(sug["hi"], "Higher")
+            if isinstance(sug.get("lo"), (int, float)): names.setdefault(sug["lo"], "Lower")
+            lab = " / ".join(f"{names.get(v, '')} ${v:g}".strip() for v in vals)
             est[f"F{r}"].comment = Comment(
-                f"BFS winning rates for this material: {lab}\n(low / suggested / high — from bids we actually won; dropdown or type your own)",
+                f"BFS winning rates: {lab}\nSuggested = similar winning jobs. Higher = GCs we rarely work with (room to charge). "
+                f"Lower = partner GCs we protect. Custom = type any rate.\nSF quantity is locked from the takeoff — pricing never changes it.",
                 "BFS Price Engine")
     for j, l in enumerate((jobdata.get("lumps") or [])[:1]):
         est[f"B{_LUMP_ROW}"] = _txt(l.get("desc") or "")
