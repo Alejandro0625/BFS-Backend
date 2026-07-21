@@ -477,12 +477,45 @@ def process(jid, pdf_bytes):
                 except Exception as te:
                     jlog(job, f"Page {pi+1}: auto-detect skipped ({te})", "warn")
             sf_warns = flag_label_outliers(polys, pw, ph) if not auto else []  # catch typo'd markup labels
+            # RASTER-PAGE v13 SUGGESTIONS (2026-07-21; the 5-iteration reclaim verdict:
+            # no runtime signal separates junk floods from real walls, so the HUMAN is
+            # the discriminator). On raster-underlay pages, run the boundary model with
+            # EMPTY ownership and surface its pieces as suggest_only: never counted in
+            # zones/totals/Excel/evidence until the estimator accepts each one.
+            if auto and not doc_has_markup:
+                try:
+                    _imga = 0.0
+                    for _im9 in pg.get_images(full=True):
+                        for _r9 in pg.get_image_rects(_im9[0]):
+                            _imga += max(0, _r9.width) * max(0, _r9.height)
+                    if _imga >= 0.25 * pw * ph:
+                        _ftpt9 = float(scale_val or 8.0) / 72.0
+                        _sugs = vector_hatch._v13_regions(pdf_bytes, pi, [], pw, ph, _ftpt9, max_new=40)
+                        for _s9 in _sugs:
+                            _s9["suggest_only"] = True
+                            _s9["material"] = "AI suggestion (confirm to add)"
+                            _s9["category"] = "AI suggestion (confirm to add)"
+                            _s9["group"] = "AI suggestion (confirm to add)"
+                            _s9["sf_exact"] = False
+                        if _sugs:
+                            polys = polys + _sugs
+                            auto_flags_pre = f"🤖 {len(_sugs)} AI wall suggestion(s) on this raster page — dashed outlines; click Accept on the ones that are real walls. NOT counted until accepted."
+                        else:
+                            auto_flags_pre = None
+                    else:
+                        auto_flags_pre = None
+                except Exception:
+                    auto_flags_pre = None
+            else:
+                auto_flags_pre = None
             job["polygons_by_page"][pi + 1] = polys
             job["dims_by_page"][pi + 1] = {"width": pw, "height": ph}
             if not polys and not lin_lf_items:  # keep pages that have linear (trim/LF) measurements even with no area polygons
                 continue
             bymat = defaultdict(lambda: {"sf": 0.0, "n": 0, "category": None})
             for p in polys:
+                if p.get("suggest_only"):
+                    continue          # suggestions NEVER enter zones/totals until accepted
                 key = p.get("material") or p.get("category") or "Unlabeled"
                 bymat[key]["sf"] += p["area_sf"]; bymat[key]["n"] += 1
                 bymat[key]["category"] = p.get("category")
@@ -497,6 +530,8 @@ def process(jid, pdf_bytes):
                 })
                 legend[mat] = {"id": mat, "name": mat, "category": cat}
             auto_flags = []
+            if auto_flags_pre:
+                auto_flags.append(auto_flags_pre)
             page_levels = []
             if auto:
                 # SOFFIT/RETURN SENTINEL — the historical money-loser was FORGETTING these
@@ -1248,6 +1283,8 @@ def evidence_pdf(jid: str, materials: str = ""):
         pg = out.new_page(width=pw, height=ph)
         pg.insert_image(pg.rect, stream=pix.tobytes("jpg", jpg_quality=80))  # JPEG → colored sheets shrink hugely
         for p in page_polys:
+            if p.get("suggest_only"):
+                continue      # unaccepted AI suggestions never appear on the evidence PDF
             col = p.get("fill_color") or [0.85, 0.1, 0.1]
             col = tuple(float(c) for c in col[:3])
             pts = [(float(x) * pw, float(y) * ph) for x, y in (p.get("points") or [])]
@@ -1258,6 +1295,57 @@ def evidence_pdf(jid: str, materials: str = ""):
     data = out.tobytes(); out.close(); src.close()
     return Response(content=data, media_type="application/pdf",
                     headers={"Content-Disposition": f'attachment; filename="BFS_Evidence_{jid}.pdf"'})
+
+@app.post("/accept-suggestion")
+def accept_suggestion(payload: dict = Body(...)):
+    """Flip a suggest_only v13 piece into a REAL zone (the human said it's a wall).
+    payload: {jobId, page (1-based), pieceId}. Rebuilds that page's zone rows,
+    persists, logs the acceptance as flywheel training data."""
+    jid = payload.get("jobId"); page = int(payload.get("page") or 0)
+    pid = payload.get("pieceId")
+    j = get_job(jid)
+    if not j or page < 1:
+        raise HTTPException(404, "job/page not found")
+    polys = (j.get("polygons_by_page") or {}).get(page) or (j.get("polygons_by_page") or {}).get(str(page))
+    if polys is None:
+        raise HTTPException(404, "no polygons for page")
+    hit = next((p for p in polys if str(p.get("id")) == str(pid) and p.get("suggest_only")), None)
+    if hit is None:
+        raise HTTPException(404, "suggestion not found (already accepted?)")
+    hit["suggest_only"] = False
+    hit["material"] = "AI wall (accepted)"
+    hit["category"] = "AI wall (accepted)"
+    hit["group"] = "AI wall (accepted)"
+    # rebuild the page's zones from non-suggestion polys (mirror the analyze path)
+    from collections import defaultdict as _dd
+    bymat = _dd(lambda: {"sf": 0.0, "n": 0, "category": None})
+    for p in polys:
+        if p.get("suggest_only"):
+            continue
+        key = p.get("material") or p.get("category") or "Unlabeled"
+        bymat[key]["sf"] += p.get("area_sf", 0); bymat[key]["n"] += 1
+        bymat[key]["category"] = p.get("category")
+    zones = [{"materialName": m, "material_type": m, "category": d["category"] or "Other",
+              "netArea": round(d["sf"], 1), "grossArea": round(d["sf"], 1),
+              "totalOpeningArea": 0, "description": f"{d['n']} region(s)"}
+             for m, d in bymat.items()]
+    for e in j.get("takeoffData") or []:
+        if e.get("pageNumber") == page:
+            e["zones"] = zones
+    try:
+        _persist_job(jid)
+    except Exception:
+        pass
+    try:  # flywheel: an accepted suggestion is gold-grade boundary supervision
+        ts = int(time.time() * 1000)
+        os.makedirs(CORR_DIR, exist_ok=True)
+        with open(os.path.join(CORR_DIR, f"{ts}_suggest-accept.json"), "w", encoding="utf-8") as fh:
+            json.dump({"jobId": jid, "page": page, "source": "suggest-accept",
+                       "shapes": [{"points": hit.get("points"), "area_sf": hit.get("area_sf")}],
+                       "_ts": ts}, fh)
+    except Exception:
+        pass
+    return {"ok": True, "zones": zones, "accepted_sf": hit.get("area_sf")}
 
 @app.post("/bid-excel")
 def bid_excel_endpoint(payload: dict = Body(...)):
