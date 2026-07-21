@@ -2015,6 +2015,14 @@ def _v13_regions(pdf_bytes, page_index, polys, W, H, ft_pt, max_new=40):
         except Exception:
             pass
         _raster_page = img_area >= 0.25 * W * H
+        # roof-cap scope (26-194 p9: blank side walls died "roof-cap" on a SIDING
+        # elevation sheet — golds 730/563sf unclaimed): the gray-gable roof rule only
+        # makes sense where the sheet actually speaks roofing (same >=2-term test
+        # _roof_split trusts). Elevation sheets keep their unfenestrated walls.
+        try:
+            _roofpg9 = sum(1 for t in _ROOF_TERMS if t in (pg.get_text() or "").upper()) >= 2
+        except Exception:
+            _roofpg9 = True   # unreadable text: keep the conservative cap
         if img_area < 0.25 * W * H:
             # not a raster underlay — but Avalon/Rivers-Edge/Essex render their siding
             # as VECTOR FILLS (0-1% image, yet fully 'rendered' to the eye; v13 found
@@ -2142,7 +2150,7 @@ def _v13_regions(pdf_bytes, page_index, polys, W, H, ft_pt, max_new=40):
         # ROOF DISCRIMINATOR (viz-diagnosed over-bias: gray gables read as wall):
         # a big piece with <2 window-shaped holes is a roof — size can't separate
         # walls from roofs, fenestration can (the gray reader's proven rule).
-        if sf > 300:
+        if sf > 300 and _roofpg9:
             win_holes = 0
             for ci_v, cc in enumerate(cs):
                 if hier_v is None or hier_v[0][ci_v][3] == -1:
