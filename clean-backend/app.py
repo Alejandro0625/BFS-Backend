@@ -16,6 +16,7 @@ import texture  # classical-CV texture fallback for unmarked drawings
 import model_infer  # trained cladding-extent model (ONNX) — the real auto-markup for RAW drawings
 import vector_hatch  # reads the DRAWN pattern vectors (seam trains + gray fills) — exact, preferred on clean pages
 import callouts  # reads the drawing's own text callouts + leader arrows -> names the regions
+import density_reader  # dense-microtexture suggestions (Callahan class)
 import ocr_text  # OCR fallback (onnxruntime RapidOCR) for FLATTENED sets — lazy, memory-safe
 import snap_fill  # coloring-book BUCKET fill + corner-snap → exact SF from vector geometry (assist layer)
 import material_groups  # within-job texture grouping → a selectable PREVIEW of material groups (assist layer)
@@ -490,9 +491,14 @@ def process(jid, pdf_bytes):
                     for _im9 in pg.get_images(full=True):
                         for _r9 in pg.get_image_rects(_im9[0]):
                             _imga += max(0, _r9.width) * max(0, _r9.height)
+                    _sugs = []
                     if _imga >= 0.25 * pw * ph:
                         _ftpt9 = float(scale_val or 8.0) / 72.0
                         _sugs = vector_hatch._v13_regions(pdf_bytes, pi, [], pw, ph, _ftpt9, max_new=40)
+                    elif density_reader.is_dense_page(pg):
+                        # Callahan-class micro-texture: the density reader's fields
+                        # become confirmable suggestions (probe-proven 22/114 ensemble)
+                        _sugs = density_reader.suggest_pieces(pdf_bytes, pi, pw, ph, max_new=40)
                         for _s9 in _sugs:
                             _s9["suggest_only"] = True
                             _s9["material"] = "AI suggestion (confirm to add)"
