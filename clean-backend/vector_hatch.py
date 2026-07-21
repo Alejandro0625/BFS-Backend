@@ -2014,6 +2014,7 @@ def _v13_regions(pdf_bytes, page_index, polys, W, H, ft_pt, max_new=40):
                     img_area += max(0, r.width) * max(0, r.height)
         except Exception:
             pass
+        _raster_page = img_area >= 0.25 * W * H
         if img_area < 0.25 * W * H:
             # not a raster underlay — but Avalon/Rivers-Edge/Essex render their siding
             # as VECTOR FILLS (0-1% image, yet fully 'rendered' to the eye; v13 found
@@ -2111,6 +2112,20 @@ def _v13_regions(pdf_bytes, page_index, polys, W, H, ft_pt, max_new=40):
         try:
             xs = [q[0] for q in p["points"]]
             ys = [q[1] for q in p["points"]]
+            # PHANTOM-TERRITORY guard (26-194 p9: a "Rendered siding" outline QUAD
+            # covering 85% of the page while claiming only 128sf net vetoed EVERY v13
+            # candidate — 11 money walls — through this bbox clash test). A piece may
+            # only claim territory its SF actually measures: if claimed area_sf is
+            # under 20% of the polygon's geometric footprint, it is an outline/sliver
+            # artifact, not territory. (Guards both the phantom quad and thin slivers.)
+            sh9 = 0.0
+            for i9 in range(len(p["points"])):
+                x19, y19 = p["points"][i9]
+                x29, y29 = p["points"][(i9 + 1) % len(p["points"])]
+                sh9 += x19 * y29 - x29 * y19
+            geom_sf9 = abs(sh9) / 2.0 * (W * ft_pt) * (H * ft_pt)
+            if p.get("area_sf", 0) < 0.2 * geom_sf9:
+                continue
             exist.append((min(xs), min(ys), max(xs), max(ys)))
         except Exception:
             pass
