@@ -559,6 +559,24 @@ def process(jid, pdf_bytes):
                     pass
                 auto_flags.append("Read from the drawing's pattern vectors — confirm which walls are in your scope"
                                   if auto_engine == "vector" else "AI suggestion — verify SF before bidding")
+                # JOB-LEVEL SANITY (audit item 5 — flags only, SF never touched):
+                # a merged/leaked region announces itself as a size outlier.
+                try:
+                    _sfs = sorted(p.get("area_sf", 0) for p in polys
+                                  if not p.get("suggest_only") and p.get("area_sf", 0) > 0)
+                    if len(_sfs) >= 4:
+                        _med = _sfs[len(_sfs) // 2]
+                        _big = _sfs[-1]
+                        if _med > 0 and _big > 3 * _med and _big > 1500:
+                            auto_flags.append(f"⚠ SANITY: largest piece ({_big:,.0f} SF) is "
+                                              f"{_big/_med:.0f}× the page median — check for a merged or "
+                                              f"leaked region before trusting its SF.")
+                    _ptot = sum(_sfs)
+                    if _ptot > 40000:
+                        auto_flags.append(f"⚠ SANITY: page total {_ptot:,.0f} SF is unusually large for "
+                                          f"one sheet — verify the scale and check for double-counted faces.")
+                except Exception:
+                    pass
                 if not scale_conf:
                     # scale could NOT be read → SF used a default 8.0 and is unreliable. Force a calibrate.
                     auto_flags.append("Scale could not be read on this sheet — calibrate before trusting SF (SF may be off several ×)")
