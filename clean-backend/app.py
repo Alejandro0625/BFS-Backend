@@ -482,7 +482,9 @@ def process(jid, pdf_bytes):
             # the discriminator). On raster-underlay pages, run the boundary model with
             # EMPTY ownership and surface its pieces as suggest_only: never counted in
             # zones/totals/Excel/evidence until the estimator accepts each one.
-            if auto and not doc_has_markup:
+            if not doc_has_markup and page_is_elev:
+                # (runs even when auto-detect found NOTHING — the emptiest raster
+                # pages need suggestions most; acid test: p19 had 0 pieces, 0 sugs)
                 try:
                     _imga = 0.0
                     for _im9 in pg.get_images(full=True):
