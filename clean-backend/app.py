@@ -497,13 +497,16 @@ def process(jid, pdf_bytes):
                     # ALSO carry a backdrop image, so the raster test stole them and — via
                     # an indent bug — dropped the pieces; 40k hairlines is the more
                     # specific signature, so it wins the tie).
-                    if density_reader.is_dense_page(pg):
+                    _dense9 = density_reader.is_dense_page(pg)
+                    if _dense9:
                         # Callahan-class micro-texture: the density reader's fields
                         # become confirmable suggestions (probe-proven 22/114 ensemble)
                         _sugs = density_reader.suggest_pieces(pdf_bytes, pi, pw, ph, max_new=40)
                     elif _imga >= 0.25 * pw * ph:
                         _ftpt9 = float(scale_val or 8.0) / 72.0
                         _sugs = vector_hatch._v13_regions(pdf_bytes, pi, [], pw, ph, _ftpt9, max_new=40)
+                    jlog(job, f"Page {pi+1}: suggestion probe — dense={_dense9}, "
+                              f"img={_imga / max(pw * ph, 1):.0%}, suggestions={len(_sugs)}", "info")
                     # tag + append OUTSIDE the branches — BOTH readers' suggestions ship
                     # (the indent bug had raster suggestions computed then discarded)
                     for _s9 in _sugs:
@@ -517,7 +520,8 @@ def process(jid, pdf_bytes):
                         auto_flags_pre = f"🤖 {len(_sugs)} AI wall suggestion(s) on this page — dashed outlines; click Accept on the ones that are real walls. NOT counted until accepted."
                     else:
                         auto_flags_pre = None
-                except Exception:
+                except Exception as _se9:
+                    jlog(job, f"Page {pi+1}: suggestion probe FAILED — {type(_se9).__name__}: {_se9}", "warn")
                     auto_flags_pre = None
             else:
                 auto_flags_pre = None
