@@ -493,24 +493,28 @@ def process(jid, pdf_bytes):
                         for _r9 in pg.get_image_rects(_im9[0]):
                             _imga += max(0, _r9.width) * max(0, _r9.height)
                     _sugs = []
-                    if _imga >= 0.25 * pw * ph:
-                        _ftpt9 = float(scale_val or 8.0) / 72.0
-                        _sugs = vector_hatch._v13_regions(pdf_bytes, pi, [], pw, ph, _ftpt9, max_new=40)
-                    elif density_reader.is_dense_page(pg):
+                    # DENSITY FIRST (Callahan acid 2026-07-21: dense hairline pages often
+                    # ALSO carry a backdrop image, so the raster test stole them and — via
+                    # an indent bug — dropped the pieces; 40k hairlines is the more
+                    # specific signature, so it wins the tie).
+                    if density_reader.is_dense_page(pg):
                         # Callahan-class micro-texture: the density reader's fields
                         # become confirmable suggestions (probe-proven 22/114 ensemble)
                         _sugs = density_reader.suggest_pieces(pdf_bytes, pi, pw, ph, max_new=40)
-                        for _s9 in _sugs:
-                            _s9["suggest_only"] = True
-                            _s9["material"] = "AI suggestion (confirm to add)"
-                            _s9["category"] = "AI suggestion (confirm to add)"
-                            _s9["group"] = "AI suggestion (confirm to add)"
-                            _s9["sf_exact"] = False
-                        if _sugs:
-                            polys = polys + _sugs
-                            auto_flags_pre = f"🤖 {len(_sugs)} AI wall suggestion(s) on this raster page — dashed outlines; click Accept on the ones that are real walls. NOT counted until accepted."
-                        else:
-                            auto_flags_pre = None
+                    elif _imga >= 0.25 * pw * ph:
+                        _ftpt9 = float(scale_val or 8.0) / 72.0
+                        _sugs = vector_hatch._v13_regions(pdf_bytes, pi, [], pw, ph, _ftpt9, max_new=40)
+                    # tag + append OUTSIDE the branches — BOTH readers' suggestions ship
+                    # (the indent bug had raster suggestions computed then discarded)
+                    for _s9 in _sugs:
+                        _s9["suggest_only"] = True
+                        _s9["material"] = "AI suggestion (confirm to add)"
+                        _s9["category"] = "AI suggestion (confirm to add)"
+                        _s9["group"] = "AI suggestion (confirm to add)"
+                        _s9["sf_exact"] = False
+                    if _sugs:
+                        polys = polys + _sugs
+                        auto_flags_pre = f"🤖 {len(_sugs)} AI wall suggestion(s) on this page — dashed outlines; click Accept on the ones that are real walls. NOT counted until accepted."
                     else:
                         auto_flags_pre = None
                 except Exception:
