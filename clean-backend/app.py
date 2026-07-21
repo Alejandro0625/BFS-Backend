@@ -84,7 +84,7 @@ def _persist_job(jid):
         if job.get("pdf") and not os.path.exists(os.path.join(d, "input.pdf")):
             with open(os.path.join(d, "input.pdf"), "wb") as fh: fh.write(job["pdf"])
         meta = {k: job.get(k) for k in ("status", "phase", "progress", "legend", "takeoffData",
-                "scheduleData", "error", "polygons_by_page", "dims_by_page", "log", "projName")}
+                "scheduleData", "error", "polygons_by_page", "dims_by_page", "log", "projName", "pageCount")}
         with open(os.path.join(d, "job.json"), "w", encoding="utf-8") as fh:
             json.dump(meta, fh)
     except Exception:
@@ -398,6 +398,7 @@ def process(jid, pdf_bytes):
         job["progress"] = {"label": "Loading PDF", "pct": 3}
         doc = fitz.open(stream=pdf_bytes, filetype="pdf")
         n = doc.page_count
+        job["pageCount"] = n   # Draw tab needs the full page list — photo/sparse sheets have no takeoffData entry
         jlog(job, f"PDF loaded — {n} page(s)", "ok")
         legend = {}
         auto_used = 0  # cap expensive texture renders so a big unmarked PDF can't blow memory
@@ -796,7 +797,7 @@ def status(jid: str):
     return {"status": j["status"], "phase": j.get("phase", ""), "log": j["log"], "progress": j["progress"],
             "legend": j.get("legend", []), "takeoffData": j.get("takeoffData", []),
             "scheduleData": j.get("scheduleData"), "drawingSchedule": j.get("drawingSchedule"),
-            "ocrMaterials": j.get("ocrMaterials"), "error": j.get("error")}
+            "ocrMaterials": j.get("ocrMaterials"), "error": j.get("error"), "pageCount": j.get("pageCount", 0)}
 
 @app.get("/polygons/{jid}/{page}")
 def polygons(jid: str, page: int):
