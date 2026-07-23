@@ -735,6 +735,28 @@ def process(jid, pdf_bytes):
                               f"(flattened set): {', '.join(m['text'] for m in ocr_mats[:3])}", "ok")
         except Exception:
             pass
+        # TYPICAL-OF-n FLAG (convention census 2026-07-23: 'TYP OF n' pages carry 53
+        # not-found walls / 10.2k SF in 6 jobs — the drawing shows ONE instance, the
+        # estimator counts n). FLAG ONLY per the two-tier rule: SF never auto-multiplied.
+        try:
+            import re as _re7
+            _tdoc = fitz.open(stream=pdf_bytes, filetype="pdf")
+            for _pi7 in range(len(_tdoc)):
+                _t7 = (_tdoc[_pi7].get_text() or "").upper()
+                for _m7 in _re7.finditer(r"TYP(?:ICAL)?\.?\s*(?:OF|X)\s*\(?(\d+)\)?", _t7):
+                    _n7 = int(_m7.group(1))
+                    if 2 <= _n7 <= 30:
+                        for _e7 in job["takeoffData"]:
+                            if _e7["pageNumber"] == _pi7 + 1:
+                                _e7.setdefault("flags", []).append(
+                                    f"⚠ REPETITION: this sheet says '{_m7.group(0).strip()}' — one instance"
+                                    f" is drawn but {_n7} exist. Confirm the count is in your takeoff"
+                                    " (multiply or trace the others) before bidding.")
+                                break
+                        break   # one flag per page
+            _tdoc.close()
+        except Exception:
+            pass
         # JOB-LEVEL SOFFIT/RETURN CROSS-CHECK (the $500K recall guard — BOTH paths):
         # if ANY page of the set mentions soffits (or panel/canopy returns) but the
         # finished takeoff contains no zone named for them, flag it loudly. Flags
