@@ -754,6 +754,14 @@ def process(jid, pdf_bytes):
                                     " (multiply or trace the others) before bidding.")
                                 break
                         break   # one flag per page
+                if "MATCH LINE" in _t7:
+                    for _e7 in job["takeoffData"]:
+                        if _e7["pageNumber"] == _pi7 + 1:
+                            _e7.setdefault("flags", []).append(
+                                "⚠ MATCH LINE on this sheet — the view continues on another sheet."
+                                " Confirm the continued portion is in the takeoff (censused: match-line"
+                                " sheets hide walls).")
+                            break
             _tdoc.close()
         except Exception:
             pass
