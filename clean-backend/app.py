@@ -552,6 +552,20 @@ def process(jid, pdf_bytes):
                     auto_flags_pre = None
             else:
                 auto_flags_pre = None
+            # LEGEND-FIRST SECOND PASS (owner directive 2026-07-25: naming is the lane).
+            # Late-reader pieces (v13/band/rc) exist only AFTER the first naming pass —
+            # re-run callout/legend binding on pieces still lacking a drawing identity.
+            if auto:
+                try:
+                    _anon9 = [p for p in polys if not p.get("named_by")
+                              and not p.get("suggest_only")
+                              and p.get("area_sf", 0) > 100]
+                    if _anon9:
+                        _n2 = callouts.name_regions(pdf_bytes, pi, _anon9, pw, ph)
+                        if _n2:
+                            jlog(job, f"Page {pi+1}: {_n2} late region(s) named on second legend pass", "ok")
+                except Exception:
+                    pass
             job["polygons_by_page"][pi + 1] = polys
             job["dims_by_page"][pi + 1] = {"width": pw, "height": ph}
             if not polys and not lin_lf_items:  # keep pages that have linear (trim/LF) measurements even with no area polygons
@@ -580,6 +594,12 @@ def process(jid, pdf_bytes):
                 if "ACM" in u or "MCM" in u or "COMPOSITE" in u or "ALUCOBOND" in u: return "acm"
                 if "NICHIHA" in u or "NCH" in u: return "nichiha"
                 if "PERF" in u: return "perforated"
+                # archive vocabulary (128 markup files / 775 terms, 2026-07-25):
+                # his code system is prefix-stable across GCs
+                import re as _rv
+                if _rv.match(r"^(FCP|FCL|FCS|FCBB|FSV|FSH|FC)[-\s:]", u): return "fc"
+                if _rv.match(r"^(VCS|EL0?\d)[-\s:]", u) or "VINYL" in u: return "vinyl"
+                if _rv.match(r"^AP[-\s:]", u): return "metal"
                 if any(k in u for k in ("SHINGLE", "SHAKE", "CEDAR")): return "shingle"
                 if any(k in u for k in ("STANDING", "SEAM", "CORRUGAT", "METAL PANEL", "MTL", "ALUM")): return "metal"
                 if any(k in u for k in ("FC", "FIBER", "HARDIE", "LAP", "SIDING", "CEMENT", "CLAPBOARD", "PLANK")): return "fc"
