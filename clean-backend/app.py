@@ -583,12 +583,21 @@ def process(jid, pdf_bytes):
                 if any(k in u for k in ("SHINGLE", "SHAKE", "CEDAR")): return "shingle"
                 if any(k in u for k in ("STANDING", "SEAM", "CORRUGAT", "METAL PANEL", "MTL", "ALUM")): return "metal"
                 if any(k in u for k in ("FC", "FIBER", "HARDIE", "LAP", "SIDING", "CEMENT", "CLAPBOARD", "PLANK")): return "fc"
-                if "WALL AREA" in u or "(CONFIRM)" in u or "WALL BAND" in u: return "unassigned"
                 return "unassigned"
+            def _fam9_outer(m):
+                # READER-generic vocabulary is not a drawing identity — always
+                # unassigned (miner 2026-07-25: 'Panel wall'/'Vertical rib'/'Rendered
+                # siding' token-leaked into fc and caused 7 of the 8 family errors)
+                u = (m or "").upper()
+                if any(k in u for k in ("WALL AREA", "(CONFIRM)", "WALL BAND", "PANEL WALL",
+                                         "VERTICAL RIB", "RENDERED SIDING", "HATCHED AREA",
+                                         "LAP / HORIZONTAL", "COLOR FILL", "AI SUGGESTION")):
+                    return "unassigned"
+                return _fam9(m)
             _fam_flags9 = set()
             for mat, d in bymat.items():
                 cat = d["category"] or "Other"
-                _f9 = _fam9(mat) if auto else None
+                _f9 = _fam9_outer(mat) if auto else None
                 if _f9 == "non-bfs" and d["sf"] > 30:
                     _fam_flags9.add(f"⚠ NON-BFS MATERIAL detected: '{str(mat)[:36]}' ({d['sf']:,.0f} SF) — "
                                     "brick/masonry/EIFS/glazing class is never BFS scope; confirm exclusion.")
