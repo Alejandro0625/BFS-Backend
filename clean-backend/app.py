@@ -298,15 +298,42 @@ def flag_label_outliers(polys, pw, ph):
     return warns
 
 def is_elevation_page(pg):
-    """Auto-crop to the pages the estimator actually measures = elevations, returns, soffits
-    (her step 4-5). Skip plans/details/schedules/cover so we don't invent cladding there."""
+    """Auto-crop to the pages the estimator actually measures = elevations, returns, soffits.
+    v2 (cold-run audit 2026-07-24: v1 text-only test found ALL gold pages on just 19/88
+    archive jobs — blind on flattened sheets, excluded mixed sheets carrying a 'roof
+    plan' note, over-included note-mentioning details): TITLE evidence outranks
+    exclusions; geometric level-datum evidence rescues textless sheets."""
+    import re as _re5
     try:
         t = (pg.get_text() or "").lower()
     except Exception:
-        return False
+        t = ""
+    # 1) a real elevation TITLE anywhere = yes, regardless of plan notes on the sheet
+    if _re5.search(r"\b(north|south|east|west|front|rear|left|right|side|partial|overall|exterior|building)\s+[\w\s]{0,18}elevation", t):
+        return True
+    # 2) plan-titled sheets without an elevation title = no
     if ("roof plan" in t) or ("floor plan" in t):
         return False
-    return ("elevation" in t) or ("return" in t) or ("soffit" in t)
+    if ("elevation" in t) or ("return" in t) or ("soffit" in t):
+        return True
+    # 3) textless/flattened sheets: LEVEL-DATUM geometry = elevation signature —
+    #    but sections/details stack LEVELs too (v2 gate: 1,818 extras corpus-wide),
+    #    so require the FACADE signature as well: several LONG horizontal structure
+    #    lines (building base/story lines span elevations; sections are narrow cuts).
+    if len(t) < 60:
+        try:
+            words = pg.get_text("words") or []
+            lv = sum(1 for w in words if (w[4] or "").strip().upper() in ("LEVEL", "ROOF")
+                     or (w[4] or "").strip().upper().startswith("T.O"))
+            if lv >= 3:
+                hl, _vl = _page_struct_lines(pg)
+                W9 = pg.rect.width
+                long_h = sum(1 for (x0, x1, _y) in hl if (x1 - x0) > 0.30 * W9)
+                if long_h >= 3:
+                    return True
+        except Exception:
+            pass
+    return False
 
 def _page_struct_lines(pg):
     """Long H/V vector lines of the page (same rule as /snap-points): the building's real geometry."""
