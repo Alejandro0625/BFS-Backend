@@ -735,6 +735,60 @@ def process(jid, pdf_bytes):
                               f"(flattened set): {', '.join(m['text'] for m in ocr_mats[:3])}", "ok")
         except Exception:
             pass
+        # ANNOT-INTEGRITY GUARD (assisted-path robustness, 2026-07-23): corrupt or
+        # partially-stripped PDFs can carry annot chains that BREAK mid-iteration —
+        # the reader then silently reads SOME markups and produces a wrong total.
+        # Compare the xref-declared annot count per page against what iteration
+        # reaches; any shortfall = LOUD flag (SF untouched — the human re-exports).
+        try:
+            _idoc = fitz.open(stream=pdf_bytes, filetype="pdf")
+            _bad_pages = []
+            for _pi8 in range(len(_idoc)):
+                _pg8 = _idoc[_pi8]
+                _decl = 0
+                try:
+                    _av8 = _idoc.xref_get_key(_pg8.xref, "Annots")
+                    if _av8 and _av8[0] in ("array", "xref"):
+                        import re as _re8
+                        for _x8 in _re8.findall(r"(\d+) 0 R", str(_av8[1])):
+                            try:
+                                _o8 = _idoc.xref_object(int(_x8), compressed=True) or ""
+                                if not _o8.strip() or _o8.strip() == "null":
+                                    _decl += 1   # freed/null object behind a live ref
+                                    continue
+                            except Exception:
+                                _decl += 1   # unresolvable ref = exactly what we're hunting
+                                continue
+                            # Popup/Link/Widget live in /Annots but are NOT takeoff
+                            # markups and are rightly skipped by annot iteration
+                            if any(t in _o8 for t in ("/Subtype/Popup", "/Subtype /Popup",
+                                                       "/Subtype/Link", "/Subtype /Link",
+                                                       "/Subtype/Widget", "/Subtype /Widget")):
+                                continue
+                            _decl += 1
+                except Exception:
+                    pass
+                if not _decl:
+                    continue
+                _seen = 0
+                try:
+                    _a8 = _pg8.first_annot
+                    while _a8 is not None:
+                        _seen += 1
+                        _a8 = _a8.next
+                except Exception:
+                    pass          # chain broke mid-iteration — _seen holds the shortfall
+                if _seen < _decl:
+                    _bad_pages.append((_pi8 + 1, _seen, _decl))
+            _idoc.close()
+            if _bad_pages and job["takeoffData"]:
+                _pp = ", ".join(f"p{p} ({s}/{d})" for p, s, d in _bad_pages[:5])
+                job["takeoffData"][-1].setdefault("flags", []).append(
+                    f"⚠ MARKUP INTEGRITY: this PDF's annotations are partially unreadable on "
+                    f"{len(_bad_pages)} page(s) — read/declared: {_pp}. The totals may be missing "
+                    "markups. Re-export the PDF from Bluebeam (no flatten) and re-upload.")
+        except Exception:
+            pass
         # TYPICAL-OF-n FLAG (convention census 2026-07-23: 'TYP OF n' pages carry 53
         # not-found walls / 10.2k SF in 6 jobs — the drawing shows ONE instance, the
         # estimator counts n). FLAG ONLY per the two-tier rule: SF never auto-multiplied.
