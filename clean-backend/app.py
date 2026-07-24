@@ -565,10 +565,39 @@ def process(jid, pdf_bytes):
                 bymat[key]["category"] = p.get("category")
             zones = []
             src_txt = ({"vector": "drawing vectors (exact geometry)", "model": "AI model (confirm)"}.get(auto_engine, "AI texture (confirm)")) if auto else "markup"
+            # FAMILY LAYER v1 (weekend lane #43, 26-020 probe): normalize each zone's
+            # family from its name; junk names and non-BFS materials get FLAGGED,
+            # anonymous masses get FLAGGED — never guessed (DoD: flag beats guess).
+            def _fam9(m):
+                u = (m or "").upper()
+                import re as _rf
+                if _rf.match(r"^[AS]-?\d{2,4}\b", u) or u.startswith("GROUP ") or len(u) <= 2:
+                    return "junk-name"
+                if any(k in u for k in ("BRICK", "MASON", "STONE", "EIFS", "STUCCO", "CONCRETE",
+                                         "GLAZ", "GLASS", "CURTAIN", "STOREFRONT", "GWB", "ROOF MEMBRANE")):
+                    return "non-bfs"
+                if "SOFFIT" in u: return "soffit"
+                if "ACM" in u or "MCM" in u or "COMPOSITE" in u or "ALUCOBOND" in u: return "acm"
+                if "NICHIHA" in u or "NCH" in u: return "nichiha"
+                if "PERF" in u: return "perforated"
+                if any(k in u for k in ("SHINGLE", "SHAKE", "CEDAR")): return "shingle"
+                if any(k in u for k in ("STANDING", "SEAM", "CORRUGAT", "METAL PANEL", "MTL", "ALUM")): return "metal"
+                if any(k in u for k in ("FC", "FIBER", "HARDIE", "LAP", "SIDING", "CEMENT", "CLAPBOARD", "PLANK")): return "fc"
+                if "WALL AREA" in u or "(CONFIRM)" in u or "WALL BAND" in u: return "unassigned"
+                return "unassigned"
+            _fam_flags9 = set()
             for mat, d in bymat.items():
                 cat = d["category"] or "Other"
+                _f9 = _fam9(mat) if auto else None
+                if _f9 == "non-bfs" and d["sf"] > 30:
+                    _fam_flags9.add(f"⚠ NON-BFS MATERIAL detected: '{str(mat)[:36]}' ({d['sf']:,.0f} SF) — "
+                                    "brick/masonry/EIFS/glazing class is never BFS scope; confirm exclusion.")
+                if _f9 == "unassigned" and d["sf"] > 300:
+                    _fam_flags9.add(f"⚠ FAMILY UNASSIGNED: '{str(mat)[:36]}' ({d['sf']:,.0f} SF) has no material "
+                                    "identity from the drawing — name it before pricing (never priced on a guess).")
                 zones.append({
                     "materialName": mat, "material_type": mat, "category": cat,
+                    "family": _f9,
                     "netArea": round(d["sf"], 1), "grossArea": round(d["sf"], 1),
                     "totalOpeningArea": 0, "description": f"{d['n']} region(s) from {src_txt}",
                 })
@@ -705,7 +734,7 @@ def process(jid, pdf_bytes):
                 "zones": zones,
                 "linearItems": linear_items,
                 "autoTrim": auto_trim,
-                "flags": auto_flags + sf_warns,
+                "flags": auto_flags + sf_warns + sorted(_fam_flags9),
                 "levels": page_levels,
                 "source": "texture-auto" if auto else "digitize",
                 # window/door COUNT surface (count-only takeoffs are a whole bid class):
