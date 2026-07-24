@@ -564,6 +564,35 @@ def process(jid, pdf_bytes):
                         _n2 = callouts.name_regions(pdf_bytes, pi, _anon9, pw, ph)
                         if _n2:
                             jlog(job, f"Page {pi+1}: {_n2} late region(s) named on second legend pass", "ok")
+                    # PER-JOB CODE MAP (gate v2 2026-07-25: 35/35 = 1.000 precision):
+                    # the set's own text defines CODE -> MATERIAL; expand bare-code
+                    # names so family binding uses the job's vocabulary.
+                    import re as _rc9
+                    if "_code_map9" not in job:
+                        _cm = {}
+                        try:
+                            _cd = fitz.open(stream=pdf_bytes, filetype="pdf")
+                            for _cpi in range(len(_cd)):
+                                _t = (_cd[_cpi].get_text() or "").upper()
+                                for _m in _rc9.finditer(r"([A-Z][A-Z\s/&]{6,40})\s*[-–:]\s*\(?([A-Z]{1,4}-?\d{1,2}[A-Z]?)\)?", _t):
+                                    _cm.setdefault(_m.group(2), _m.group(1).strip())
+                                for _m in _rc9.finditer(r"\b([A-Z]{1,4}-?\d{1,2}[A-Z]?)\s*[:=–-]\s*([A-Z][A-Z\s/&]{6,40})", _t):
+                                    _cm.setdefault(_m.group(1), _m.group(2).strip())
+                            _cd.close()
+                        except Exception:
+                            pass
+                        job["_code_map9"] = _cm
+                    _cm = job["_code_map9"]
+                    if _cm:
+                        for p in polys:
+                            _mt = str(p.get("material") or "")
+                            if p.get("named_by") or p.get("suggest_only"):
+                                continue
+                            for _c in _rc9.findall(r"\b([A-Z]{1,4}-?\d{1,2}[A-Z]?)\b", _mt.upper()):
+                                if _c in _cm:
+                                    p["material"] = p["category"] = p["group"] = f"{_cm[_c]} ({_c})"
+                                    p["named_by"] = "codemap:" + _c
+                                    break
                 except Exception:
                     pass
             job["polygons_by_page"][pi + 1] = polys
