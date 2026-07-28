@@ -84,7 +84,8 @@ def _persist_job(jid):
         if job.get("pdf") and not os.path.exists(os.path.join(d, "input.pdf")):
             with open(os.path.join(d, "input.pdf"), "wb") as fh: fh.write(job["pdf"])
         meta = {k: job.get(k) for k in ("status", "phase", "progress", "legend", "takeoffData",
-                "scheduleData", "error", "polygons_by_page", "dims_by_page", "log", "projName", "pageCount")}
+                "scheduleData", "error", "polygons_by_page", "dims_by_page", "log", "projName", "pageCount",
+                "coverageReport")}
         with open(os.path.join(d, "job.json"), "w", encoding="utf-8") as fh:
             json.dump(meta, fh)
     except Exception:
@@ -957,6 +958,12 @@ def process(jid, pdf_bytes):
                           " measured or excluded before bidding (missed soffits have cost real money).")
         except Exception:
             pass
+        # ── COVERAGE LAYER: compose flags + reconcile — report only, SF never touched
+        try:
+            import coverage as _cov
+            _cov.run(job, pdf_bytes, jlog=lambda m, lv="info": jlog(job, m, lv))
+        except Exception:
+            jlog(job, "Coverage layer error — takeoff unaffected", "warn")
         total = sum(z["netArea"] for e in job["takeoffData"] for z in e["zones"])
         if auto_tried:  # never fail silently: say what the AI actually looked at
             jlog(job, f"Auto-detect scanned {auto_tried} page(s), found cladding on {auto_hits}", "warn" if auto_hits == 0 else "ok")
@@ -1003,7 +1010,8 @@ def status(jid: str):
     return {"status": j["status"], "phase": j.get("phase", ""), "log": j["log"], "progress": j["progress"],
             "legend": j.get("legend", []), "takeoffData": j.get("takeoffData", []),
             "scheduleData": j.get("scheduleData"), "drawingSchedule": j.get("drawingSchedule"),
-            "ocrMaterials": j.get("ocrMaterials"), "error": j.get("error"), "pageCount": j.get("pageCount", 0)}
+            "ocrMaterials": j.get("ocrMaterials"), "error": j.get("error"), "pageCount": j.get("pageCount", 0),
+            "coverageReport": j.get("coverageReport")}
 
 @app.get("/polygons/{jid}/{page}")
 def polygons(jid: str, page: int):
