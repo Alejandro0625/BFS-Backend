@@ -26,6 +26,7 @@ from collections import defaultdict
 import fitz
 import callouts
 import ocr_text
+import titleblock  # label-anchored text-layer sheet ID (+ OCR reader, unused here)
 import vector_hatch
 
 SCHEMA_VERSION = 1
@@ -1021,15 +1022,28 @@ def _title_block_words(pg):
 
 
 def _sheet_of_page(pg):
-    """(sheet_number|None, title|None) from the title block. The drawing number
-    is the LAST sheet-number-shaped token in the block (the DRAWING NO. box sits
-    at the very bottom-right); the title is the text after it."""
+    """(sheet_number|None, title|None) from the title block. v2 (2026-07-29): the
+    sheet number comes from titleblock.text_sheet_of_page — LABEL-ANCHORED (token
+    nearest a DRAWING/SHEET NUMBER label) with wider sheet shapes; the legacy
+    bottom-most-token rule misread spec tokens (real 26-169 p65 trap: 'DEARBORN
+    BC-45 CLEANER' bound as sheet BC-45 while the DRAWING NUMBER box says P-003).
+    Legacy rule kept as fallback when titleblock reads nothing. The title is
+    still the text after the sheet token."""
     toks = _title_block_words(pg)
     num, title = None, None
     idx = None
-    for i, t in enumerate(toks):
-        if _SHEETNUM_RE.match((t or "").strip()):
-            num, idx = t.strip(), i
+    try:
+        num = titleblock.text_sheet_of_page(pg)
+    except Exception:
+        num = None
+    if num:
+        for i, t in enumerate(toks):
+            if (t or "").strip().upper() == num:
+                idx = i                       # last occurrence = the ID box token
+    else:
+        for i, t in enumerate(toks):          # legacy fallback: bottom-most token
+            if _SHEETNUM_RE.match((t or "").strip()):
+                num, idx = t.strip(), i
     if idx is not None:
         tail = " ".join(toks[idx + 1:]).strip()
         title = re.sub(r"\s+", " ", tail).upper()[:80] or None
