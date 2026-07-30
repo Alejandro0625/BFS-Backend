@@ -1988,6 +1988,15 @@ def _apply_view_scales(pdf_bytes, page_index, polys, W, H, page_scale):
 _V13_SESS = None
 _V13_BUDGET = {}    # doc fingerprint -> pages already inferred (perf guard, huge sets)
 
+# v18 PER-INSTANCE RATIO HEAD state (BFS_V18_DESIGN.md §5). Session is loaded once;
+# a failed load LATCHES dead (logged loudly once, counted, never retried, never
+# raises into the v13 path). _V18_FAILS_TOTAL = cumulative inference-failure count
+# for this process — the locked v16b/v17 lesson: failures are counted and logged,
+# NEVER swallowed, and a failed inference leaves SF untouched.
+_V18_SESS = None
+_V18_DEAD = False
+_V18_FAILS_TOTAL = 0
+
 
 def _v13_regions(pdf_bytes, page_index, polys, W, H, ft_pt, max_new=40):
     """v13 BOUNDARY MODEL (Unet resnet34, 3-class: bg / wall interior / HIS wall
@@ -2138,6 +2147,7 @@ def _v13_regions(pdf_bytes, page_index, polys, W, H, ft_pt, max_new=40):
         except Exception:
             pass
     out = []
+    v18_ids = []    # watershed label id per accepted candidate (aligned with out)
     for i in range(1, ns):
         m = (lab == i).astype(np.uint8)
         a_px = int(m.sum())
@@ -2192,9 +2202,92 @@ def _v13_regions(pdf_bytes, page_index, polys, W, H, ft_pt, max_new=40):
                     "category": "Wall area (AI boundary, confirm)",
                     "group": "Wall area (AI boundary, confirm)", "sf_exact": True,
                     "holes": [], "label": f"~{round(sf):,} SF"})
+        v18_ids.append(i)
         if len(out) >= max_new:
             break
+    # v18 PER-INSTANCE FENESTRATION-CONDITIONAL NETTING (BFS_V18_DESIGN.md §5).
+    # Env-gated by V18_ONNX; the default path exists neither locally nor in prod,
+    # so this SHIPS DARK (same activation pattern as V13_ONNX/V16_ONNX: delivering
+    # the model file IS the switch). When live: ONE padded full-page pass on the
+    # 1536 render with every accepted candidate mask -> (fen_prob, ratio) per wall;
+    # sf *= ratio ONLY when fen_prob >= 0.5 AND ratio in [0.3, 1.0) — never
+    # inflate; distrust -> gross (raw SF kept). The helper NEVER raises (a v18
+    # problem must never cost v13 walls through the caller's legacy handler) and
+    # NEVER silently swallows (failures counted + printed — v16b/v17 lesson).
+    if out:
+        _v18_net_candidates(img, lab, v18_ids, out, page_index)
     return out
+
+
+def _v18_net_candidates(img, lab, ids, pieces, page_index):
+    """v18 ratio head (model_v18.onnx, dynamic h/w, opset 17): apply per-instance
+    fenestration-conditional netting to freshly accepted v13 candidates, in place.
+
+    Export contract (verified against the kernel's self-tested export block):
+      inputs  input[1,3,h,w] float32 RGB/255  +  roi_masks[n,h,w] float32 0/1
+      outputs logits[1,3,h,w]  +  roi_out[n,2] (col0 = fen prob ALREADY sigmoided,
+              col1 = ratio ALREADY mapped to [0.3, 1.0]); h,w multiples of 32.
+
+    Rules (BFS_V18_DESIGN.md §5 + the locked density-lane lesson):
+      - DARK unless the V18_ONNX file exists (no load attempt without it).
+      - net = gross * ratio ONLY when fen_prob >= 0.5 AND 0.3 <= ratio < 1.0;
+        anything else keeps raw (gross) SF — the model is never allowed to inflate.
+      - ZERO bare except:pass around the session: every failure increments
+        _V18_FAILS_TOTAL and prints a loud [v18] line at page end; a failed
+        inference leaves every SF untouched. This function never raises.
+    """
+    global _V18_SESS, _V18_DEAD, _V18_FAILS_TOTAL
+    import os as _os
+    mp = _os.environ.get("V18_ONNX", "/data/model_v18.onnx")
+    if not _os.path.isfile(mp):
+        return                       # ships DARK: no file -> not even a load attempt
+    import numpy as np
+    if _V18_SESS is None and not _V18_DEAD:
+        try:
+            import onnxruntime as ort
+            _V18_SESS = ort.InferenceSession(mp, providers=["CPUExecutionProvider"])
+        except Exception as e:       # counted + logged ONCE, latched dead, no retry
+            _V18_DEAD = True
+            print(f"[v18] p{page_index}: session LOAD FAILED {type(e).__name__}: {e}"
+                  f" — ratio head OFF for this process", flush=True)
+    if _V18_SESS is None:
+        _V18_FAILS_TOTAL += 1
+        print(f"[v18] p{page_index}: session dead — {len(pieces)} candidate(s) keep "
+              f"raw SF (fails total {_V18_FAILS_TOTAL})", flush=True)
+        return
+    applied = 0
+    try:
+        ih, iw = img.shape[:2]
+        H32 = ((ih + 31) // 32) * 32
+        W32 = ((iw + 31) // 32) * 32
+        padded = np.full((H32, W32, 3), 255, np.uint8)   # white pad = paper (kernel's
+        padded[:ih, :iw] = img                           # solo-check convention)
+        x = (padded.astype(np.float32) / 255.0).transpose(2, 0, 1)[None]
+        masks = np.zeros((len(ids), H32, W32), np.float32)
+        for j, li in enumerate(ids):
+            masks[j, :ih, :iw] = (lab == li)
+        ro = _V18_SESS.run(["roi_out"], {"input": x, "roi_masks": masks})[0]
+        if ro.shape != (len(ids), 2):
+            raise ValueError(f"roi_out shape {ro.shape} != ({len(ids)}, 2)")
+        for j, pc in enumerate(pieces):
+            fen = float(ro[j, 0])
+            ratio = float(ro[j, 1])
+            if fen >= 0.5 and 0.3 <= ratio < 1.0:
+                sf2 = pc["area_sf"] * ratio
+                pc["area_sf"] = round(sf2, 1)
+                pc["label"] = f"~{round(sf2):,} SF"
+                pc["v18_fen"] = round(fen, 2)
+                pc["v18_ratio"] = round(ratio, 3)
+                applied += 1
+    except Exception as e:           # counted + logged, SF untouched — never raises
+        _V18_FAILS_TOTAL += 1
+        print(f"[v18] p{page_index}: inference FAILED {type(e).__name__}: {e} — "
+              f"{len(pieces)} candidate(s) keep raw SF (fails total {_V18_FAILS_TOTAL})",
+              flush=True)
+        return
+    if _os.environ.get("VH_V13_DEBUG"):
+        print(f"[v18] p{page_index}: netted {applied}/{len(pieces)} candidate(s), "
+              f"fails total {_V18_FAILS_TOTAL}", flush=True)
 
 
 def _rendered_color_regions(pdf_bytes, page_index, polys, W, H, ft_pt, max_new=40):
