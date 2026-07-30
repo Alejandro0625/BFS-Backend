@@ -18,6 +18,7 @@ import vector_hatch  # reads the DRAWN pattern vectors (seam trains + gray fills
 import callouts  # reads the drawing's own text callouts + leader arrows -> names the regions
 import density_reader  # dense-microtexture suggestions (Callahan class)
 import ocr_text  # OCR fallback (onnxruntime RapidOCR) for FLATTENED sets — lazy, memory-safe
+import titleblock  # title-block OCR (sheet no. + drawing title) — page-finding fallback for curve-title sheets
 import snap_fill  # coloring-book BUCKET fill + corner-snap → exact SF from vector geometry (assist layer)
 import material_groups  # within-job texture grouping → a selectable PREVIEW of material groups (assist layer)
 import auto_trim as auto_trim_mod  # derive corner/base/opening LF from face geometry (blueprint 1c) — suggestions only
@@ -298,12 +299,59 @@ def flag_label_outliers(polys, pw, ph):
             warns.append(f"{p.get('material') or p.get('category') or 'A region'}: " + p["sf_warn_msg"])
     return warns
 
-def is_elevation_page(pg):
+_TB_MAX_OCR_PAGES = int(os.environ.get("TITLEBLOCK_MAX_OCR_PAGES", "150"))
+_TB_OCR_BUDGET = {}   # id(doc) -> pages OCR'd (protects the request path on mega-sets)
+
+
+def _tb_text_sheet(pg):
+    """True when the title-block region carries a sheet-number-shaped token in the TEXT
+    layer — i.e. the title block is readable without OCR."""
+    try:
+        W8, H8 = pg.rect.width, pg.rect.height
+        rot8 = pg.rotation_matrix
+        for w in pg.get_text("words"):
+            q = fitz.Point((w[0] + w[2]) / 2, (w[1] + w[3]) / 2) * rot8
+            if q.x >= W8 * 0.82 and q.y >= H8 * 0.80 \
+                    and titleblock.SHEET_RE.match((w[4] or "").strip().upper()):
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def _titleblock_fallback(pg, t):
+    """v3-ocr (2026-07-29 flattened re-audit): the 15 page-finding-blind jobs are NOT
+    textless — their gold pages carry body text while the TITLE BLOCK is curves (no
+    sheet number, no title in the text layer). When the text path cannot classify AND
+    the title block is text-blind, OCR the corner (titleblock.py — prototype-graded
+    60/60 sheet ids, 9/9 elevation titles, 0 FP on 26-222) and admit the page when the
+    OCR'd TITLE says ELEVATION (or the sheet sits in the A4xx elevation series).
+    conf<0.6 abstains → page stays non-elevation (flag-never-bind)."""
+    try:
+        if len(t) >= 60 and _tb_text_sheet(pg):
+            return False        # title block IS textual — the text verdict stands
+        dk = id(pg.parent)
+        used = _TB_OCR_BUDGET.get(dk, 0)
+        if used >= _TB_MAX_OCR_PAGES:
+            return False
+        if len(_TB_OCR_BUDGET) > 64:
+            _TB_OCR_BUDGET.clear()
+        _TB_OCR_BUDGET[dk] = used + 1
+        v = titleblock.elevation_candidate(pg)
+        return bool(v.get("admit"))
+    except Exception:
+        return False
+
+
+def is_elevation_page(pg, ocr_fallback=True):
     """Auto-crop to the pages the estimator actually measures = elevations, returns, soffits.
     v2 (cold-run audit 2026-07-24: v1 text-only test found ALL gold pages on just 19/88
     archive jobs — blind on flattened sheets, excluded mixed sheets carrying a 'roof
     plan' note, over-included note-mentioning details): TITLE evidence outranks
-    exclusions; geometric level-datum evidence rescues textless sheets."""
+    exclusions; geometric level-datum evidence rescues textless sheets.
+    v3-ocr (2026-07-29): title-block OCR fallback for CURVE-TITLE sheets — the
+    measured blind class has texty bodies but drawn title blocks; strictly additive
+    (only ever ADDS admission; the doc-level gate stays text-only)."""
     import re as _re5
     try:
         t = (pg.get_text() or "").lower()
@@ -312,9 +360,11 @@ def is_elevation_page(pg):
     # 1) a real elevation TITLE anywhere = yes, regardless of plan notes on the sheet
     if _re5.search(r"\b(north|south|east|west|front|rear|left|right|side|partial|overall|exterior|building)\s+[\w\s]{0,18}elevation", t):
         return True
-    # 2) plan-titled sheets without an elevation title = no
+    # 2) plan-titled sheets without an elevation title = no — but a curve-title sheet
+    # can carry plan NOTES in body text while its drawn title says ELEVATIONS: consult
+    # the title-block OCR before rejecting (text-sheeted pages return False unchanged)
     if ("roof plan" in t) or ("floor plan" in t):
-        return False
+        return _titleblock_fallback(pg, t) if ocr_fallback else False
     if ("elevation" in t) or ("return" in t) or ("soffit" in t):
         return True
     # 3) textless/flattened sheets: LEVEL-DATUM geometry = elevation signature —
@@ -334,7 +384,7 @@ def is_elevation_page(pg):
                     return True
         except Exception:
             pass
-    return False
+    return _titleblock_fallback(pg, t) if ocr_fallback else False
 
 def _page_struct_lines(pg):
     """Long H/V vector lines of the page (same rule as /snap-points): the building's real geometry."""
@@ -455,7 +505,7 @@ def process(jid, pdf_bytes):
         # text, the filter is meaningless: turn it OFF and try every page instead of page 6 only.
         text_pages = sum(1 for pi in range(n) if len(doc[pi].get_text() or "") > 150)
         text_reliable = text_pages >= max(3, int(n * 0.3))
-        doc_any_elevation = text_reliable and any(is_elevation_page(doc[pi]) for pi in range(n))
+        doc_any_elevation = text_reliable and any(is_elevation_page(doc[pi], ocr_fallback=False) for pi in range(n))  # doc gate stays text-only — OCR admission is per-page/additive
         if not text_reliable and n > 1:
             jlog(job, f"Drawing text not extractable ({text_pages}/{n} pages with text) — scanning every page for cladding", "warn")
         auto_tried = 0; auto_hits = 0
@@ -470,7 +520,7 @@ def process(jid, pdf_bytes):
             for i, p in enumerate(polys):
                 p["id"] = i  # unique ids across polygons + linear runs
             auto = False; scale_conf = True; scale_val = None; auto_engine = None
-            page_is_elev = is_elevation_page(pg) or not doc_any_elevation  # only auto-mark elevations (or all if none detectable)
+            page_is_elev = (not doc_any_elevation) or is_elevation_page(pg)  # only auto-mark elevations (or all if none detectable); order skips OCR when all pages are admitted anyway
             if not polys and not doc_has_markup and page_is_elev:
                 # RAW/clean page -> auto-markup. Engine order: VECTOR (reads the drawn pattern —
                 # exact geometry, openings netted; cheap, so EVERY page gets it) -> trained MODEL
