@@ -954,9 +954,25 @@ def process(jid, pdf_bytes):
                     "markups. Re-export the PDF from Bluebeam (no flatten) and re-upload.")
         except Exception:
             pass
-        # TYPICAL-OF-n FLAG (convention census 2026-07-23: 'TYP OF n' pages carry 53
-        # not-found walls / 10.2k SF in 6 jobs — the drawing shows ONE instance, the
-        # estimator counts n). FLAG ONLY per the two-tier rule: SF never auto-multiplied.
+        # TYPICAL-OF-n FLAG.  PREMISE CORRECTED 2026-08-05 (FIX_TYPOF.md; first
+        # measured in FIX_CONVENTIONS.md, then INDEPENDENTLY RE-DERIVED).
+        # The 2026-07-23 census that motivated the old text was a co-occurrence table;
+        # the within-job control collapses TYP to -1.9 found points = zero effect.
+        # typof_verify.py then re-scanned ALL pages of all 121 jobs with THIS regex on
+        # THIS text source, and compared the stated n against k = the instances the
+        # estimator actually traced, under four independent k definitions:
+        #   26-214 p51 'TYP OF 4' k=10 | 26-021 p12 'TYP. OF (3)' k=4
+        #   26-214 p70 'TYP OF 4' k=3  | 26-109 p1  'TYPICAL OF 5' k=1
+        # k == n on 0 of 4, and k spans 1..10 against n=3..5 in BOTH directions, so
+        # no count rule is fundable.  The repeated units ARE drawn and he traces each
+        # one: on p51 thirteen garage-screen panels are traced (ten within 1% of
+        # 77.92 SF) on a sheet whose note says "TYP OF 4".  So "one instance is drawn
+        # but n exist" was false and "multiply" would have over-billed that page 4x.
+        # A TYP-OF callout means repeats EXIST but the drawing does not establish how
+        # many are in scope -> it is a FLAG TO CHECK, never a multiplier.
+        # 42 pages / 21 of 121 jobs fire this; only 4 carry gold and 33 carry no
+        # markup at all, so the archive is silent (not supportive) on the rest.
+        # FLAG ONLY: SF is never auto-multiplied.
         try:
             import re as _re7
             _tdoc = fitz.open(stream=pdf_bytes, filetype="pdf")
@@ -968,9 +984,14 @@ def process(jid, pdf_bytes):
                         for _e7 in job["takeoffData"]:
                             if _e7["pageNumber"] == _pi7 + 1:
                                 _e7.setdefault("flags", []).append(
-                                    f"⚠ REPETITION: this sheet says '{_m7.group(0).strip()}' — one instance"
-                                    f" is drawn but {_n7} exist. Confirm the count is in your takeoff"
-                                    " (multiply or trace the others) before bidding.")
+                                    f"⚠ REPETITION: this sheet says '{_m7.group(0).strip()}'."
+                                    " That means repeats exist — but the drawing does NOT establish"
+                                    " how many are in your scope, so this is a flag to CHECK, never a"
+                                    f" multiplier. Do NOT multiply the measured area by {_n7}: in the"
+                                    " 121-job archive the repeated units are each DRAWN and the traced"
+                                    " count never equalled the stated n (a sheet marked 'TYP OF 4'"
+                                    " carries 10 traced instances of one 78 SF unit). Confirm every"
+                                    " drawn instance is in your takeoff before bidding.")
                                 break
                         break   # one flag per page
                 if "MATCH LINE" in _t7:
