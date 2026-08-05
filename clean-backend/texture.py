@@ -77,7 +77,57 @@ def _register_scale(doc, pi, scale):
         _DOC_SCALES.clear()
 
 
+def _notation_contradicts(doc, pi, value):
+    """CONFIDENCE AXIS ONLY — never touches the value.
+
+    True when the page PRINTS a scale notation and `value` matches NONE of the printed
+    values within 2%. That can only happen when the value came from a NON-notation branch
+    (dimension strings / OCR / inheritance) while the sheet states something else — i.e.
+    the engine is contradicting the drawing's own note while calling itself confirmed.
+
+    Measured 2026-08-05 over 317 pages / 95 jobs against the corrected upper-edge oracle
+    (scratchpad/rule_kfold.json): fires on 2 pages, BOTH genuinely wrong, precision 1.000
+    held-out by job, and it de-confidences ZERO square feet that the engine had right.
+    Both hits are the `dim_scale` half/double phantom its own docstring warns about
+    (26-142 p16 read 3.7221 where the sheet prints 1/4"; 26-239A p11 read 26.8157 where
+    the sheet prints 1/8"). The wider variants were REFUTED at the same bar and are NOT
+    implemented: blanket mixed-scale refusal held-out precision 0.202, mixed+finest 0.333,
+    R1-or-mixed+finest 0.389 — all below the 0.50 bar, each spending 3-5 correct SF of
+    confidence per SF corrected.
+    """
+    try:
+        if not value or value <= 0:
+            return False
+        txt = doc[pi].get_text() or ""
+        try:
+            for a in (doc[pi].annots() or []):
+                txt += " " + ((a.info or {}).get("content", "") or "")
+        except Exception:
+            pass
+        nv = _parse_scale_text(txt)
+        if not nv:
+            return False                     # silent sheet corroborates nothing
+        return all(abs(v / value - 1.0) > 0.02 for v in nv)
+    except Exception:
+        return False                         # a failed audit never withdraws confidence
+
+
 def _read_scale(doc, pi):
+    """Read the drawing scale as feet-per-inch, robustly. Returns (ft_per_in, confirmed).
+
+    The VALUE is produced by _read_scale_value below; this wrapper adds a downgrade-only
+    confidence audit on top of it. The returned ft/in is byte-identical to what the
+    pre-2026-08-05 chain returned on every page — the audit can only flip confirmed
+    True -> False, never the number, and never False -> True. That is what makes this
+    change SF-invariant by construction rather than by measurement.
+    """
+    sc, conf = _read_scale_value(doc, pi)
+    if conf and _notation_contradicts(doc, pi, sc):
+        return sc, False
+    return sc, conf
+
+
+def _read_scale_value(doc, pi):
     """Read the drawing scale as feet-per-inch, robustly. Returns (ft_per_in, confirmed).
     Source chain — the drawing states its scale three ways, take the first that speaks
     with confidence: (1) page/annot TEXT scale note; (2) the drawing's own DIMENSION
