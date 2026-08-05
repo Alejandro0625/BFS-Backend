@@ -86,7 +86,7 @@ def _persist_job(jid):
             with open(os.path.join(d, "input.pdf"), "wb") as fh: fh.write(job["pdf"])
         meta = {k: job.get(k) for k in ("status", "phase", "progress", "legend", "takeoffData",
                 "scheduleData", "error", "polygons_by_page", "dims_by_page", "log", "projName", "pageCount",
-                "coverageReport")}
+                "coverageReport", "openingsConvention")}
         with open(os.path.join(d, "job.json"), "w", encoding="utf-8") as fh:
             json.dump(meta, fh)
     except Exception:
@@ -1014,6 +1014,17 @@ def process(jid, pdf_bytes):
             _cov.run(job, pdf_bytes, jlog=lambda m, lv="info": jlog(job, m, lv))
         except Exception:
             jlog(job, "Coverage layer error — takeoff unaffected", "warn")
+        # ── GROSS-vs-NET CONVENTION FLAG (Lane 6, 2026-08-05): the engine measures the
+        # wall the architect drew (GROSS); the archive books NET. Two opening detectors
+        # were refuted against pre-registered bars (FIX_OPENINGS.md), so the product
+        # NAMES the convention instead of guessing a deduction. Metadata + flag text
+        # only — the module fingerprints every SF number before/after and self-reverts
+        # if one moved.
+        try:
+            import openings_convention as _oc
+            _oc.annotate(job, jlog=lambda m, lv="info": jlog(job, m, lv))
+        except Exception:
+            jlog(job, "Gross-vs-net convention flag skipped — takeoff unaffected", "warn")
         total = sum(z["netArea"] for e in job["takeoffData"] for z in e["zones"])
         if auto_tried:  # never fail silently: say what the AI actually looked at
             jlog(job, f"Auto-detect scanned {auto_tried} page(s), found cladding on {auto_hits}", "warn" if auto_hits == 0 else "ok")
@@ -1061,7 +1072,11 @@ def status(jid: str):
             "legend": j.get("legend", []), "takeoffData": j.get("takeoffData", []),
             "scheduleData": j.get("scheduleData"), "drawingSchedule": j.get("drawingSchedule"),
             "ocrMaterials": j.get("ocrMaterials"), "error": j.get("error"), "pageCount": j.get("pageCount", 0),
-            "coverageReport": j.get("coverageReport")}
+            "coverageReport": j.get("coverageReport"),
+            # grouped GROSS-vs-NET convention summary (counts + archive deduction RANGE).
+            # Estimator information only — every SF in it is a convention estimate and is
+            # never added to or subtracted from any total (openings_convention.py).
+            "openingsConvention": j.get("openingsConvention")}
 
 @app.get("/polygons/{jid}/{page}")
 def polygons(jid: str, page: int):
