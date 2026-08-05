@@ -85,21 +85,84 @@ def _blocks(pg):
     return out[:80]
 
 
-def _leaders(pg, min_len=25, max_len=600):
-    """Plain-ish segments that could be leader shafts (any angle, medium length)."""
+class _RectGrid:
+    """Uniform-grid index over text-block rects — 'is this point at a callout?' in O(1).
+    Without it the anchored filter below would be O(segments x blocks) on every page."""
+
+    __slots__ = ("cell", "d")
+
+    def __init__(self, rects, cell=64.0):
+        self.cell = float(cell)
+        self.d = {}
+        for i, r in enumerate(rects):
+            x0, y0, x1, y1 = r
+            for cx in range(int(x0 // self.cell), int(x1 // self.cell) + 1):
+                for cy in range(int(y0 // self.cell), int(y1 // self.cell) + 1):
+                    b = self.d.setdefault((cx, cy), [])
+                    if len(b) < 400:
+                        b.append((r, i))
+
+    def _near(self, x, y, pad):
+        cx, cy = int(x // self.cell), int(y // self.cell)
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                for (r, i) in self.d.get((cx + dx, cy + dy), ()):
+                    if r[0] - pad <= x <= r[2] + pad and r[1] - pad <= y <= r[3] + pad:
+                        yield i
+
+    def hit(self, x, y, pad):
+        for _ in self._near(x, y, pad):
+            return True
+        return False
+
+    def idx(self, x, y, pad):
+        return sorted(set(self._near(x, y, pad)))
+
+
+def _leaders(pg, min_len=25, max_len=600, anchors=None, cap=4000, anchor_pad=20.0):
+    """Plain-ish segments that could be leader shafts (any angle, medium length).
+
+    FIX 6 (2026-08-04) — THE CAP WAS THE BUG. This used to return `segs[:4000]`: the
+    FIRST 4000 length-filtered segments in page order. On a hatched elevation those
+    4000 are all seam lines, so the real leaders never survived and leader-naming read
+    as "unavailable" on exactly the dense sheets it was written for. Measured on 5,891
+    gold walls in 119 paired jobs (MATERIAL_SIGNAL_CENSUS): 92.7% of gold walls sit on
+    a page where that cap binds, and 95.7% of the walls a leader COULD name are on such
+    a page — uncapped leader tracing is available on 25.7% of walls vs the whole
+    production namer's 4.9%.
+
+    The fix is not "raise the cap" (that costs O(segments x blocks) work on every page).
+    When `anchors` — the material text-block rects, page space — are supplied, only
+    segments with an ENDPOINT AT a callout are kept. That is a SUPERSET of the segments
+    name_regions could ever use (its own test is _near_rect(..., 16) on the same rects,
+    and anchor_pad here is 20), so this can only ADD coverage, never remove it, and the
+    surviving set is ~1000x smaller — so `cap` stops binding instead of deciding.
+    """
     segs = []
+    grid = _RectGrid(anchors) if anchors else None
+    lo2, hi2 = min_len * min_len, max_len * max_len
+    full = False
     try:
         for d in pg.get_drawings():
+            if full:
+                break
             for it in d["items"]:
                 if it[0] != "l":
                     continue
                 p1, p2 = it[1], it[2]
-                L = ((p1.x - p2.x) ** 2 + (p1.y - p2.y) ** 2) ** 0.5
-                if min_len <= L <= max_len:
-                    segs.append((p1.x, p1.y, p2.x, p2.y))
+                L2 = (p1.x - p2.x) ** 2 + (p1.y - p2.y) ** 2
+                if not (lo2 <= L2 <= hi2):
+                    continue
+                if grid is not None and not (grid.hit(p1.x, p1.y, anchor_pad)
+                                             or grid.hit(p2.x, p2.y, anchor_pad)):
+                    continue
+                segs.append((p1.x, p1.y, p2.x, p2.y))
+                if len(segs) >= cap:
+                    full = True
+                    break
     except Exception:
         pass
-    return segs[:4000]
+    return segs
 
 
 def _pip(pt, poly):
@@ -162,6 +225,45 @@ def _material_name(t):
 # material KEY tags: M1, PNL-1, EF-3, WD2 ... (legend key on the wall)
 _KEY_RE = re.compile(r"^[A-Z]{1,3}[-.]?\d{1,2}$")
 
+# ---------------------------------------------------------------- FIX 6 CODE-TAG TIER
+# The archive labels two-thirds of its gold SF with a BARE CODE, not an English material
+# word (HUNT_BASELINES G10: _MAT_RE recognises 33.2% of gold material SF). A bare code
+# printed ON the wall is, measured, the single most accurate identity signal in the
+# drawing — on 5,891 gold walls across 119 paired jobs (MATERIAL_SIGNAL_CENSUS, S3b):
+#   available on 9.8% of walls · 96.5% correct · +13.3 pts over "always say fiber cement"
+#   · +25.1 pts over the GC-majority guess · +6.9 pts over an ORACLE that already knows
+#   the job's majority family · +21.1 pts at VARIANT (colour/line-item) level.
+# _KEY_RE cannot be reused for this: it is the LEGEND key shape and matches door/window/
+# detail tags (W-1, D-2, A-1) just as happily. The tier is therefore gated on a MATERIAL
+# PREFIX TABLE — the same table that produced the 96.5% — and names nothing outside it.
+# Widening the shape WITHOUT that gate is what the census measured as S3/S3x: legend and
+# UniFormat-keynote resolution scored 19.5% / 23.1% correct, i.e. 70-76 points BELOW a
+# constant string. That path is deliberately NOT taken here.
+_CODE_TAG_RE = re.compile(r"^([A-Z]{1,4})[-.]?(\d{1,2}[A-Z]?)$")
+_CODE_FAMILY = {
+    # fiber cement
+    "FC": "FIBER CEMENT", "FCP": "FIBER CEMENT", "FCS": "FIBER CEMENT",
+    "FCL": "FIBER CEMENT", "FCB": "FIBER CEMENT", "FBC": "FIBER CEMENT",
+    "HDFC": "FIBER CEMENT", "SFC": "FIBER CEMENT", "FSH": "FIBER CEMENT",
+    "FSV": "FIBER CEMENT", "LS": "FIBER CEMENT",
+    # metal panel
+    "MP": "METAL PANEL", "CMP": "METAL PANEL", "LPSS": "METAL PANEL",
+    "SS": "METAL PANEL", "IMP": "METAL PANEL",
+    # aluminium/metal composite
+    "ACM": "ACM", "MCM": "ACM",
+}
+
+
+def _code_tag(tok):
+    """A word token -> (CODE, FAMILY) when it is a MATERIAL code tag, else None."""
+    m = _CODE_TAG_RE.match(tok or "")
+    if not m:
+        return None
+    fam = _CODE_FAMILY.get(m.group(1))
+    if not fam:
+        return None
+    return (m.group(1) + "-" + m.group(2), fam)
+
 
 def _legend_pairs(pg, blocks):
     """Legend convention: a short KEY (M5 / PNL-1) sitting just left of a material text block
@@ -194,6 +296,49 @@ def _key_words(pg):
     except Exception:
         pass
     return out
+
+
+def _code_words(pg):
+    """FIX 6 — MATERIAL code tags printed on the drawing: [(cx, cy, CODE, FAMILY)]."""
+    out = []
+    try:
+        for w in pg.get_text("words"):
+            ct = _code_tag((w[4] or "").strip().strip(".:;,()"))
+            if ct:
+                out.append(((w[0] + w[2]) / 2, (w[1] + w[3]) / 2, ct[0], ct[1]))
+    except Exception:
+        pass
+    return out[:4000]
+
+
+# FIX 6 tunables. Chosen on the TRAIN half of the held-out split; the swept values and
+# the chosen ones are reported in FIX_NAMING_COVERAGE.md.
+_CODE_MARGIN_PT = 0.0      # how far outside the region a code tag may sit (0 = strictly on it)
+_NEAR_BIND_PT = 0.0        # ARM D — near-bind OFF (35.7% marginal held-out, and it destroys correct names)
+_TIERS = ("code", "arrow", "leader")   # ARM D — legend OFF (held-out 6.5% marginal), near-bind OFF
+
+
+def _poly_dist(pt, poly):
+    """Point -> polygon distance in points (0 when inside). Pure-python, no shapely:
+    this runs inside the request path."""
+    if _pip(pt, poly):
+        return 0.0
+    x, y = pt
+    best = 1e18
+    n = len(poly)
+    for i in range(n):
+        x1, y1 = poly[i]
+        x2, y2 = poly[(i + 1) % n]
+        dx, dy = x2 - x1, y2 - y1
+        L2 = dx * dx + dy * dy
+        if L2 <= 1e-12:
+            d2 = (x - x1) ** 2 + (y - y1) ** 2
+        else:
+            t = max(0.0, min(1.0, ((x - x1) * dx + (y - y1) * dy) / L2))
+            d2 = (x - x1 - t * dx) ** 2 + (y - y1 - t * dy) ** 2
+        if d2 < best:
+            best = d2
+    return best ** 0.5
 
 
 _SCHED_NUM = re.compile(r"^[\d,]+(?:\.\d+)?$")
@@ -342,20 +487,52 @@ def read_schedule(pdf_bytes, page_index):
 def name_regions(pdf_bytes, page_index, polys, pw, ph):
     """polys carry normalized DISPLAY points. Returns count of regions named.
     Mutates polys in place: sets material/category/group to the callout text when found."""
+    doc = None
     try:
         doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-        pg = doc[page_index]
+        return name_regions_pg(doc[page_index], polys, pw, ph)
+    except Exception:
+        return 0
+    finally:
+        try:
+            if doc is not None:
+                doc.close()
+        except Exception:
+            pass
+
+
+def name_regions_pg(pg, polys, pw, ph):
+    """Same reader on an ALREADY-OPEN page — the caller owns the document. app.py calls
+    the naming layer twice per page (first pass + legend-first second pass); each call
+    used to re-open the whole PDF from bytes. Nothing else about the read changes."""
+    try:
         blocks = _blocks(pg)
-        if not blocks:
-            doc.close(); return 0
+        codes = _code_words(pg)
+        # FIX 6: the old early-exit was `if not blocks: return 0` — a page whose walls
+        # are labelled ONLY with bare codes ("FC-1") has no _MAT_RE text block at all,
+        # so the reader gave up before it could read the codes. Two-thirds of the
+        # archive's gold SF is labelled exactly that way (HUNT_BASELINES G10).
+        if not blocks and not codes:
+            return 0
         rot = pg.rotation_matrix
-        segs = _leaders(pg)
-        legend = _legend_pairs(pg, blocks)
-        keys = _key_words(pg)
-        heads = _arrowheads(pg)
-        doc.close()
+        # FIX 6: anchor the leader scan to the callout blocks instead of truncating the
+        # page's first 4000 segments (see _leaders). Same segments the loop below can
+        # use, without the seam-line flood deciding which ones survive.
+        _want_lead = ("leader" in _TIERS or "arrow" in _TIERS)
+        segs = _leaders(pg, anchors=[b["rect"] for b in blocks]) if (blocks and _want_lead) else []
+        legend = _legend_pairs(pg, blocks) if (blocks and "legend" in _TIERS) else {}
+        keys = _key_words(pg) if (blocks and "legend" in _TIERS) else []
+        heads = _arrowheads(pg) if (blocks and "arrow" in _TIERS) else []
         # region polygons in PAGE-display coords
         rpolys = [[(x * pw, y * ph) for x, y in p["points"]] for p in polys]
+        # bbox per region — a cheap reject before any point-in-polygon / distance work
+        rbb = []
+        for rr in rpolys:
+            if len(rr) < 3:
+                rbb.append(None)
+            else:
+                xs = [q[0] for q in rr]; ys = [q[1] for q in rr]
+                rbb.append((min(xs), min(ys), max(xs), max(ys)))
         # blocks + segs to display coords
         def rp(x, y):
             q = fitz.Point(x, y) * rot
@@ -370,7 +547,7 @@ def name_regions(pdf_bytes, page_index, polys, pw, ph):
         # 0) LEGEND-KEY FIRST — the most reliable convention (M5/PNL-1 tag on the wall + a
         # legend mapping key->material). Runs before leaders/proximity so junk text can't
         # claim a region that has a proper key.
-        if legend and keys:
+        if legend and keys and "legend" in _TIERS:
             for (kx, ky, key) in keys:
                 if key not in legend:
                     continue
@@ -387,16 +564,87 @@ def name_regions(pdf_bytes, page_index, polys, pw, ph):
                         used.add(ri)
                         named += 1
                         break
+        # 0b) CODE-TAG TIER — a MATERIAL code printed on the wall ("FC-1", "MP-2").
+        # Runs after the job's own legend (which is more specific) and before leaders,
+        # because a tag sitting ON the region is a stronger claim than a line pointing
+        # at it. Gated on _CODE_FAMILY: unknown prefixes are never named (see the table).
+        for (cx, cy, code, fam) in (codes if "code" in _TIERS else ()):
+            q = fitz.Point(cx, cy) * rot
+            pt = (q.x, q.y)
+            best, bestd = None, None
+            for ri, rr in enumerate(rpolys):
+                bb = rbb[ri]
+                if ri in used or bb is None:
+                    continue
+                m = _CODE_MARGIN_PT
+                if not (bb[0] - m <= pt[0] <= bb[2] + m and bb[1] - m <= pt[1] <= bb[3] + m):
+                    continue
+                d = _poly_dist(pt, rr)
+                if d <= m and (bestd is None or d < bestd):
+                    best, bestd = ri, d
+            if best is None:
+                continue
+            nm = f"{code} ({fam})"
+            polys[best]["material"] = nm
+            polys[best]["category"] = nm
+            polys[best]["group"] = nm
+            polys[best]["named_by"] = "code:" + code
+            polys[best]["name_dist_pt"] = round(bestd, 1)
+            used.add(best)
+            named += 1
+
         # arrowheads in display coords, with a tip that points AT a region
         dheads = [{"tip": rp(*h["tip"]), "c": rp(h["cx"], h["cy"])} for h in heads]
+        # FIX 6: grid-index the arrowhead centres. The old code ran min() over every
+        # arrowhead on the page for EVERY leader endpoint (up to 2,000 x segments).
+        hgrid = _RectGrid([(h["c"][0], h["c"][1], h["c"][0], h["c"][1]) for h in dheads],
+                          cell=48.0) if dheads else None
+
+        def head_near(pt, rad=22.0):
+            if hgrid is None:
+                return None
+            best, bd = None, rad * rad
+            for hi in hgrid.idx(pt[0], pt[1], rad):
+                h = dheads[hi]
+                d = (h["c"][0] - pt[0]) ** 2 + (h["c"][1] - pt[1]) ** 2
+                if d <= bd:
+                    bd, best = d, h
+            return best
 
         def region_at(pt):
             for ri, rr in enumerate(rpolys):
-                if ri not in used and len(rr) >= 3 and _pip(pt, rr):
+                bb = rbb[ri]
+                if ri in used or bb is None:
+                    continue
+                if not (bb[0] <= pt[0] <= bb[2] and bb[1] <= pt[1] <= bb[3]):
+                    continue        # bbox reject before the O(vertices) crossing test
+                if _pip(pt, rr):
                     return ri
             return None
 
-        def assign(ri, nm, how):
+        def region_near(pt, radius):
+            """FIX 6 — a leader endpoint that lands in EMPTY SPACE still points at
+            something. On 26-170 p1 the leader ends 424 pt from the nearest detected
+            polygon: the callout is readable, the region under it was simply never
+            detected, and the name is thrown away. Bind to the nearest region within
+            `radius` and RECORD THE DISTANCE, so the confidence of the bind travels
+            with it instead of being asserted. radius <= 0 disables the tier."""
+            if radius <= 0:
+                return None, None
+            best, bestd = None, None
+            for ri, rr in enumerate(rpolys):
+                bb = rbb[ri]
+                if ri in used or bb is None:
+                    continue
+                if not (bb[0] - radius <= pt[0] <= bb[2] + radius
+                        and bb[1] - radius <= pt[1] <= bb[3] + radius):
+                    continue
+                d = _poly_dist(pt, rr)
+                if d <= radius and (bestd is None or d < bestd):
+                    best, bestd = ri, d
+            return best, bestd
+
+        def assign(ri, nm, how, dist=0.0):
             nm = _material_name(nm)
             if not nm:
                 return False
@@ -408,6 +656,7 @@ def name_regions(pdf_bytes, page_index, polys, pw, ph):
             polys[ri]["category"] = nm
             polys[ri]["group"] = nm
             polys[ri]["named_by"] = how
+            polys[ri]["name_dist_pt"] = round(float(dist), 1)
             used.add(ri)
             return True
 
@@ -417,25 +666,47 @@ def name_regions(pdf_bytes, page_index, polys, pw, ph):
         #        with material text count, so detail-bubble/dimension arrows never mislabel.
         #    (b) plain leader — a leader segment from the block ends inside a region.
         #    (c) proximity — the block center sits inside a region.
-        for b in dblocks:
-            nm = b["text"]
-            hit = False
+        # FIX 6: index each leader by the callout block its TAIL sits at. Production
+        # scanned every segment against every block; with the anchored scan every segment
+        # is at SOME block, so that product would explode on a dense sheet. The index runs
+        # the identical _near_rect(...,16) test once per endpoint and keeps the loop linear.
+        seg_by_block = {}
+        if segs and dblocks and ("leader" in _TIERS or "arrow" in _TIERS):
+            bgrid = _RectGrid([b["rect"] for b in dblocks])
             for (x1, y1, x2, y2) in segs:
                 a = rp(x1, y1); c2 = rp(x2, y2)
                 for (p_from, p_to) in ((a, c2), (c2, a)):
-                    if not _near_rect(p_from, b["rect"], 16):
-                        continue
+                    for bi in bgrid.idx(p_from[0], p_from[1], 16):
+                        if _near_rect(p_from, dblocks[bi]["rect"], 16):
+                            seg_by_block.setdefault(bi, []).append((p_from, p_to))
+        for bi, b in (enumerate(dblocks) if ("leader" in _TIERS or "arrow" in _TIERS) else ()):
+            nm = b["text"]
+            hit = False
+            for (p_from, p_to) in seg_by_block.get(bi, ()):
+                for _once in (0,):
                     # (a) is there an arrowhead near this leader's far end?
-                    ah = min(dheads, key=lambda h: (h["c"][0] - p_to[0]) ** 2 + (h["c"][1] - p_to[1]) ** 2, default=None) if dheads else None
-                    if ah and (ah["c"][0] - p_to[0]) ** 2 + (ah["c"][1] - p_to[1]) ** 2 <= 22 ** 2:
+                    ah = head_near(p_to) if "arrow" in _TIERS else None
+                    if ah is not None:
                         ri = region_at(ah["tip"])
                         if ri is None:
                             ri = region_at(p_to)
                         if ri is not None and assign(ri, nm, "arrow"):
                             hit = True; break
+                        # (a2) FIX 6 — the arrow's tip lands in empty space
+                        ri, dd = region_near(ah["tip"], _NEAR_BIND_PT)
+                        if ri is not None and assign(ri, nm, "arrow~near", dd):
+                            hit = True; break
                     # (b) plain leader end in a region
+                    if "leader" not in _TIERS:
+                        continue
                     ri = region_at(p_to)
                     if ri is not None and assign(ri, nm, "leader"):
+                        hit = True; break
+                    # (c) FIX 6 — the leader's far end lands in empty space: the region it
+                    # points at was never detected. Bind to the nearest one within
+                    # _NEAR_BIND_PT and carry the distance as the confidence.
+                    ri, dd = region_near(p_to, _NEAR_BIND_PT)
+                    if ri is not None and assign(ri, nm, "leader~near", dd):
                         hit = True; break
                 if hit:
                     break
