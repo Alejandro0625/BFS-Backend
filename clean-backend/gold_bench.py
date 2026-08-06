@@ -11,8 +11,27 @@ from shapely.geometry import Polygon
 import vector_hatch, snap_fill
 
 ROOT = r"V:\Bids 2026\Siding Bids 2026\00 - Submitted"
-OUT = r"C:\Users\User\AppData\Local\Temp\claude\C--Users-User--claude-projects-C--Users-User-Downloads\7923c776-90d9-4429-bc6e-2042f5ab0117\scratchpad\gold_bench_results.json"
-MAX_JOBS = 30
+# 2026-07-29: office staff MOVE job folders between status dirs (26-025 Avita went
+# Submitted -> "00 - Scope review" for a rebid; the frozen exam silently lost its
+# 113 gold walls and EVERY engine scored 66/372 vs bar 140). Manifest-pinned runs
+# now search these roots READ-ONLY in order (Submitted first); heuristic
+# (no-manifest) runs still use ROOT only, so corpus discovery semantics are unchanged.
+ROOTS = [ROOT,
+         r"V:\Bids 2026\Siding Bids 2026\00 - Scope review",
+         r"V:\Bids 2026\Siding Bids 2026\00 - WON",
+         r"V:\Bids 2026\Siding Bids 2026\00 - Not Submitted"]
+# 2026-07-30: under Task Scheduler's "run whether user is logged on" session the
+# V: drive mapping DOES NOT EXIST (autopilot exam scored 0/372 all night after the
+# logon-type change). Fall back to the UNC share transparently so every scheduler
+# session grades the same archive.
+_UNC_BASE = "\\\\192.168.168.2\\Boston"
+if not os.path.isdir(ROOT):
+    ROOT = _UNC_BASE + ROOT[2:]
+    ROOTS = [_UNC_BASE + r[2:] for r in ROOTS]
+OUT = os.environ.get("BENCH_OUT",
+    r"C:\Users\User\AppData\Local\Temp\claude\C--Users-User--claude-projects-C--Users-User-Downloads\7923c776-90d9-4429-bc6e-2042f5ab0117\scratchpad\gold_bench_results.json")
+MAX_JOBS = int(os.environ.get("BENCH_MAX_JOBS", "30"))     # defaults = the frozen v2 gate
+_MANIFEST_FILE = os.environ.get("BENCH_MANIFEST", "gold_manifest.json")  # gold_manifest_full.json = every submitted bid
 MAX_PAGES = 6          # per doc — elevations live early in elevation-only files
 MAX_MB = 60
 
@@ -130,21 +149,40 @@ else:
 _MANIFEST = {}
 try:
     _MANIFEST = json.load(open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                            "gold_manifest.json")))
+                                            _MANIFEST_FILE)))
 except Exception:
     pass
-for job in (sorted(os.listdir(ROOT)) if _RUN else []):
+_jobdirs = {}
+if _RUN:
+    for _r in (ROOTS if _MANIFEST else [ROOT]):
+        try:
+            for _j in os.listdir(_r):
+                _jobdirs.setdefault(_j, _r)      # first root wins (Submitted preferred)
+        except Exception:
+            pass
+_joblist = sorted(_jobdirs, reverse=bool(os.environ.get("BENCH_DESC")))
+_graded_keys = set()      # a moved job can exist under two names — grade each key ONCE
+for job in _joblist:
     if jobs_done >= MAX_JOBS:
         break
-    jd = os.path.join(ROOT, job)
+    jd = os.path.join(_jobdirs[job], job)
     if not os.path.isdir(jd):
         continue
     # FROZEN EXAM: the manifest pins job->file so every run grades the same test —
-    # heuristic re-picking changed the exam twice and made runs incomparable
+    # heuristic re-picking changed the exam twice and made runs incomparable.
+    # Entries may be a filename string (gold = first MAX_PAGES pages, the v2 gate) or
+    # a dict {"file":..., "pages":[1-based,...]} pinning WHERE the gold lives (the
+    # full-corpus exam: takeoffs sit on pages 6-70 of the arch crops).
+    pin_pages = None
+    _mkey = None
     if _MANIFEST:
-        mf = next((v for k, v in _MANIFEST.items() if job[:44] == k), None)
-        if mf is None:
+        _mkey = next((k for k in _MANIFEST if job[:44] == k), None)
+        if _mkey is None or _mkey in _graded_keys:
             continue
+        mf = _MANIFEST[_mkey]
+        if isinstance(mf, dict):
+            pin_pages = [int(p) - 1 for p in (mf.get("pages") or [])]
+            mf = mf.get("file") or ""
         cand = [os.path.join(jd, f) for f in os.listdir(jd) if f.startswith(mf[:36])]
         fp = cand[0] if cand else None
     else:
@@ -155,7 +193,10 @@ for job in (sorted(os.listdir(ROOT)) if _RUN else []):
         doc = fitz.open(fp)
         # gold per page
         gold_by_pg = {}
-        for pi in range(min(len(doc), MAX_PAGES)):
+        page_iter = pin_pages if pin_pages else range(min(len(doc), MAX_PAGES))
+        for pi in page_iter:
+            if pi < 0 or pi >= len(doc):
+                continue
             g = gold_walls(doc[pi])
             if g:
                 gold_by_pg[pi] = g
@@ -210,19 +251,46 @@ for job in (sorted(os.listdir(ROOT)) if _RUN else []):
                     cov = u.intersection(gp).area / max(1e-9, gp.area)
             except Exception:
                 pass
+            # confidence features for the precision/abstention curve (pillar-1 of the
+            # road to 100: the system must KNOW when it's right — iou alone measured
+            # only 53% precision at the money gate; reader class + scale are the
+            # candidate signals). Additive keys; bench_diff reads got/iou only.
+            def _rdr(p):
+                m = str(p.get("material") or "")
+                for pre, nm in (("Hatched area", "hatch"), ("Color fill", "color"),
+                                ("Rendered", "rc"), ("Wall area (AI boundary", "v13"),
+                                ("Wall band", "band"), ("Wall area", "flood"),
+                                ("Panel wall", "fill")):
+                    if m.startswith(pre):
+                        return nm
+                return "train"
             jrec["walls"].append({"pg": pi + 1, "mat": g["mat"], "gold": g["sf"],
                                   "got": round(asf, 1), "iou": round(cov, 2),
-                                  "n_pieces": len(mine)})
+                                  "n_pieces": len(mine),
+                                  "readers": sorted(set(_rdr(p) for _, p in mine)),
+                                  "named": any(p.get("named_by_tag") or p.get("stmt")
+                                               for _, p in mine)})
         del piece_polys
     if jrec["walls"]:
         results.append(jrec)
         jobs_done += 1
+        if _mkey is not None:
+            _graded_keys.add(_mkey)
         ok = sum(1 for w in jrec["walls"] if w["iou"] >= 0.7 and abs(w["got"] - w["gold"]) <= 0.15 * w["gold"])
         print(f"[{jobs_done}] {jrec['job'][:40]:<42} walls {len(jrec['walls']):>3}  OK {ok:>3}  "
               f"scale_conf={jrec['scale_conf']}", flush=True)
 
 if _RUN:
     json.dump(results, open(OUT, "w"), indent=1)
+    # DENOMINATOR GUARD (2026-07-29 lesson: office moved 26-025's folder and the
+    # exam silently graded 66/372 — a missing manifest job must be LOUD, never silent):
+    if _MANIFEST:
+        _graded_jobs = {r["job"] for r in results}
+        _missing = [k for k in _MANIFEST
+                    if not any(str(j).startswith(str(k)[:6]) for j in _graded_jobs)]
+        if _missing:
+            print(f"\n!!!! DENOMINATOR SHORTFALL: {len(results)}/{len(_MANIFEST)} manifest "
+                  f"jobs graded — MISSING (folder moved/renamed?): {_missing}", flush=True)
     tw = sum(len(r["walls"]) for r in results)
     ok = sum(1 for r in results for w in r["walls"] if w["iou"] >= 0.7 and abs(w["got"] - w["gold"]) <= 0.15 * w["gold"])
     shape_ok = sum(1 for r in results for w in r["walls"] if w["iou"] >= 0.7)
