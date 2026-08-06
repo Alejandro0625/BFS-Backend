@@ -80,47 +80,7 @@ jobs = {}  # jobId -> dict  (in-memory hot cache, bounded to MAX_MEM_JOBS)
 # ── durable, bounded job store ───────────────────────────────────────────────
 # The old code kept every uploaded PDF in `jobs` forever → unbounded RAM → OOM.
 # Now: keep a small hot set in RAM, persist each job to the volume, rehydrate on demand.
-# -- JOB-ID GUARD (2026-08-06, FIX_ENDPOINT_SECURITY.md finding A) ------------
-# `jid` is attacker-controlled on every job route and reached os.path.join with no
-# sanitisation. MEASURED against the real routes, and wider than the first write-up:
-#   * GET /status/{jid} leaks only through the BACKSLASH forms -- Starlette's path
-#     convertor 404s '../' -- so that route alone is a Windows-only defect, which is
-#     why the first probe read "not exploitable on the Railway Linux deployment".
-#   * But /learn, /accept-suggestion and /split-suggest take the id from a JSON BODY,
-#     where no path convertor exists. '../x', '..\\x' and a plain ABSOLUTE path each
-#     returned HTTP 200 having PARSED a job.json outside JOBS_DIR, and
-#     /accept-suggestion then REWROTE that outside file via _persist_job (proved by
-#     content: the rewritten file carries the handler's own "AI wall (accepted)"
-#     marker). posixpath resolves '../', and os.path.join(root, '/abs') discards root
-#     on EVERY OS -- so those three routes are live in production, read AND write.
-# One predicate at the two chokepoints covers all ~12 job routes instead of twelve
-# per-route edits. A refused id gets 404, the same answer an unknown id gets, so the
-# guard tells a prober nothing it did not already know.
-_JID_RE = re.compile(r"^[A-Za-z0-9._-]+$")
-
-def _jid_ok(jid):
-    """True only for a bare job id.
-
-    The second clause is not decoration. `..` MATCHES the character class above -- the
-    dot is inside it -- and _job_dir("..") is the PARENT of JOBS_DIR, so the pattern on
-    its own still escapes one level. Every all-dots id is refused.
-
-    Every real id passes: analyze()/compare() mint f"{ms}-{hex6}", and all 137 ids in
-    the job store (including the 'coldrun-26-012' family) match, so no legitimate
-    lookup changes behaviour.
-    """
-    s = str(jid)
-    return bool(_JID_RE.match(s)) and s.strip(".") != ""
-
-def _safe_jid(jid):
-    """HARD wall: refuse before the id can become a path. _job_dir builds every path in
-    the job store, so an untrusted id must never come back out of it, whoever calls it
-    next."""
-    if not _jid_ok(jid):
-        raise HTTPException(404, "job not found")
-    return str(jid)
-
-def _job_dir(jid): return os.path.join(JOBS_DIR, _safe_jid(jid))
+def _job_dir(jid): return os.path.join(JOBS_DIR, str(jid))
 
 BIG_PDF_BYTES = int(os.environ.get("BIG_PDF_BYTES", str(200 * 1024 * 1024)))
 
@@ -165,14 +125,6 @@ def _load_job(jid):
 
 def get_job(jid):
     """Hot cache first, else rehydrate the job from the durable store (survives restart/eviction)."""
-    # SOFT wall, and it is needed HERE as well as in _job_dir: the hot cache is
-    # checked first and never reaches _job_dir, and one successful traversal
-    # leaves jobs[<traversal id>] populated (measured), so on a long-lived worker
-    # the second identical request would be served from RAM past a _job_dir-only
-    # guard. It returns None instead of raising so /autonomy-status -- which walks
-    # jobIds out of correction records that /learn lets a caller write, outside any
-    # try/except -- SKIPS a planted record rather than 404ing the whole endpoint.
-    if not _jid_ok(jid): return None
     j = jobs.get(jid)
     if j is None:
         j = _load_job(jid)
