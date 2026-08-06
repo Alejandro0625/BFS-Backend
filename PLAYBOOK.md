@@ -26,7 +26,7 @@
 - Kernel `bostonfacades/bfs-takeoff-v12` (v10's proven recipe + grad clip + lr 7e-4, on the big `takeoff-tiles-v6` dataset). Expect ~6–10h.
 - **When COMPLETE**: check log — if `BEST HONEST extent-IoU` **> 0.741** (v10's score), deploy it:
   1. Copy kernel `bostonfacades/bfs-onnx-export-v10`, point its input at v12's output, run → download `model.onnx`
-  2. `POST {backend}/admin/upload-model?key=bfs-model-load` (multipart field `model`) — **requires explicit user approval in-session (classifier-gated)**
+  2. `POST {backend}/admin/upload-model?key=$ADMIN_KEY` (multipart field `model`) — **requires explicit user approval in-session (classifier-gated)**. `/admin/*` is **FAIL-CLOSED**: with `ADMIN_KEY` unset on Railway — or still set to the credential this playbook used to print in full — the endpoint refuses **every** request with HTTP 503 and logs why. Set a fresh `ADMIN_KEY` in the Railway service variables first; the previously published value is permanently denylisted by digest and can never authenticate again.
   3. Verify `/health` shows `auto_engine: "model"`, then run the test battery.
 - If ≤ 0.741: keep v10, note results, adjust (more epochs / different seed).
 
@@ -37,6 +37,7 @@
 4. **Zips created on Windows PowerShell use backslash entries** — build zips with Python `zipfile` (forward slashes) or Linux can't extract them.
 5. Railway health-gate is NOT reliable protection — a failed deploy CAN take the service down (~4 min to revert: push previous file versions back).
 6. After EVERY backend deploy run the battery: marked file must return exactly 1364/2209/4630/1653; clean Fleet ≈ 6697/5756; `/health` ok.
+7. **A credential must never have a default.** `os.environ.get("KEY", "literal")` makes the literal the live credential the moment the variable is unset — and this repo is public, so the literal is the world's. Guard every admin/mutating route the way `clean-backend/admin_auth.py` does: unset == blank == the published value == **DISABLED**, refusing every request until an operator sets a real secret. Fail-closed cannot cause an outage of correct usage; fail-open silently poisons every SF number the system produces.
 
 ## Test assets
 - Marked (exact-path): `C:\Users\User\Downloads\fleet_garage_elevations.pdf`
