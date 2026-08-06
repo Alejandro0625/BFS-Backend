@@ -35,6 +35,22 @@ JOBS_DIR = os.environ.get("JOBS_DIR", "/data/jobs")
 MAX_MEM_JOBS = int(os.environ.get("MAX_MEM_JOBS", "20"))   # cap RAM: never OOM (evicted jobs live on disk)
 MAX_DISK_JOBS = int(os.environ.get("MAX_DISK_JOBS", "200"))  # cap volume: prune oldest persisted jobs
 MAX_AUTO_PAGES = int(os.environ.get("MAX_AUTO_PAGES", "30"))  # cap texture auto-detect work per PDF
+# SITE/CIVIL SCALE CUT (2026-08-06, FIX_ENGINE_BLOWUP.md). A permit set contains civil,
+# site, locus and grading sheets, and the engine has no page-selection stage, so it
+# measures them as cladding at the scale THEY print. The scale is read correctly; the
+# sheet is land, not a wall — 26-046 p1 prints 1"=400' and booked 58,468,346 SF, which is
+# 2,500x an elevation at 1/8"=1'-0"; 26-199 p11 prints 1"=2000' (62,500x) and booked
+# 3,136,600 SF. Census of every measured page in the 121-job archive (3,829 pages):
+# the confirmed-scale ladder actually observed is 1, 1.33, 2, 2.67, 4, 5.33, 6, 8, 10,
+# 10.67, 16, 20, 21.33, then a GAP, then 64, 400, 500, 2000. The cut sits in that gap and
+# ABOVE every architectural scale anyone draws a building at (1/64"=1'-0" is 64 ft/in):
+# 100 ft/in cannot come off the architectural ladder at all. At this cut 3 pages of 3,829
+# are touched (0.08%) carrying 61,664,732 SF = 42.5% of all SF the archive run booked,
+# and ZERO of them is a gold page — the coarsest confirmed scale carrying any gold
+# anywhere in the corpus is 21.33 ft/in, 4.7x below the cut. Measured, not tuned:
+# bfs_overnight/ENGSCALE_EXPOSURE.json carries the same table at 17/20/32/64/100/400,
+# and 20 is NOT usable — it takes a gold page (26-234 p5) and four frozen-exam jobs.
+SITE_SCALE_FT_PER_IN = float(os.environ.get("SITE_SCALE_FT_PER_IN", "100"))
 
 app = FastAPI(title="BFS Clean Backend")
 # CORS: browsers may only call this API from the app's own origins (the Vercel prod
@@ -521,6 +537,7 @@ def process(jid, pdf_bytes):
             for i, p in enumerate(polys):
                 p["id"] = i  # unique ids across polygons + linear runs
             auto = False; scale_conf = True; scale_val = None; auto_engine = None
+            site_scale_flags = []   # survives even when the page ends up producing no auto regions
             page_is_elev = (not doc_any_elevation) or is_elevation_page(pg)  # only auto-mark elevations (or all if none detectable); order skips OCR when all pages are admitted anyway
             if not polys and not doc_has_markup and page_is_elev:
                 # RAW/clean page -> auto-markup. Engine order: VECTOR (reads the drawn pattern —
@@ -546,6 +563,36 @@ def process(jid, pdf_bytes):
                                 tpolys = snap_auto_polys(pg, tpolys, pw, ph)  # lock AI shapes to the drawing's real corners
                             except Exception:
                                 pass
+                    # ---- SITE/CIVIL SCALE = NOT A CLADDING SHEET (2026-08-06) -----------
+                    # The detector has now told us the scale IT believes, read from this
+                    # page's own printed note and CONFIRMED. Every confidence mechanism in
+                    # the engine asks "was the scale read correctly?" and none asks "what
+                    # kind of drawing is this?", so a correctly-read site scale is the one
+                    # error class that passes every guard (FIX_ENGINE_BLOWUP.md §4). Only
+                    # a CONFIRMED scale disqualifies: an unconfirmed reading is already
+                    # handled by the calibrate-before-trusting flag below, and guessing a
+                    # page away on an unconfirmed number is how the 08-04 scale patch
+                    # withheld 42.2% of gold SF and dropped the frozen exam 140 -> 107.
+                    # AUTO PATH ONLY — this whole branch is inside
+                    # `if not polys and not doc_has_markup and page_is_elev`, so the
+                    # marked/digitize path (the exact 100%-SF tier) cannot reach it.
+                    if tpolys:
+                        try:
+                            _ss_val = float(sinfo.get("ft_per_in") or 0.0)
+                        except Exception:
+                            _ss_val = 0.0
+                        if bool(sinfo.get("scale_confirmed")) and _ss_val >= SITE_SCALE_FT_PER_IN:
+                            _ss_sf = sum(float(p.get("area_sf") or 0) for p in tpolys)
+                            site_scale_flags.append(
+                                f"⚠ SITE SHEET EXCLUDED — this page prints 1\"={_ss_val:g}', a site/civil "
+                                f"scale, not a wall elevation (an elevation is 1/8\"=1'-0\" = 8 ft/in). "
+                                f"{len(tpolys)} auto-read region(s) totalling {_ss_sf:,.0f} SF were LEFT OUT "
+                                f"of the takeoff: at this scale the reader is measuring LAND, not cladding. "
+                                f"If this really is a wall elevation, calibrate the page and re-run it.")
+                            jlog(job, f"Page {pi+1}: 1\"={_ss_val:g}' is a site/civil scale — "
+                                      f"{len(tpolys)} region(s) / {_ss_sf:,.0f} SF excluded from the takeoff", "warn")
+                            tpolys = []
+                            page_is_elev = False   # also suppresses the raster-page AI suggestions below
                     if tpolys:
                         try:  # read the architect's own labels: callout text + leader arrows -> region names
                             n_named = callouts.name_regions(pdf_bytes, pi, tpolys, pw, ph)
@@ -649,7 +696,12 @@ def process(jid, pdf_bytes):
                     pass
             job["polygons_by_page"][pi + 1] = polys
             job["dims_by_page"][pi + 1] = {"width": pw, "height": ph}
-            if not polys and not lin_lf_items:  # keep pages that have linear (trim/LF) measurements even with no area polygons
+            # keep pages that have linear (trim/LF) measurements even with no area polygons,
+            # AND keep a page the site-scale guard emptied: dropping it here would make the
+            # exclusion SILENT, which is the exact defect app.py:756's page-total SANITY flag
+            # has (it fires on all six blowup pages and has no consumer, so it never becomes a
+            # code). An excluded page must arrive at the estimator carrying its own reason.
+            if not polys and not lin_lf_items and not site_scale_flags:
                 continue
             bymat = defaultdict(lambda: {"sf": 0.0, "n": 0, "category": None})
             for p in polys:
@@ -861,7 +913,7 @@ def process(jid, pdf_bytes):
                 "zones": zones,
                 "linearItems": linear_items,
                 "autoTrim": auto_trim,
-                "flags": auto_flags + sf_warns + sorted(_fam_flags9),
+                "flags": auto_flags + sf_warns + sorted(_fam_flags9) + site_scale_flags,
                 "levels": page_levels,
                 "source": "texture-auto" if auto else "digitize",
                 # window/door COUNT surface (count-only takeoffs are a whole bid class):
