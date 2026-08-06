@@ -163,26 +163,18 @@ def _read_scale_value(doc, pi):
     except Exception:
         key = None
     if key is not None and key in _SCALE_CACHE:
+        # IMMUTABLE-ON-HIT (FIX_WARM_SCALECACHE.md): a cached scale is returned verbatim
+        # on every hit, so the same (page, content) can never resolve to a different
+        # scale on a later read in a long-lived worker. The removed branch re-ran sibling
+        # inheritance on a cache hit and UPGRADED a cached (8.0, False) default to an
+        # inherited (scale, True) once same-document siblings had registered into
+        # _DOC_SCALES between the 1st and 2nd upload of one file - moving a page's
+        # ft_per_in (26-152: every SF x (2.0/8.0)**2 = 1/16) or its scale_confirmed flag
+        # (26-147) between two identical uploads. A FIRST read of a page is always a
+        # cache miss and never enters here, so cold single-pass grades are byte-identical.
         cached = _SCALE_CACHE[key]
         if cached[1]:
             _register_scale(doc, pi, cached[0])
-            return cached
-        if not cands:
-            # unconfirmed cache entry: siblings may have registered since — retry the
-            # cheap inheritance check before returning the stale default
-            try:
-                dk = _doc_key(doc)
-                sibs = _DOC_SCALES.get(dk) or {}
-                r = doc[pi].rect
-                size = (round(r.width), round(r.height))
-                vals = {round(s, 4) for p, (s, sz) in sibs.items()
-                        if p != pi and sz == size}
-                if len(vals) == 1:
-                    fresh = (vals.pop(), True)
-                    _SCALE_CACHE[key] = fresh
-                    return fresh
-            except Exception:
-                pass
         return cached
     result = None
     # (2) dimension strings: "24'-0\"" drawn over a measurable line IS the scale
