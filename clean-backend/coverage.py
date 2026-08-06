@@ -104,6 +104,10 @@ _LOOSE_KEY_RE = re.compile(r"^(?:[A-Z]{1,3}\d{0,2}[A-Z]?(?:-[A-Z]{1,4}\d{0,2}[A-
 # SYNC WITH app.py:914 -- the TYP-OF emitter regex
 _TYP_RE = re.compile(r"TYP(?:ICAL)?\.?\s*(?:OF|X)\s*\(?(\d+)\)?")
 # SYNC WITH app.py:682-683 -- REWORK sentinel terms
+_REWORK_RE = re.compile(r"\bREFABRICATE|\bREMOVE AND REINSTALL\b|\bREWORK")
+# 2026-08-05 instructional-text audit: the old tuple was substring-matched and
+# PREFABRICATED contains REFABRICATE (125 of 157 firing pages).  Kept in SYNC with
+# the corrected app.py trigger; report layer only, no SF path.
 _REWORK_TERMS = ("REFABRICATE", "REMOVE AND REINSTALL", "REWORK", "LIMITS OF WORK")
 # Owner refinement 2026-07-28 -- courtyard/separate-structure vocabulary. Each
 # hit is a STRUCTURE_TERM convention: always unresolved in v1 (same semantics
@@ -685,7 +689,7 @@ def _sentinel_scan(doc, raw, up):
         # SYNC app.py:945 -- the job-level soffit/return sentinel condition
         if "SOFFIT" in t or ("RETURN" in t and ("PANEL" in t or "CANOPY" in t or "ACM" in t)):
             hits[page].append({"type": "SOFFIT", "text": "SOFFIT/RETURN"})
-        if any(k in t for k in _REWORK_TERMS):   # SYNC app.py:682-683
+        if _REWORK_RE.search(t):   # SYNC app.py corrected trigger 2026-08-05
             hits[page].append({"type": "REWORK", "text": "REWORK terms"})
         # owner refinement: courtyard / separate-structure vocabulary
         for term in _STRUCT_TERMS:
