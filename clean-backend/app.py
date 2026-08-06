@@ -731,10 +731,27 @@ def process(jid, pdf_bytes):
                     # REWORK-CASCADE sentinel (93 Bennington loss: 'REMOVE AND REFABRICATE
                     # panels that INTERFACE with the shifted wall' — scope written in notes,
                     # never measured). Rework verbs = scope beyond the highlighted limits.
-                    if any(k in _t for k in ("REFABRICATE", "REMOVE AND REINSTALL", "REWORK",
-                                             "LIMITS OF WORK")):
-                        auto_flags.append("⚠ REWORK job — notes extend scope beyond the marked"
-                                          " limits (interfacing panels, returns, make-good)."
+                    # REWORK TRIGGER CORRECTED 2026-08-05 (FIX_TYPOF.md — instructional-text
+                    # audit).  The trigger was `"REFABRICATE" in _t`, a BARE SUBSTRING test,
+                    # and the ordinary drawing word PRE-FABRICATED contains it.  Re-running
+                    # the shipped trigger over all 5,959 pages of the 121-job archive:
+                    # 157 pages fire, only 27 carry a genuine rework verb, 125 fire ONLY on
+                    # "PREFABRICATED" and 5 ONLY on "LIMITS OF WORK" -> 17.2% precision, and
+                    # 43 of the 56 flagged jobs contain no rework verb anywhere.  Telling an
+                    # estimator a prefab-panel job is a REWORK job is a confidently-wrong
+                    # assertion.  \bREFABRICAT cannot match PREFABRICATED (the preceding P is
+                    # a word char, so there is no boundary).  "LIMITS OF WORK" is dropped
+                    # outright: it is the phrase that MARKS the limits, so firing "scope
+                    # extends beyond the marked limits" on it asserts the opposite of the
+                    # note.  The flag now QUOTES the matched note so the claim is checkable
+                    # against the sheet.  FLAG TEXT ONLY: auto_flags reaches only
+                    # "flags" at app.py:847 — no SF, no scale, no polygon.
+                    _rw_m = re.search(r"\bREFABRICATE|\bREMOVE AND REINSTALL\b|\bREWORK", _t)
+                    if _rw_m:
+                        auto_flags.append(f"⚠ REWORK job — this sheet carries the note"
+                                          f" '{_rw_m.group(0)}'. Rework scope lives in the NOTES,"
+                                          " outside the highlighted limits (interfacing panels,"
+                                          " returns, make-good), so it is easy to miss."
                                           " Read every note on this sheet before pricing.")
                 except Exception:
                     pass
@@ -1000,8 +1017,10 @@ def process(jid, pdf_bytes):
                         if _e7["pageNumber"] == _pi7 + 1:
                             _e7.setdefault("flags", []).append(
                                 "⚠ MATCH LINE on this sheet — the view continues on another sheet."
-                                " Confirm the continued portion is in the takeoff (censused: match-line"
-                                " sheets hide walls).")
+                                " Confirm the continued portion is in the takeoff. Archive census:"
+                                " 69 match-line pages in 19 jobs, and on 32 of them NO sheet"
+                                " reference is printed beside the match line, so which sheet"
+                                " continues it cannot be resolved from the drawing.")
                             break
             _tdoc.close()
         except Exception:
@@ -1528,7 +1547,7 @@ def evidence_pdf(jid: str, materials: str = ""):
     cov.insert_text((50, 84), (j.get("projName") or "Project"), fontsize=11, color=(0.4, 0.45, 0.5))
     y = 130
     cov.insert_text((50, y), "Material", fontsize=10, color=(0.4, 0.45, 0.5))
-    cov.insert_text((360, y), "Net SF", fontsize=10, color=(0.4, 0.45, 0.5)); y += 8
+    cov.insert_text((360, y), "SF (gross)", fontsize=10, color=(0.4, 0.45, 0.5)); y += 8
     cov.draw_line((50, y), (500, y), color=(0.8, 0.83, 0.87)); y += 20
     for k, sf in sorted(mats.items(), key=lambda x: -x[1]):
         cov.insert_text((50, y), str(k)[:48], fontsize=11)
@@ -1540,7 +1559,8 @@ def evidence_pdf(jid: str, materials: str = ""):
     y += 34
     cov.insert_text((50, y), "How these numbers were measured", fontsize=11, color=(0.05, 0.11, 0.18)); y += 16
     cov.insert_text((50, y), "Every region is read from the drawing's own geometry (seams, fills, tags,", fontsize=8.5, color=(0.35, 0.4, 0.45)); y += 12
-    cov.insert_text((50, y), "trained boundary model) and carries its arithmetic: gross - openings = net.", fontsize=8.5, color=(0.35, 0.4, 0.45)); y += 18
+    cov.insert_text((50, y), "trained boundary model). Areas are GROSS as drawn - openings are NOT", fontsize=8.5, color=(0.35, 0.4, 0.45)); y += 12
+    cov.insert_text((50, y), "deducted unless a reader cut the opening out of the shape itself.", fontsize=8.5, color=(0.35, 0.4, 0.45)); y += 18
     nflag = 0
     flagged = []
     for el in j.get("takeoffData", []):
@@ -1586,7 +1606,7 @@ def evidence_pdf(jid: str, materials: str = ""):
             tp.insert_text((50, 50), "Wall-by-wall detail", fontsize=13, color=(0.05, 0.11, 0.18))
             tp.insert_text((50, 72), "Page", fontsize=8.5, color=(0.4, 0.45, 0.5))
             tp.insert_text((90, 72), "Material / wall", fontsize=8.5, color=(0.4, 0.45, 0.5))
-            tp.insert_text((360, 72), "Net SF", fontsize=8.5, color=(0.4, 0.45, 0.5))
+            tp.insert_text((360, 72), "SF (gross)", fontsize=8.5, color=(0.4, 0.45, 0.5))
             tp.insert_text((430, 72), "Measured by", fontsize=8.5, color=(0.4, 0.45, 0.5))
             tp.draw_line((50, 80), (562, 80), color=(0.8, 0.83, 0.87))
             ty = 96
