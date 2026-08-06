@@ -23,6 +23,7 @@ import snap_fill  # coloring-book BUCKET fill + corner-snap → exact SF from ve
 import material_groups  # within-job texture grouping → a selectable PREVIEW of material groups (assist layer)
 import auto_trim as auto_trim_mod  # derive corner/base/opening LF from face geometry (blueprint 1c) — suggestions only
 import dim_scale  # self-calibrate scale from the drawing's own dimension strings (blueprint 1b) — cross-check only
+import admin_auth  # FAIL-CLOSED guard for /admin/* — no key configured means the door is shut, not open
 from fastapi import FastAPI, UploadFile, File, BackgroundTasks, HTTPException, Body
 from fastapi.responses import Response
 from fastapi.middleware.cors import CORSMiddleware
@@ -1765,11 +1766,15 @@ def snap_points(jid: str, page: int):
 
 @app.post("/admin/upload-model")
 async def upload_model(model: UploadFile = File(...), key: str = "", slot: str = ""):
-    """One-time: load a trained ONNX model onto the volume. Guarded by ADMIN_KEY.
+    """One-time: load a trained ONNX model onto the volume. FAIL-CLOSED behind
+    ADMIN_KEY: with no key configured this endpoint is DISABLED and refuses every
+    request — the model file it writes is what every later inference loads, so an
+    open door here is silent poisoning of every SF number the system produces.
     slot="" -> the extent model (/data/model.onnx, v11 path); slot="v13" -> the
     boundary model (/data/model_v13.onnx) — its PRESENCE activates the v13 reader."""
-    if key != os.environ.get("ADMIN_KEY", "bfs-model-load"):
-        raise HTTPException(403, "bad key")
+    ok, code, msg = admin_auth.authorize(key, "/admin/upload-model")
+    if not ok:
+        raise HTTPException(code, msg)
     data = await model.read()
     if slot == "v13":
         path = os.environ.get("V13_ONNX", "/data/model_v13.onnx")
@@ -1870,9 +1875,12 @@ def export_corrections(key: str = "", since: str = ""):
     """Flywheel export: every /learn label captured by the live app (renames, deletes,
     splits, bucket confirms, final-* answer keys) as one JSON payload — the raw
     material for the v14 dataset. Labels only (PDFs stay on the volume; fetch a
-    specific correction's drawing separately if needed). Key-gated like upload-model."""
-    if key != os.environ.get("ADMIN_KEY", "bfs-model-load"):
-        raise HTTPException(403, "bad key")
+    specific correction's drawing separately if needed). FAIL-CLOSED behind ADMIN_KEY
+    exactly like upload-model: this payload IS the training moat, so with no key
+    configured the endpoint is DISABLED rather than open."""
+    ok, code, msg = admin_auth.authorize(key, "/admin/export-corrections")
+    if not ok:
+        raise HTTPException(code, msg)
     out = []
     try:
         for d in sorted(os.listdir(CORR_DIR)):
