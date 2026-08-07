@@ -488,6 +488,17 @@ def snap_auto_polys(pg, polys, pw, ph):
 
 def process(jid, pdf_bytes):
     job = jobs[jid]
+    # FIX_V13_NONDETERMINISM (2026-08-06): scope the v13 inference budget to THIS analysis.
+    # vector_hatch._V13_BUDGET is a process-lifetime dict {doc_fp: pages_inferred} that caps
+    # v13 inference per document; on a HIT it WITHHOLDS work (returns []), it does not
+    # memoise. On a long-lived worker the count survived between uploads, so re-analysing
+    # the same PDF began with the budget already spent and _v13_regions returned [] for
+    # every page -- the boundary reader silently dropped out (38,172.6 -> 25,112.9 SF,
+    # -34.21%, measured live). Dropping THIS document's fingerprint makes every upload start
+    # from a fresh budget. It does not raise the cap or the per-page limit, and for a
+    # never-seen fingerprint (every cold single-pass grade) it is a no-op, so first-run SF
+    # is unchanged by construction.
+    vector_hatch.reset_v13_budget(pdf_bytes)
     try:
         job["status"] = "running"; job["phase"] = "loading"
         job["progress"] = {"label": "Loading PDF", "pct": 3}
