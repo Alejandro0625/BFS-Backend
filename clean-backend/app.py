@@ -23,6 +23,7 @@ import snap_fill  # coloring-book BUCKET fill + corner-snap → exact SF from ve
 import material_groups  # within-job texture grouping → a selectable PREVIEW of material groups (assist layer)
 import auto_trim as auto_trim_mod  # derive corner/base/opening LF from face geometry (blueprint 1c) — suggestions only
 import dim_scale  # self-calibrate scale from the drawing's own dimension strings (blueprint 1b) — cross-check only
+import dim_area  # second reader: independent area from printed W/H dimension strings (confidence signal; two-tier, moves no SF)
 import admin_auth  # FAIL-CLOSED guard for /admin/* — no key configured means the door is shut, not open
 from fastapi import FastAPI, UploadFile, File, BackgroundTasks, HTTPException, Body
 from fastapi.responses import Response
@@ -979,6 +980,18 @@ def process(jid, pdf_bytes):
                 # openings the readers detected and cut out of the SF on this page
                 "openingsCount": (sum(len(p.get("holes") or []) for p in polys) if auto else None),
             })
+            # SECOND READER (confidence signal; two-tier -- moves no booked SF): an area
+            # read DIRECTLY from this page's printed W/H dimension strings
+            # (dim_area.area -> W_ft*H_ft), attached ALONGSIDE the vector SF so their
+            # agreement/disagreement is measurable per page. It never touches a polygon,
+            # an area_sf, a netArea or a grossArea; it abstains (None) unless both axes
+            # close a dimension chain. See dim_area.py + SECOND_READER_TRAIN_LEG.md.
+            try:
+                _dra = dim_area.area(pg) if auto else None
+            except Exception:
+                _dra = None
+            job["takeoffData"][-1]["areaFromDims"] = (round(_dra["area_sf"], 1) if (_dra and _dra.get("area_sf")) else None)
+            job["takeoffData"][-1]["areaFromDimsBasis"] = (_dra.get("basis") if _dra else None)
             extra = (f" + {n_lin_sf} linear run(s)" if n_lin_sf else "") + (f", {len(linear_items)} trim/LF item(s)" if linear_items else "")
             jlog(job, f"Page {pi+1}: " + (f"{len(polys)} AI-suggested zone(s)" if auto else f"{len(polys)} marked region(s){extra}") + f", {len(zones)} material(s)", "warn" if auto else "ok")
             for w in sf_warns:
