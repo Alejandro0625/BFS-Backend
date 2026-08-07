@@ -1988,6 +1988,36 @@ def _apply_view_scales(pdf_bytes, page_index, polys, W, H, page_scale):
 _V13_SESS = None
 _V13_BUDGET = {}    # doc fingerprint -> pages already inferred (perf guard, huge sets)
 
+
+def reset_v13_budget(pdf_bytes=None):
+    """Scope the v13 inference budget to ONE analysis (FIX_V13_NONDETERMINISM, 2026-08-06).
+
+    `_V13_BUDGET` above is a process-lifetime dict {doc_fingerprint: pages_inferred} that
+    caps v13 inference at V13_MAX_PAGES PER DOCUMENT so a huge set cannot cost an hour. It
+    is a BUDGET, not a memo -- a hit WITHHOLDS work, returning [] instead of a stored
+    answer. It was never reset, and production is a long-lived worker, so the SECOND upload
+    of a file was not the first: once a document had spent its budget anywhere in the life
+    of the worker, `_v13_regions` returned [] for it forever, silently -- no log, no flag,
+    status still 'done'. MEASURED on live: the same 3-page PDF scored 38,172.6 SF then
+    25,112.9 SF (-34.21%) on repeat uploads.
+
+    Called at the START of each analysis (app.process), this drops THIS document's
+    fingerprint so every upload starts from a fresh budget. It does NOT raise the cap or
+    change the per-page limit: within one analysis the budget still accumulates and still
+    caps at V13_MAX_PAGES, exactly as before. The key formula is IDENTICAL to the one
+    `_v13_regions` uses, so within one process it drops the very entry that function keys
+    on. For a never-before-seen fingerprint -- every cold, single-pass grade -- the key is
+    absent and this is a no-op, so the first-run SF cannot move. Only this request's own
+    fingerprint is touched, so a concurrent analysis of a DIFFERENT document is untouched.
+    """
+    try:
+        if pdf_bytes is None:
+            _V13_BUDGET.clear()
+        else:
+            _V13_BUDGET.pop((len(pdf_bytes), hash(pdf_bytes[:4096])), None)
+    except Exception:
+        pass
+
 # v18 PER-INSTANCE RATIO HEAD state (BFS_V18_DESIGN.md §5). Session is loaded once;
 # a failed load LATCHES dead (logged loudly once, counted, never retried, never
 # raises into the v13 path). _V18_FAILS_TOTAL = cumulative inference-failure count
