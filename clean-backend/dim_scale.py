@@ -51,9 +51,18 @@ def _dim_words(pg):
     return out
 
 
-def _segments(pg):
-    """Long straight H/V segments in display coords, split by axis."""
-    rot = pg.rotation_matrix
+def _segments(pg, use_rot=True):
+    """Long straight H/V segments, split by axis.
+
+    use_rot=True  -- ROTATED display space, the frame this reader has always used.
+    use_rot=False -- UNROTATED page space, the frame `_dim_words` (19 lines above)
+    returns. `sheet_scale` pairs a dimension WORD against the dimension LINE it
+    labels, and it can only do that if both are measured in ONE frame; on a
+    /Rotate 90|270 page the two frames sit ~90 deg apart, nothing pairs, and the
+    reader abstains. The second frame is consulted ONLY as the rung-gated fallback
+    in `sheet_scale` below -- never in place of the first.
+    """
+    rot = pg.rotation_matrix if use_rot else None
     hs, vs = [], []
     try:
         drawings = pg.get_drawings()
@@ -63,8 +72,10 @@ def _segments(pg):
         for it in d.get("items") or []:
             if it[0] != "l":
                 continue
-            p0 = fitz.Point(it[1]) * rot
-            p1 = fitz.Point(it[2]) * rot
+            p0 = fitz.Point(it[1])
+            p1 = fitz.Point(it[2])
+            if rot is not None:
+                p0, p1 = p0 * rot, p1 * rot
             dx, dy = abs(p1.x - p0.x), abs(p1.y - p0.y)
             if dx >= _MIN_LINE_PT and dy <= 1.5:
                 hs.append((min(p0.x, p1.x), max(p0.x, p1.x), (p0.y + p1.y) / 2, dx))
@@ -73,7 +84,7 @@ def _segments(pg):
     return hs, vs
 
 
-def sheet_scale(pg):
+def _scale_in_frame(pg, use_rot=True):
     """Consensus scale from dimension strings. Returns (ft_per_pt, n_agreeing)
     or None when the sheet doesn't give a confident answer.
 
@@ -84,7 +95,7 @@ def sheet_scale(pg):
     dims = _dim_words(pg)
     if len(dims) < 3:
         return None
-    hs, vs = _segments(pg)
+    hs, vs = _segments(pg, use_rot)
     votes = []                 # per dim: list of plausible implied ft/pt values
     for cx, cy, ft, horiz in dims:
         cands = set()
@@ -138,3 +149,55 @@ def sheet_scale(pg):
             return None                 # genuinely ambiguous — refuse to guess
     best_sup.sort()
     return (best_sup[len(best_sup) // 2], len(best_sup))
+
+
+# ------------------------------------------------------------ RUNG-GATED SECOND FRAME (FIX_SCALEROT_REGRADE.md 4)
+# Rungs of the architect's / engineer's standard scale rule, in FEET PER INCH of
+# paper. A reader has no access to this fact, which is what makes "the new value
+# lands on a rung" independent evidence rather than a restatement of the reading.
+_RUNGS = (0.0833, 0.1667, 0.3333, 0.6667, 1.0, 1.333, 2.0, 2.667, 4.0, 5.333,
+          6.0, 8.0, 10.0, 10.667, 16.0, 20.0, 21.333, 30.0, 32.0, 40.0, 48.0,
+          50.0, 60.0, 64.0, 100.0)
+_RUNG_TOL = 0.03           # the same 3% agreement window this module already uses
+
+
+def _on_rung(ft_per_pt):
+    """Does this reading sit on a scale an architect actually draws at?"""
+    v = ft_per_pt * 72.0                      # ft per INCH of paper
+    r = min(_RUNGS, key=lambda x: abs(x - v) / x)
+    return abs(r - v) / r <= _RUNG_TOL
+
+
+def sheet_scale(pg):
+    """Consensus scale from dimension strings -- (ft_per_pt, n_agreeing) or None.
+
+    Frame 1 (rotated segments) is the deployed reader and is ALWAYS asked first; if
+    it answers, its answer is returned unchanged. Only when it abstains, and only on
+    a /Rotate 90|270 page, is the unrotated frame consulted -- and its reading is
+    accepted ONLY if it lands on a rung of the standard scale ladder.
+
+    WHY THE GATE. Un-rotating the segments corrects a real frame mismatch and gains
+    40 scales corpus-wide, but only 20 of them are on a rung, against a dumb
+    baseline (this reader's own confirmed scales) of 0.606. A gained scale flips
+    `scale_confirmed`, so the engine stops abstaining and BOOKS SF, and SF error is
+    scale error SQUARED -- an off-rung gain is a candidate confidently-wrong page.
+    Gating on the ladder keeps the 20 real ones and lets the other 20 keep abstaining
+    (replayed over the 122-job corpus: +20 pages / 10 jobs / 100% on-rung / 0 new
+    off-rung assertions / 0 rot-0 pages touched -- RUNG_RULE_REPLAY.json).
+
+    STRICTLY ADDITIVE: this can only turn None into a rung-confirmed value. It never
+    changes, and never withdraws, a scale the deployed reader already returns.
+    """
+    first = _scale_in_frame(pg, True)
+    if first is not None:
+        return first                       # deployed behaviour, byte for byte
+    if not getattr(pg, "rotation", 0):
+        # ROT-0 CONTROL, BY CONSTRUCTION rather than by argument: on an unrotated
+        # page `pg.rotation_matrix` is the identity, so the second frame could only
+        # ever repeat the None above -- but stating it here means the control cannot
+        # be broken by a future change to what "the second frame" means.
+        return None
+    second = _scale_in_frame(pg, False)
+    if second is not None and _on_rung(second[0]):
+        return second
+    return None
