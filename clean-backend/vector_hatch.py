@@ -1987,6 +1987,7 @@ def _apply_view_scales(pdf_bytes, page_index, polys, W, H, page_scale):
 
 _V13_SESS = None
 _V13_BUDGET = {}    # doc fingerprint -> pages already inferred (perf guard, huge sets)
+_V13_MISSING_WARNED = False   # 2026-08-10: say it ONCE per process, never per page
 
 
 def reset_v13_budget(pdf_bytes=None):
@@ -2042,6 +2043,20 @@ def _v13_regions(pdf_bytes, page_index, polys, W, H, ft_pt, max_new=40):
         return []
     mp = _os.environ.get("V13_ONNX", "/data/model_v13.onnx")
     if not _os.path.isfile(mp):
+        # 2026-08-09/10: this `return []` is why an entire measurement programme was run on an
+        # engine missing its BOUNDARY reader without one line of evidence anywhere. The default
+        # is the PRODUCTION path, so any process that does not set V13_ONNX silently grades six
+        # readers instead of seven. Behaviour is UNCHANGED (still []); it just stops being
+        # silent. Once per process, never per page, and it can never raise.
+        global _V13_MISSING_WARNED
+        if not _V13_MISSING_WARNED:
+            _V13_MISSING_WARNED = True
+            try:
+                print("[v13] BOUNDARY READER INACTIVE — V13_ONNX=%r is not a file, so "
+                      "_v13_regions returns nothing. This process is NOT grading the engine "
+                      "the benches grade." % (mp,), flush=True)
+            except Exception:
+                pass
         return []
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     try:
