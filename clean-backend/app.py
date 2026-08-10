@@ -25,6 +25,16 @@ import auto_trim as auto_trim_mod  # derive corner/base/opening LF from face geo
 import dim_scale  # self-calibrate scale from the drawing's own dimension strings (blueprint 1b) — cross-check only
 import dim_area  # second reader: independent area from printed W/H dimension strings (confidence signal; two-tier, moves no SF)
 import admin_auth  # FAIL-CLOSED guard for /admin/* — no key configured means the door is shut, not open
+# SELECT-TO-SUM FIX #1: job-level material GROUPING + NAMING. Imported DEFENSIVELY so a deploy
+# that lands app.py without mat_canon.py degrades to today's per-name rollup instead of failing
+# to boot — but NEVER silently: the reason is surfaced on /health as mat_canon, because a
+# grouping that quietly stopped working looks exactly like a capability gap.
+try:
+    import mat_canon as _mc
+    _MC_ERR = None
+except Exception as _mce:      # pragma: no cover - deploy-shape guard
+    _mc = None
+    _MC_ERR = str(_mce)
 from fastapi import FastAPI, UploadFile, File, BackgroundTasks, HTTPException, Body
 from fastapi.responses import Response
 from fastapi.middleware.cors import CORSMiddleware
@@ -243,6 +253,26 @@ def categorize(subject):
     if any(k in s for k in ["shingle", "shake"]): return "Shingle/Shake"
     if "pvc" in s or "azek" in s: return "PVC/Trim"
     return subject or "Other"
+
+def _reader_from_name(m, src9=""):
+    """Which reader produced a region, from the RAW reader name it was given.
+
+    This used to live inside /evidence-pdf and read the zone's displayed materialName. Once
+    FIX #1 renames a zone to its material GROUP those prefixes are gone, so every row of the
+    evidence receipt would have collapsed to the "Drawing geometry" default — a provenance
+    column that silently stops being provenance. The zone now carries `reader`, derived HERE
+    from the dominant raw name, and evidence-pdf prefers it."""
+    m = str(m or "")
+    if "bluebeam" in str(src9 or ""):
+        return "Your markup (exact)"
+    for pre, nm in (("Hatched area", "Hatch reader"), ("Color fill", "Drawn color"),
+                    ("Rendered", "Rendered reader"), ("Wall area (AI boundary", "AI boundary model"),
+                    ("Wall band", "Story-band"), ("Wall area", "Structural flood"),
+                    ("Panel wall", "Drawn fill")):
+        if m.startswith(pre):
+            return nm
+    return "Drawing geometry"
+
 
 def jlog(job, msg, level="info"):
     job["log"].append({"msg": msg, "level": level})
@@ -754,6 +784,36 @@ def process(jid, pdf_bytes):
                                     break
                 except Exception:
                     pass
+            # SELECT-TO-SUM FIX #1 — tag each AUTO polygon with its job-level material group.
+            # The readers emit a distinct name per course width (vector_hatch:625), per seam
+            # (:622) and per rgb (:1208), so the canvas — which keys a click-group on the
+            # per-page fill_color — shows ~43 cryptic chips per job (measured, 103 jobs).
+            # canon() collapses those families and folds sheet prose/OCR noise into ONE
+            # confirm bucket. It relabels only; area_sf is never touched.
+            # MARKED pages are deliberately NOT grouped: those names are the estimator's own
+            # markup labels, the marked path is exact by constitution, and canon() would merge
+            # two same-family labels (the battery pins the four marked SFs exactly).
+            if auto and _mc is not None:
+                try:
+                    _cmap = _mc.build_color_name_map([q for q in polys if not q.get("suggest_only")])
+                    for q in polys:
+                        _g9, _c9 = _mc.material_group(q.get("material") or q.get("category") or "",
+                                                      q.get("fill_color"), _cmap)
+                        q["material_group"] = _g9
+                        q["material_class"] = _c9
+                        # ⚠ LOAD-BEARING, not cosmetic. App.jsx:1056 builds a Draw-tab
+                        # polygon's category as `p.material_type || p.category`, and
+                        # App.jsx:1084/1118 attribute a drawn CUT-OUT to the zone matching
+                        # that name (`zz.category===hostCat || zz.materialName===hostCat`),
+                        # falling back to the BIGGEST zone on the page when nothing matches.
+                        # Renaming zones to material groups while polygons still answered with
+                        # their raw name would have sent every opening on a merged group to
+                        # the wrong material — the page total is unchanged but the per-material
+                        # split (which is what gets priced) would be wrong, silently. Emitting
+                        # the group here makes both sides speak the same name.
+                        q["material_type"] = _g9
+                except Exception as _ge:
+                    jlog(job, f"Page {pi+1}: material grouping skipped ({_ge})", "warn")
             job["polygons_by_page"][pi + 1] = polys
             job["dims_by_page"][pi + 1] = {"width": pw, "height": ph}
             # keep pages that have linear (trim/LF) measurements even with no area polygons,
@@ -807,8 +867,33 @@ def process(jid, pdf_bytes):
                                          "LAP / HORIZONTAL", "COLOR FILL", "AI SUGGESTION")):
                     return "unassigned"
                 return _fam9(m)
+            # ---- SELECT-TO-SUM FIX #1: the CLICK-GROUP rollup (auto only) -------------------
+            # `bymat` above stays keyed on the RAW reader names and keeps driving the family /
+            # scope FLAGS below, byte-identically — a display label must never become the input
+            # to a scope warning. Zones are emitted per MATERIAL GROUP instead, and each group
+            # takes its category, family and reader provenance from its DOMINANT raw name, so
+            # every derived field still comes from a real drawing name.
+            _grouped = bool(auto and _mc is not None and
+                            any(p.get("material_group") for p in polys if not p.get("suggest_only")))
+            bygrp = defaultdict(lambda: {"sf": 0.0, "n": 0, "cls": None})
+            _rawsf9 = defaultdict(float)
+            if _grouped:
+                for p in polys:
+                    if p.get("suggest_only"):
+                        continue
+                    g9 = p.get("material_group") or "Unlabeled"
+                    bygrp[g9]["sf"] += p["area_sf"]; bygrp[g9]["n"] += 1
+                    bygrp[g9]["cls"] = p.get("material_class")
+                    _rawsf9[(g9, p.get("material") or p.get("category") or "Unlabeled")] += p["area_sf"]
+            _dom9 = {}
+            for (g9, raw9), sf9 in _rawsf9.items():
+                if sf9 > _dom9.get(g9, (None, -1.0))[1]:
+                    _dom9[g9] = (raw9, sf9)
+
             _fam_flags9 = set()
             for mat, d in bymat.items():
+                # FLAGS ALWAYS RUN OVER THE RAW NAMES — grouped or not — so the scope warnings
+                # the estimator relies on are unchanged by a display relabel.
                 cat = d["category"] or "Other"
                 _f9 = _fam9_outer(mat) if auto else None
                 if _f9 == "non-bfs" and d["sf"] > 30:
@@ -817,13 +902,29 @@ def process(jid, pdf_bytes):
                 if _f9 == "unassigned" and d["sf"] > 300:
                     _fam_flags9.add(f"⚠ FAMILY UNASSIGNED: '{str(mat)[:36]}' ({d['sf']:,.0f} SF) has no material "
                                     "identity from the drawing — name it before pricing (never priced on a guess).")
+                if _grouped:
+                    continue          # this page's zones are emitted per material group below
                 zones.append({
                     "materialName": mat, "material_type": mat, "category": cat,
                     "family": _f9,
                     "netArea": round(d["sf"], 1), "grossArea": round(d["sf"], 1),
                     "totalOpeningArea": 0, "description": f"{d['n']} region(s) from {src_txt}",
+                    "reader": _reader_from_name(mat),
                 })
                 legend[mat] = {"id": mat, "name": mat, "category": cat}
+            for g9, d in bygrp.items():
+                raw9 = _dom9.get(g9, (g9, 0.0))[0]        # dominant raw name carries provenance
+                cat = (bymat.get(raw9) or {}).get("category") or "Other"
+                zones.append({
+                    "materialName": g9, "material_type": g9, "category": cat,
+                    "family": _fam9_outer(raw9),
+                    "netArea": round(d["sf"], 1), "grossArea": round(d["sf"], 1),
+                    "totalOpeningArea": 0, "description": f"{d['n']} region(s) from {src_txt}",
+                    "material_group": g9, "material_class": d["cls"],
+                    "reader": _reader_from_name(raw9),
+                    "readAs": (str(raw9)[:60] if str(raw9) != str(g9) else None),
+                })
+                legend[g9] = {"id": g9, "name": g9, "category": cat}
             auto_flags = []
             if auto_flags_pre:
                 auto_flags.append(auto_flags_pre)
@@ -1704,17 +1805,9 @@ def evidence_pdf(jid: str, materials: str = ""):
     # PER-WALL TABLE page(s): every zone with its page, SF, and reader provenance —
     # the wall-by-wall receipt a reviewer can check against the drawing in seconds.
     def _reader_of(z):
-        m = str(z.get("materialName") or "")
-        src9 = str(z.get("source") or "")
-        if "bluebeam" in src9:
-            return "Your markup (exact)"
-        for pre, nm in (("Hatched area", "Hatch reader"), ("Color fill", "Drawn color"),
-                        ("Rendered", "Rendered reader"), ("Wall area (AI boundary", "AI boundary model"),
-                        ("Wall band", "Story-band"), ("Wall area", "Structural flood"),
-                        ("Panel wall", "Drawn fill")):
-            if m.startswith(pre):
-                return nm
-        return "Drawing geometry"
+        # prefer the provenance the zone carries (grouped zones are named for the material,
+        # not the reader, so the name prefixes are no longer available here)
+        return z.get("reader") or _reader_from_name(z.get("materialName"), z.get("source"))
     rows = []
     for el in j.get("takeoffData", []):
         for z in el.get("zones", []):
@@ -1788,18 +1881,38 @@ def accept_suggestion(payload: dict = Body(...)):
     hit["material"] = "AI wall (accepted)"
     hit["category"] = "AI wall (accepted)"
     hit["group"] = "AI wall (accepted)"
-    # rebuild the page's zones from non-suggestion polys (mirror the analyze path)
+    # rebuild the page's zones from non-suggestion polys (mirror the analyze path).
+    # ⚠ THIS MIRROR IS LOAD-BEARING: it overwrites the page's zones wholesale, so if it keyed
+    # on the raw name while /analyze keyed on the material group, accepting one suggestion
+    # would silently shatter that page back into the ~43 unnamed chips FIX #1 just removed —
+    # and only on the pages the estimator interacted with. Keyed the same way, from the same
+    # tag the analyze path already wrote onto each polygon.
     from collections import defaultdict as _dd
-    bymat = _dd(lambda: {"sf": 0.0, "n": 0, "category": None})
-    for p in polys:
-        if p.get("suggest_only"):
-            continue
-        key = p.get("material") or p.get("category") or "Unlabeled"
+    _live9 = [p for p in polys if not p.get("suggest_only")]
+    _grouped9 = bool(_mc is not None and any(p.get("material_group") for p in _live9))
+    if _grouped9 and _mc is not None:
+        try:                      # the accepted region is new — it has no group tag yet
+            _cmap9 = _mc.build_color_name_map(_live9)
+            for p in _live9:
+                if not p.get("material_group"):
+                    _g9, _c9 = _mc.material_group(p.get("material") or p.get("category") or "",
+                                                  p.get("fill_color"), _cmap9)
+                    p["material_group"] = _g9; p["material_class"] = _c9
+        except Exception:
+            _grouped9 = False
+    bymat = _dd(lambda: {"sf": 0.0, "n": 0, "category": None, "raw": None, "cls": None})
+    for p in _live9:
+        key = ((p.get("material_group") or "Unlabeled") if _grouped9
+               else (p.get("material") or p.get("category") or "Unlabeled"))
         bymat[key]["sf"] += p.get("area_sf", 0); bymat[key]["n"] += 1
         bymat[key]["category"] = p.get("category")
+        bymat[key]["raw"] = p.get("material") or p.get("category") or "Unlabeled"
+        bymat[key]["cls"] = p.get("material_class")
     zones = [{"materialName": m, "material_type": m, "category": d["category"] or "Other",
               "netArea": round(d["sf"], 1), "grossArea": round(d["sf"], 1),
-              "totalOpeningArea": 0, "description": f"{d['n']} region(s)"}
+              "totalOpeningArea": 0, "description": f"{d['n']} region(s)",
+              "material_group": (m if _grouped9 else None), "material_class": d["cls"],
+              "reader": _reader_from_name(d["raw"])}
              for m, d in bymat.items()]
     for e in j.get("takeoffData") or []:
         if e.get("pageNumber") == page:
@@ -2054,4 +2167,8 @@ def health():
     return {"status": "ok", "engine": "digitize-markup", "deps": "pymupdf+onnx",
             "auto_engine": "model" if model_infer.available() else "texture",
             "ocr": ocr_text.available(), "ocr_err": ocr_text.last_error(),
-            "jobs_in_mem": len(jobs), "jobs_on_disk": on_disk, "mem_cap": MAX_MEM_JOBS}
+            "jobs_in_mem": len(jobs), "jobs_on_disk": on_disk, "mem_cap": MAX_MEM_JOBS,
+            # FIX #1 grouping: a deploy that lands app.py without mat_canon.py keeps serving
+            # takeoffs with today's per-name rollup. That must be VISIBLE — a silent fallback
+            # is indistinguishable from "the grouping never worked".
+            "mat_canon": (False if _mc is None else True), "mat_canon_err": _MC_ERR}
