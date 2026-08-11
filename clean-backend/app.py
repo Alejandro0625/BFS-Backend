@@ -2171,4 +2171,11 @@ def health():
             # FIX #1 grouping: a deploy that lands app.py without mat_canon.py keeps serving
             # takeoffs with today's per-name rollup. That must be VISIBLE — a silent fallback
             # is indistinguishable from "the grouping never worked".
-            "mat_canon": (False if _mc is None else True), "mat_canon_err": _MC_ERR}
+            "mat_canon": (False if _mc is None else True), "mat_canon_err": _MC_ERR,
+            # Same move as mat_canon above, for a BIGGER silent fallback. `_v13_regions`
+            # reads V13_ONNX with the production default /data/model_v13.onnx and returns []
+            # SILENTLY when it is absent, so a prod running six readers instead of seven
+            # looks exactly like one running seven. `v13_status()` is pure, is called by
+            # nothing in the detect path, and never raises. It reports LOADABILITY, not that
+            # inference ran -- the page budget it reports beside it can still withhold work.
+            "v13": vector_hatch.v13_status()}
