@@ -1990,6 +1990,51 @@ _V13_BUDGET = {}    # doc fingerprint -> pages already inferred (perf guard, hug
 _V13_MISSING_WARNED = False   # 2026-08-10: say it ONCE per process, never per page
 
 
+def v13_status():
+    """Is the v13 BOUNDARY READER loadable IN THIS PROCESS? Pure, and it never raises.
+
+    WHY THIS EXISTS. `_v13_regions` reads `V13_ONNX` with the PRODUCTION default
+    `/data/model_v13.onnx` (the Railway volume), no deploy config sets that variable or
+    uploads the model there, and when the file is absent the reader returns `[]` SILENTLY.
+    A production serving takeoffs with six readers instead of seven is indistinguishable
+    from one serving seven -- except in the SF it books. `FIX_ACCURACY_CEILINGS.md` ends
+    with six measurement strategies measured to their ceilings and DO-list item 1 is
+    "confirm/activate v13 in prod (biggest detection lever; config not algorithm)", and
+    that question has been unanswerable from outside the process: /health reported the v11
+    extent model and mat_canon and nothing about v13.
+
+    ⚠ IT REPORTS LOADABILITY, NOT THAT INFERENCE RAN. `_v13_regions` also WITHHOLDS work
+    once a document's page budget is spent (`V13_MAX_PAGES`, default 8, keyed on the
+    document fingerprint in a process-lifetime dict) -- setting the variable is only half
+    of it, which is the whole of `FIX_V13_BUDGET_BENCH.md`. The budget fields ride next to
+    `active` precisely so the two can never be read as the same claim.
+
+    Called by nothing in the detect path: this is an observation of the engine, not a
+    change to it.
+    """
+    import os as _o
+    st = {"active": False, "env_set": False, "path": "/data/model_v13.onnx", "bytes": 0,
+          "err": None, "max_pages": 8, "docs_budgeted": 0, "session_loaded": False,
+          "reports": "loadability of the model file in THIS process — NOT that inference "
+                     "ran; the per-document page budget can still withhold work"}
+    try:
+        raw = _o.environ.get("V13_ONNX")
+        st["env_set"] = raw is not None
+        st["path"] = raw if raw else "/data/model_v13.onnx"
+        try:
+            st["max_pages"] = int(_o.environ.get("V13_MAX_PAGES", "8"))
+        except Exception:
+            pass
+        st["docs_budgeted"] = len(_V13_BUDGET)
+        st["session_loaded"] = _V13_SESS is not None
+        if _o.path.isfile(st["path"]):
+            st["active"] = True
+            st["bytes"] = _o.path.getsize(st["path"])
+    except Exception as e:                      # never raise: /health must answer
+        st["err"] = "%s: %s" % (type(e).__name__, e)
+    return st
+
+
 def reset_v13_budget(pdf_bytes=None):
     """Scope the v13 inference budget to ONE analysis (FIX_V13_NONDETERMINISM, 2026-08-06).
 
