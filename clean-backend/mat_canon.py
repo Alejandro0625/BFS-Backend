@@ -140,10 +140,40 @@ def qcolor(fc):
         return None
 
 
-# the reader's FIXED category palette (vector_hatch.py) — NOT real drawing colors, so
-# color-based name inheritance must NEVER fire on these (they would cross-contaminate).
+# the readers' FIXED category palette — NOT real drawing colors, so color-based name
+# inheritance must NEVER fire on these (they would cross-contaminate).
+#
+# ⭐ 2026-08-10 — THE SET NAMED ONE FILE AND THE ENGINE HAS MORE THAN ONE PALETTE.
+# The comment said "(vector_hatch.py)" and the seven constants below are indeed
+# vector_hatch's + snap_fill's.  `texture.py:15 GROUPS` writes THREE more literal
+# category colours into `fill_color` — [0.0,0.80,0.90] / [0.35,0.78,0.45] /
+# [0.95,0.45,0.55] — and none of them were here, so `is_synth()` called a texture
+# reader's category colour a REAL DRAWING COLOUR.  Measured over the 103-job corpus:
+# 3,960 polygons (11.3%) carry one, and `build_color_name_map` bound an architect
+# name to one on 96 page-instances.  No polygon inherits through those keys TODAY
+# (inheritance needs a bare "Color fill" name, and that reader emits a drawn rgb by
+# construction), so this closes a LATENT path, not a live one — measured group delta
+# 0 and SF delta 0.000000 over 16,967,795.8 SF (`gate_synth_completeness.py`, 10/10).
+#
+# The floor is typed; the texture entries are DERIVED from that module so a palette
+# edit there propagates instead of silently reopening the gap.  A failed import
+# leaves the floor, and `SYNTH_SOURCE` records which happened — an empty derivation
+# must be visible, not indistinguishable from a complete one.
 SYNTH = {(0.35, 0.55, 0.85), (0.25, 0.75, 0.35), (0.0, 0.72, 0.85), (0.55, 0.75, 0.95),
-         (0.85, 0.45, 0.25), (0.45, 0.65, 0.9), (0.45, 0.55, 0.9)}
+         (0.85, 0.45, 0.25), (0.45, 0.65, 0.9), (0.45, 0.55, 0.9),
+         # texture.py:15 GROUPS — floor copy, kept so the set survives an import failure
+         (0.0, 0.8, 0.9), (0.35, 0.78, 0.45), (0.95, 0.45, 0.55)}
+
+SYNTH_SOURCE = "floor"
+try:                                    # derive from the module that owns the palette
+    import texture as _tex              # noqa: E402  (heavy deps; app.py imports it anyway)
+    _derived = {tuple(round(float(c), 2) for c in _col[:3])
+                for _name, _col in getattr(_tex, "GROUPS", ())}
+    if _derived:
+        SYNTH |= _derived
+        SYNTH_SOURCE = "texture.GROUPS+floor(%d)" % len(_derived)
+except Exception as _e:                 # standalone use (selftests, probes) has no cv2
+    SYNTH_SOURCE = "floor (texture unavailable: %s)" % type(_e).__name__
 
 
 def is_synth(fc):
