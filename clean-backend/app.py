@@ -35,6 +35,19 @@ try:
 except Exception as _mce:      # pragma: no cover - deploy-shape guard
     _mc = None
     _MC_ERR = str(_mce)
+# REVIEW RANKING (FIX_TWO_TIER_GATE): order the estimator's queue by the reader class's
+# MEASURED confidently-wrong rate. Books nothing, moves no SF, asserts nothing — it only
+# decides what she looks at first. Same defensive import as mat_canon above, for the same
+# reason: `clean-backend/openings_convention.py` was once a 404 in the repo while app.py
+# imported it, so a new module must degrade to today's behaviour instead of failing to
+# boot — and must say so on /health, because a ranking that quietly stopped ranking looks
+# exactly like a queue nobody prioritised.
+try:
+    import review_rank as _rr
+    _RR_ERR = None
+except Exception as _rre:      # pragma: no cover - deploy-shape guard
+    _rr = None
+    _RR_ERR = str(_rre)
 from fastapi import FastAPI, UploadFile, File, BackgroundTasks, HTTPException, Body
 from fastapi.responses import Response
 from fastapi.middleware.cors import CORSMiddleware
@@ -272,6 +285,34 @@ def _reader_from_name(m, src9=""):
         if m.startswith(pre):
             return nm
     return "Drawing geometry"
+
+
+def _review_fields(classes, auto=True, src9="", raw_name=""):
+    """The REVIEW-QUEUE fields for one zone, from the reader classes of the pieces that
+    built it (`FIX_TWO_TIER_GATE`: ship the ranking, not an assert tier).
+
+    Additive by construction — every value here is derived, none of them is read back by
+    any SF, grouping, total, Excel or evidence quantity. If `review_rank` failed to import
+    the zone simply carries no review fields, exactly as it did before this shipped.
+
+    A MARKED page is not ranked with the readers: its SF is the estimator's own polygon,
+    exact by geometry, so it takes the `markup` class and sorts last."""
+    if _rr is None:
+        return {"reader": _reader_from_name(raw_name, src9)}   # exactly today's behaviour
+    cls = _rr.MARKUP_CLASS if not auto else _rr.combine(classes or [])
+    if cls is None:
+        # an auto zone whose pieces carry no stamp — a job persisted before this shipped.
+        # Fall back to the NAME, which is what the receipt used to do, and leave the risk
+        # fields None: unmeasured is the truth here, and a guessed rank is worse than none.
+        return {"readerClass": None, "reviewRank": _rr.UNMEASURED_RANK,
+                "reviewRisk": None, "reviewRate": None,
+                "reviewWhy": _rr.why(None), "reader": _reader_from_name(raw_name, src9)}
+    return {"readerClass": cls,
+            "reviewRank": _rr.rank(cls),
+            "reviewRisk": _rr.risk(cls),
+            "reviewRate": _rr.rate(cls),
+            "reviewWhy": _rr.why(cls),
+            "reader": _rr.label(cls, src9)}
 
 
 def jlog(job, msg, level="info"):
@@ -639,6 +680,18 @@ def process(jid, pdf_bytes):
                     try:
                         tpolys, _, _, sinfo = vector_hatch.detect(pdf_bytes, pi)
                         auto_engine = "vector"
+                        # ⭐ STAMP THE READER CLASS HERE, AND ONLY HERE (FIX_TWO_TIER_GATE).
+                        # The class is read off the `material` PREFIX, and `material` is
+                        # overwritten twice below — callouts.name_regions (callouts.py:560/
+                        # 588/655) and the per-job code map (~:790) — so by the time a piece
+                        # reaches the response its provenance is gone and every region would
+                        # collapse into one bucket wearing the wrong risk. This is the same
+                        # moment `gold_bench.py:370` reads the same strings, which is the
+                        # ONLY reason the corpus-measured risks in review_rank.RISK apply to
+                        # these pieces verbatim. Additive: no SF, no grouping, no total.
+                        if _rr is not None:
+                            for _p9 in tpolys:
+                                _p9["reader_class"] = _rr.classify(_p9.get("material"))
                     except Exception:
                         tpolys = []
                     if not tpolys and auto_used < MAX_AUTO_PAGES:
@@ -648,6 +701,13 @@ def process(jid, pdf_bytes):
                         else:
                             tpolys, _, _, sinfo = texture.detect(pdf_bytes, pi, ft_per_in=ft, zoom=2.0)
                             auto_engine = "texture"
+                        # The fallback engines are NOT in the corpus — every graded wall came
+                        # from vector_hatch.detect. They are stamped with their engine, which
+                        # review_rank has no risk row for, so they rank FIRST (unmeasured is
+                        # not safe). Giving them a vector class would be borrowing somebody
+                        # else's measurement.
+                        for _p9 in tpolys:
+                            _p9["reader_class"] = auto_engine
                         if tpolys:
                             try:
                                 tpolys = snap_auto_polys(pg, tpolys, pw, ph)  # lock AI shapes to the drawing's real corners
@@ -718,9 +778,17 @@ def process(jid, pdf_bytes):
                         # Callahan-class micro-texture: the density reader's fields
                         # become confirmable suggestions (probe-proven 22/114 ensemble)
                         _sugs = density_reader.suggest_pieces(pdf_bytes, pi, pw, ph, max_new=40)
+                        for _s9 in _sugs:
+                            _s9["reader_class"] = "density"   # not in the corpus — unmeasured
                     elif _imga >= 0.25 * pw * ph:
                         _ftpt9 = float(scale_val or 8.0) / 72.0
                         _sugs = vector_hatch._v13_regions(pdf_bytes, pi, [], pw, ph, _ftpt9, max_new=40)
+                        # stamped BEFORE the rename below overwrites `material` with
+                        # "AI suggestion (confirm to add)" — an accepted suggestion must
+                        # keep the risk of the reader that drew it, not lose it at the click
+                        if _rr is not None:
+                            for _s9 in _sugs:
+                                _s9["reader_class"] = _rr.classify(_s9.get("material"))
                     jlog(job, f"Page {pi+1}: suggestion probe — dense={_dense9}, "
                               f"img={_imga / max(pw * ph, 1):.0%}, suggestions={len(_sugs)}", "info")
                     # tag + append OUTSIDE the branches — BOTH readers' suggestions ship
@@ -823,13 +891,14 @@ def process(jid, pdf_bytes):
             # code). An excluded page must arrive at the estimator carrying its own reason.
             if not polys and not lin_lf_items and not site_scale_flags:
                 continue
-            bymat = defaultdict(lambda: {"sf": 0.0, "n": 0, "category": None})
+            bymat = defaultdict(lambda: {"sf": 0.0, "n": 0, "category": None, "classes": []})
             for p in polys:
                 if p.get("suggest_only"):
                     continue          # suggestions NEVER enter zones/totals until accepted
                 key = p.get("material") or p.get("category") or "Unlabeled"
                 bymat[key]["sf"] += p["area_sf"]; bymat[key]["n"] += 1
                 bymat[key]["category"] = p.get("category")
+                bymat[key]["classes"].append(p.get("reader_class"))
             zones = []
             src_txt = ({"vector": "drawing vectors (exact geometry)", "model": "AI model (confirm)"}.get(auto_engine, "AI texture (confirm)")) if auto else "markup"
             # FAMILY LAYER v1 (weekend lane #43, 26-020 probe): normalize each zone's
@@ -875,7 +944,7 @@ def process(jid, pdf_bytes):
             # every derived field still comes from a real drawing name.
             _grouped = bool(auto and _mc is not None and
                             any(p.get("material_group") for p in polys if not p.get("suggest_only")))
-            bygrp = defaultdict(lambda: {"sf": 0.0, "n": 0, "cls": None})
+            bygrp = defaultdict(lambda: {"sf": 0.0, "n": 0, "cls": None, "classes": []})
             _rawsf9 = defaultdict(float)
             if _grouped:
                 for p in polys:
@@ -884,6 +953,9 @@ def process(jid, pdf_bytes):
                     g9 = p.get("material_group") or "Unlabeled"
                     bygrp[g9]["sf"] += p["area_sf"]; bygrp[g9]["n"] += 1
                     bygrp[g9]["cls"] = p.get("material_class")
+                    # the reader classes that BUILT this group — the group's own name is a
+                    # display label by now, so the risk can only come from the pieces
+                    bygrp[g9]["classes"].append(p.get("reader_class"))
                     _rawsf9[(g9, p.get("material") or p.get("category") or "Unlabeled")] += p["area_sf"]
             _dom9 = {}
             for (g9, raw9), sf9 in _rawsf9.items():
@@ -904,26 +976,24 @@ def process(jid, pdf_bytes):
                                     "identity from the drawing — name it before pricing (never priced on a guess).")
                 if _grouped:
                     continue          # this page's zones are emitted per material group below
-                zones.append({
+                zones.append(dict({
                     "materialName": mat, "material_type": mat, "category": cat,
                     "family": _f9,
                     "netArea": round(d["sf"], 1), "grossArea": round(d["sf"], 1),
                     "totalOpeningArea": 0, "description": f"{d['n']} region(s) from {src_txt}",
-                    "reader": _reader_from_name(mat),
-                })
+                }, **_review_fields(d["classes"], auto=auto, raw_name=mat)))
                 legend[mat] = {"id": mat, "name": mat, "category": cat}
             for g9, d in bygrp.items():
                 raw9 = _dom9.get(g9, (g9, 0.0))[0]        # dominant raw name carries provenance
                 cat = (bymat.get(raw9) or {}).get("category") or "Other"
-                zones.append({
+                zones.append(dict({
                     "materialName": g9, "material_type": g9, "category": cat,
                     "family": _fam9_outer(raw9),
                     "netArea": round(d["sf"], 1), "grossArea": round(d["sf"], 1),
                     "totalOpeningArea": 0, "description": f"{d['n']} region(s) from {src_txt}",
                     "material_group": g9, "material_class": d["cls"],
-                    "reader": _reader_from_name(raw9),
                     "readAs": (str(raw9)[:60] if str(raw9) != str(g9) else None),
-                })
+                }, **_review_fields(d["classes"], auto=auto, raw_name=raw9)))
                 legend[g9] = {"id": g9, "name": g9, "category": cat}
             auto_flags = []
             if auto_flags_pre:
@@ -1900,7 +1970,8 @@ def accept_suggestion(payload: dict = Body(...)):
                     p["material_group"] = _g9; p["material_class"] = _c9
         except Exception:
             _grouped9 = False
-    bymat = _dd(lambda: {"sf": 0.0, "n": 0, "category": None, "raw": None, "cls": None})
+    bymat = _dd(lambda: {"sf": 0.0, "n": 0, "category": None, "raw": None, "cls": None,
+                         "classes": []})
     for p in _live9:
         key = ((p.get("material_group") or "Unlabeled") if _grouped9
                else (p.get("material") or p.get("category") or "Unlabeled"))
@@ -1908,11 +1979,19 @@ def accept_suggestion(payload: dict = Body(...)):
         bymat[key]["category"] = p.get("category")
         bymat[key]["raw"] = p.get("material") or p.get("category") or "Unlabeled"
         bymat[key]["cls"] = p.get("material_class")
-    zones = [{"materialName": m, "material_type": m, "category": d["category"] or "Other",
-              "netArea": round(d["sf"], 1), "grossArea": round(d["sf"], 1),
-              "totalOpeningArea": 0, "description": f"{d['n']} region(s)",
-              "material_group": (m if _grouped9 else None), "material_class": d["cls"],
-              "reader": _reader_from_name(d["raw"])}
+        # ⚠ THE MIRROR AGAIN: this handler REPLACES the page's zones wholesale, so a field
+        # the analyze path writes and this one forgets vanishes from exactly the pages the
+        # estimator touched — the failure mode this block's own header warns about. The
+        # review fields are rebuilt here from the same stamps, including the ACCEPTED
+        # piece's own (stamped at suggestion time, before its name became "AI wall
+        # (accepted)"): a click confirms the wall EXISTS, it does not re-measure its area,
+        # so the region keeps the risk of the reader that drew it.
+        bymat[key]["classes"].append(p.get("reader_class"))
+    zones = [dict({"materialName": m, "material_type": m, "category": d["category"] or "Other",
+                   "netArea": round(d["sf"], 1), "grossArea": round(d["sf"], 1),
+                   "totalOpeningArea": 0, "description": f"{d['n']} region(s)",
+                   "material_group": (m if _grouped9 else None), "material_class": d["cls"]},
+                  **_review_fields(d["classes"], auto=True, raw_name=d["raw"]))
              for m, d in bymat.items()]
     for e in j.get("takeoffData") or []:
         if e.get("pageNumber") == page:
@@ -1931,6 +2010,62 @@ def accept_suggestion(payload: dict = Body(...)):
     except Exception:
         pass
     return {"ok": True, "zones": zones, "accepted_sf": hit.get("area_sf")}
+
+@app.get("/review-queue/{jid}")
+def review_queue(jid: str):
+    """THE RANKING (FIX_TWO_TIER_GATE's replacement for the assert tier).
+
+    Returns this job's regions ordered by the MEASURED confidently-wrong rate of the
+    reader that drew each one — riskiest first — so the estimator spends her first clicks
+    where the corpus says the engine is most often materially over.
+
+    ⭐ IT BOOKS NOTHING. No SF changes, no region is asserted, no region is hidden, and
+    every zone in `takeoffData` is still here: this endpoint re-ORDERS, it does not filter
+    (`order_zones` is required to return every zone it was given). That is the whole
+    reason this could ship when the two-tier ASSERT gate could not — a gate that books
+    money on a 15.9%-wrong class breaks the zero-confidently-wrong promise, and an
+    ordering cannot, whatever the risk numbers turn out to be.
+
+    The risk table is a MEASUREMENT (review_rank.TABLE names the corpus and its md5), not
+    a judgement about materials, and it is re-derived by
+    `bfs_overnight\\probe_review_rank.py` / checked by `test_review_rank_stamp.py`.
+    """
+    j = get_job(jid)
+    if not j:
+        raise HTTPException(404, "job not found")
+    if _rr is None:                      # visible, never a silently unordered queue
+        raise HTTPException(503, "review_rank unavailable: %s" % (_RR_ERR or "not imported"))
+    rows = []
+    for el in (j.get("takeoffData") or []):
+        for z in (el.get("zones") or []):
+            cls = z.get("readerClass")
+            rows.append({"page": el.get("pageNumber"),
+                         "materialName": z.get("materialName"),
+                         "netArea": z.get("netArea", 0),
+                         "readerClass": cls,
+                         "reader": z.get("reader") or _rr.label(cls),
+                         "reviewRank": z.get("reviewRank", _rr.rank(cls)),
+                         "reviewRisk": z.get("reviewRisk", _rr.risk(cls)),
+                         "reviewRate": z.get("reviewRate", _rr.rate(cls)),
+                         "reviewWhy": z.get("reviewWhy") or _rr.why(cls)})
+    ordered = _rr.order_zones(rows)
+    # pages, ordered by their own riskiest region — the queue the estimator walks is a
+    # page at a time, and a page is exactly as urgent as the worst thing on it
+    pages = {}
+    for r in ordered:
+        p = pages.setdefault(r["page"], {"page": r["page"], "sf": 0.0, "zones": 0,
+                                         "topClass": r["readerClass"],
+                                         "topRank": r["reviewRank"],
+                                         "topReader": r["reader"]})
+        p["sf"] += float(r.get("netArea") or 0)
+        p["zones"] += 1
+    page_list = sorted(pages.values(), key=lambda p: _rr.sort_key(p["topClass"], p["sf"]))
+    return {"jobId": jid, "zones": ordered, "pages": page_list,
+            "table": dict(_rr.TABLE, order=_rr.ORDER, risk=_rr.RISK),
+            "note": ("ORDERING ONLY — every region is still confirmed by the estimator and "
+                     "no SF is booked, asserted or hidden by this ranking. The order is the "
+                     "reader class's measured share of walls where the engine booked more "
+                     "than 1.15x the wall's true SF, upper-bounded for support.")}
 
 @app.post("/bid-excel")
 def bid_excel_endpoint(payload: dict = Body(...)):
@@ -2178,4 +2313,11 @@ def health():
             # looks exactly like one running seven. `v13_status()` is pure, is called by
             # nothing in the detect path, and never raises. It reports LOADABILITY, not that
             # inference ran -- the page budget it reports beside it can still withhold work.
-            "v13": vector_hatch.v13_status()}
+            "v13": vector_hatch.v13_status(),
+            # REVIEW RANKING: same visibility rule a third time. A missing review_rank.py
+            # degrades to an unordered queue, which looks exactly like a queue nobody
+            # prioritised — so the module's presence AND the corpus its risk table was
+            # derived from are reported, because a table silently frozen at an old corpus
+            # is the failure this ships with a guard against.
+            "review_rank": (False if _rr is None else dict(_rr.TABLE, order=_rr.ORDER)),
+            "review_rank_err": _RR_ERR}
