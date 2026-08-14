@@ -809,6 +809,24 @@ def process(jid, pdf_bytes):
                     auto_flags_pre = None
             else:
                 auto_flags_pre = None
+            # OFF-GOLD SUPPRESSION (2026-08-14, FIX_SCOREBOARD_DIRECTION.md; owner-approved
+            # fill-only). The `fill` reader ("Panel wall*") books ~973k SF at 98.2% OFF-GOLD:
+            # it draws the whole building while the estimator bids a SCOPED part. Demote it
+            # booked -> suggest_only so it leaves every total (:866/896/946/1047) and the
+            # evidence PDF (:1922) but stays on screen as a one-click suggestion
+            # (/accept-suggestion flips it back by id). Booking policy is UNGATED (gold_bench/
+            # shard_bench never import app), so this canNOT move exam/corpus MONEY or the
+            # battery and canNOT raise confidently-wrong -- it only removes over-draw SF the
+            # estimator would otherwise delete by hand. Runs BEFORE the naming passes so it
+            # catches fill pieces while they still carry the "Panel wall" identity.
+            for _fp in polys:
+                if (not _fp.get("suggest_only")
+                        and str(_fp.get("group") or _fp.get("material") or "").startswith("Panel wall")):
+                    _fp["suggest_orig_material"] = _fp.get("material")
+                    _fp["suggest_only"] = True
+                    _fp["sf_exact"] = False
+                    _fp["category"] = "AI suggestion (confirm to add)"
+                    _fp["suggest_reason"] = "fill reader (98% off-gold) - confirm to book"
             # LEGEND-FIRST SECOND PASS (owner directive 2026-07-25: naming is the lane).
             # Late-reader pieces (v13/band/rc) exist only AFTER the first naming pass —
             # re-run callout/legend binding on pieces still lacking a drawing identity.
