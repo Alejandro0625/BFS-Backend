@@ -171,9 +171,14 @@ def _persist_job(jid):
         # ticklist, so losing it would un-park her out-of-scope groups behind her back
         # (the parked ZONES themselves ride inside takeoffData and the `out_of_scope`
         # piece flags inside polygons_by_page, both already here).
+        # `reviewConfirmed` is her walk of the review queue (which regions she has already
+        # eyeballed) and `netOverrides` is her per-zone NET number — the one STEP 4 says IS
+        # the delivered quantity. Losing either behind her back is the same bug scopeMap
+        # was added here to prevent: the job comes back looking untouched and she redoes
+        # an hour of confirmation, or worse, the bid silently reverts to the gross.
         meta = {k: job.get(k) for k in ("status", "phase", "progress", "legend", "takeoffData",
                 "scheduleData", "error", "polygons_by_page", "dims_by_page", "log", "projName", "pageCount",
-                "coverageReport", "openingsConvention", "scopeMap")}
+                "coverageReport", "openingsConvention", "scopeMap", "reviewConfirmed", "netOverrides")}
         with open(os.path.join(d, "job.json"), "w", encoding="utf-8") as fh:
             json.dump(meta, fh)
     except Exception:
@@ -444,6 +449,68 @@ def _apply_scope(j, smap):
             else:
                 p["out_of_scope"] = True
     return n_park, n_back
+
+
+# ── NET BY CONFIRMATION (STEP 4, PERFECT_ACCURACY_BLUEPRINT) ─────────────────
+# She books openings-DEDUCTED area (~27% median off gross). Two independent
+# programmes proved the machine cannot recover that number from pixels: the v18
+# ladder and the netting ORACLE, which showed that even PERFECT wall selection
+# plus the best CONSTANT ratio scores BELOW baseline with 27 confidently-wrong
+# (fix2_DECISION.md). So this pass does not compute a net, does not suggest a
+# net, and does not show a "job habit" — FIX_OPENINGS stands: a habit may be
+# SHOWN, never APPLIED, and even the showing is a later pass. All that lands
+# here is the PLUMBING: a place to PUT her number and a rule that everything
+# downstream reads it.
+#
+# IDENTITY BY DEFAULT, same three rules as the scope gate:
+#  1. `netOverrides` starts EMPTY. With no entry, `_apply_nets` touches nothing
+#     and every zone dict is the one `process()` built, key for key.
+#  2. THE MACHINE NUMBER IS NEVER DESTROYED. The first override stashes it in
+#     `netAreaAuto`; clearing the override puts it back and removes the stash,
+#     so a cleared job is byte-identical to one that was never touched.
+#  3. THE KEY IS THE ZONE'S SCOPE IDENTITY (page + material_group stamp), not a
+#     zone index and not a renameable display string — so an override survives
+#     the /accept-suggestion mirror rebuilding that page's zones from scratch,
+#     which is the exact way `reader_class` and `material_group` were lost
+#     before they were re-derived from stamps.
+#
+# ⚠ NOTHING IN THE ENGINE READS THIS. `_apply_nets` runs only where a takeoff
+# already exists (after /set-net, /set-scope and the /accept-suggestion
+# rebuild); `process()` never calls it, so no detection, grading or bench number
+# can move because of it.
+
+def _net_key(page, zone_key):
+    return "%s|%s" % (page, zone_key)
+
+
+def _apply_nets(j):
+    """Write her confirmed NET onto every zone that has one; restore the machine's
+    number on every zone that doesn't. Returns the number of zones overridden.
+
+    Parked zones are netted too — she may park a group AFTER netting it, and
+    restoring it must not silently hand back the gross."""
+    ov = j.get("netOverrides") or {}
+    n = 0
+    for el in (j.get("takeoffData") or []):
+        pn = el.get("pageNumber")
+        for z in (list(el.get("zones") or []) + list(el.get("parkedZones") or [])):
+            rec = ov.get(_net_key(pn, _scope_group_of_zone(z)))
+            if not isinstance(rec, dict):
+                if "netAreaAuto" in z:          # override cleared -> exactly today's zone
+                    z["netArea"] = z.pop("netAreaAuto")
+                    z.pop("netOverride", None)
+                    z.pop("netOverrideAt", None)
+                continue
+            if "netAreaAuto" not in z:          # keep the machine's draft, once
+                z["netAreaAuto"] = z.get("netArea")
+            try:
+                z["netArea"] = round(float(rec.get("net")), 1)
+            except Exception:
+                continue
+            z["netOverride"] = True
+            z["netOverrideAt"] = rec.get("ts")
+            n += 1
+    return n
 
 
 def jlog(job, msg, level="info"):
@@ -737,6 +804,108 @@ def snap_auto_polys(pg, polys, pw, ph):
             out.append(p)
     return out
 
+# ── VECTOR-PAGE SUGGESTIONS (STEP 3, PERFECT_ACCURACY_BLUEPRINT) ────────────
+# The suggestion block below has two branches — DENSE hairline pages and RASTER
+# underlays — and a CLEAN VECTOR elevation is neither, so those pages shipped
+# ZERO suggestions (confirmed against live). That is the wrong half of the gap:
+# r4_truly_missed_partition counted 869 walls / 246k SF with no engine ink on
+# them at all, and a suggestion is the difference between "she draws it" and
+# "she clicks it".
+#
+# `vector_hatch._v13_regions` already SELF-GATES onto vector sheets (>=15% of
+# the page in non-white fill paths, else one cheap 384px probe that proceeds
+# only when the model's wall-interior response covers >=8%), so calling it here
+# costs nothing on sparse CAD line sheets and admits exactly the rendered-vector
+# class it was widened for (Avalon / Rivers-Edge / Essex: 30/15/37 walls found
+# standalone where every hand-written gate excluded them).
+
+def _piece_bbox(p):
+    pts = p.get("points") or []
+    if not pts:
+        return None
+    xs = [q[0] for q in pts]; ys = [q[1] for q in pts]
+    return (min(xs), min(ys), max(xs), max(ys))
+
+
+def _bbox_cover(a, b):
+    """Fraction of box `a` that box `b` covers (normalised page coords, 0..1)."""
+    ix = min(a[2], b[2]) - max(a[0], b[0])
+    iy = min(a[3], b[3]) - max(a[1], b[1])
+    if ix <= 0 or iy <= 0:
+        return 0.0
+    return (ix * iy) / max(1e-9, (a[2] - a[0]) * (a[3] - a[1]))
+
+
+def _vector_page_suggestions(job, pdf_bytes, pi, polys, pw, ph, scale_val, max_new=40):
+    """v13 pieces on a clean VECTOR elevation, minus everything the engine already booked.
+
+    TWO THINGS PROTECT THE PRIMARY READ, because a suggestion that costs booked SF is
+    not identity-by-default and would be the fill demotion all over again:
+
+    1. THE BUDGET IS SEPARATE.  `vector_hatch._V13_BUDGET` is a per-DOCUMENT counter
+       ({doc_fp: pages_inferred}) and on a hit `_v13_regions` WITHHOLDS work — it
+       returns [] rather than a cached answer (that is the whole of
+       FIX_V13_NONDETERMINISM: a spent budget silently cost 34% of a job's SF). The
+       booked read spends that budget at vector_hatch.py:1509. If suggestions spent it
+       too, a doc would reach V13_MAX_PAGES in HALF the pages and the primary reader
+       would go dark on the rest — booked SF down, silently. So the shared counter is
+       snapshotted and RESTORED around the call, and suggestions run against their own
+       per-job page cap (V13_SUGGEST_MAX_PAGES, default = V13_MAX_PAGES). The primary
+       read's budget is therefore provably untouched: it sees the same number after
+       this function as before it, on every path including the failure paths.
+
+    2. IF v13 ALREADY RAN ON THIS PAGE, DON'T RUN IT AGAIN.  Its own ownership filter
+       ("virgin territory only", vector_hatch.py:~2280) already dropped every candidate
+       overlapping a booked poly — which is precisely the subtraction below. A second
+       full inference would spend ~40s to produce the empty set. Detected by the
+       reader_class stamp, which is written once and never renamed.
+
+    The pieces returned are SUBTRACTED against booked polys, so this surfaces only what
+    the engine did not book, and the caller tags every one of them suggest_only.
+    """
+    if any((p.get("reader_class") or "") == "v13" for p in polys):
+        return []
+    bud = getattr(vector_hatch, "_V13_BUDGET", None)
+    if not isinstance(bud, dict):
+        # cannot prove isolation from the primary read's budget -> do not risk it
+        return []
+    try:
+        cap = int(os.environ.get("V13_SUGGEST_MAX_PAGES") or os.environ.get("V13_MAX_PAGES") or 8)
+    except Exception:
+        cap = 8
+    used = int(job.get("_v13SugPages") or 0)
+    if used >= cap:
+        return []
+    fp = (len(pdf_bytes), hash(pdf_bytes[:4096]))
+    had = fp in bud
+    saved = bud.get(fp, 0)
+    sugs, ran = [], False
+    try:
+        bud[fp] = 0                     # suggestions run on their OWN budget
+        sugs = vector_hatch._v13_regions(pdf_bytes, pi, [], pw, ph,
+                                         float(scale_val or 8.0) / 72.0, max_new=max_new) or []
+        ran = bool(bud.get(fp, 0))      # the budget gate is past the cheap self-gates:
+    except Exception:                   # a bump means inference actually ran on this page
+        sugs = []                       # a reader that fails costs THIS page's suggestions,
+    finally:                            # never the page's probe, its flags or a single SF
+        if had:
+            bud[fp] = saved
+        else:
+            bud.pop(fp, None)
+    if ran:
+        job["_v13SugPages"] = used + 1
+    owned = [b for b in (_piece_bbox(p) for p in polys if not p.get("suggest_only")) if b]
+    out = []
+    for s in sugs:
+        b = _piece_bbox(s)
+        if b is None:
+            continue
+        if any(_bbox_cover(b, ob) > 0.3 for ob in owned):
+            continue                    # the engine already booked this territory
+        out.append(s)
+    return out
+
+
 def process(jid, pdf_bytes):
     job = jobs[jid]
     # FIX_V13_NONDETERMINISM (2026-08-06): scope the v13 inference budget to THIS analysis.
@@ -920,6 +1089,15 @@ def process(jid, pdf_bytes):
                         if _rr is not None:
                             for _s9 in _sugs:
                                 _s9["reader_class"] = _rr.classify(_s9.get("material"))
+                    else:
+                        # CLEAN VECTOR ELEVATION — the branch that did not exist (STEP 3).
+                        # Everything protecting the booked read lives in the helper; the
+                        # stamp goes on here for the same reason it does above.
+                        _sugs = _vector_page_suggestions(job, pdf_bytes, pi, polys, pw, ph,
+                                                         scale_val, max_new=40)
+                        if _rr is not None:
+                            for _s9 in _sugs:
+                                _s9["reader_class"] = _rr.classify(_s9.get("material"))
                     jlog(job, f"Page {pi+1}: suggestion probe — dense={_dense9}, "
                               f"img={_imga / max(pw * ph, 1):.0%}, suggestions={len(_sugs)}", "info")
                     # tag + append OUTSIDE the branches — BOTH readers' suggestions ship
@@ -1020,6 +1198,16 @@ def process(jid, pdf_bytes):
                         q["material_type"] = _g9
                 except Exception as _ge:
                     jlog(job, f"Page {pi+1}: material grouping skipped ({_ge})", "warn")
+            # ⭐ EVERY PIECE GETS AN ID (2026-08-17). Only the MARKUP path stamped one
+            # (~:800); auto-read pieces and suggestions came out of vector_hatch with no
+            # `id` at all, and `/accept-suggestion` matches `str(p["id"]) == str(pieceId)`
+            # — so with every id None, the frontend's `pieceId: z.id` serialised to
+            # ABSENT and "None" == "None" accepted the FIRST suggestion on the page
+            # whichever one she clicked. Additive (a new key on pieces that had none, the
+            # same value on pieces that had one — the list is only ever appended to, never
+            # reordered) and no SF, zone, total or export reads it.
+            for _i9, _p9 in enumerate(polys):
+                _p9["id"] = _i9
             job["polygons_by_page"][pi + 1] = polys
             job["dims_by_page"][pi + 1] = {"width": pw, "height": ph}
             # keep pages that have linear (trim/LF) measurements even with no area polygons,
@@ -1553,7 +1741,14 @@ def status(jid: str):
             # grouped GROSS-vs-NET convention summary (counts + archive deduction RANGE).
             # Estimator information only — every SF in it is a convention estimate and is
             # never added to or subtracted from any total (openings_convention.py).
-            "openingsConvention": j.get("openingsConvention")}
+            "openingsConvention": j.get("openingsConvention"),
+            # her review walk + her confirmed NETs, echoed so a reload/second device
+            # resumes where she left off instead of starting the hour again. Both are
+            # written ONLY by their own POST handlers; `reviewConfirmed` is read by
+            # nothing that computes SF, and `netOverrides` is already baked into the
+            # `netArea` above by `_apply_nets` (this is the audit trail, not the source).
+            "reviewConfirmed": j.get("reviewConfirmed") or {},
+            "netOverrides": j.get("netOverrides") or {}}
 
 @app.get("/polygons/{jid}/{page}")
 def polygons(jid: str, page: int):
@@ -2089,8 +2284,21 @@ def accept_suggestion(payload: dict = Body(...)):
     if polys is None:
         raise HTTPException(404, "no polygons for page")
     hit = next((p for p in polys if str(p.get("id")) == str(pid) and p.get("suggest_only")), None)
+    if hit is None and pid is not None:
+        # ID FALLBACK (2026-08-17): jobs analysed BEFORE pieces were stamped with an id
+        # (~:1030) are still on the volume and still rehydrate, and every piece in them
+        # answers `id: None`. Without this, her click on suggestion #4 of an old job
+        # 404s; with the old matcher it accepted #1. The array index IS the id this
+        # analyse path now assigns, so an index lookup is the same answer.
+        try:
+            _cand = polys[int(pid)]
+            if _cand.get("suggest_only") and _cand.get("id") is None:
+                hit = _cand
+        except Exception:
+            hit = None
     if hit is None:
         raise HTTPException(404, "suggestion not found (already accepted?)")
+    _accepted_cls = hit.get("reader_class")
     hit["suggest_only"] = False
     hit["material"] = "AI wall (accepted)"
     hit["category"] = "AI wall (accepted)"
@@ -2145,6 +2353,14 @@ def accept_suggestion(payload: dict = Body(...)):
     for e in j.get("takeoffData") or []:
         if e.get("pageNumber") == page:
             e["zones"] = zones
+    # ⚠ THE MIRROR, ONE MORE TIME. This handler REBUILDS the page's zones, so a zone she
+    # had already netted comes back wearing the machine's gross. `netOverrides` is keyed
+    # on (page, material_group stamp) exactly so it survives that — re-apply it here or
+    # accepting a suggestion silently reverts her confirmed number on that page.
+    try:
+        _apply_nets(j)
+    except Exception:
+        pass
     try:
         _persist_job(jid)
     except Exception:
@@ -2158,7 +2374,15 @@ def accept_suggestion(payload: dict = Body(...)):
                        "_ts": ts}, fh)
     except Exception:
         pass
-    return {"ok": True, "zones": zones, "accepted_sf": hit.get("area_sf")}
+    # `readerClass` rides back so the accept button can say WHICH reader drew the wall she
+    # just booked, and the review queue can rank it, without a second round trip. It is the
+    # stamp taken BEFORE the rename above — the piece is now called "AI wall (accepted)",
+    # and re-deriving a class from that name would give every accepted wall the same wrong
+    # risk. A click confirms the wall EXISTS; it does not re-measure it or re-classify it.
+    return {"ok": True, "zones": zones, "accepted_sf": hit.get("area_sf"),
+            "readerClass": _accepted_cls,
+            "reader": (_rr.label(_accepted_cls) if _rr is not None else None),
+            "reviewRisk": (_rr.risk(_accepted_cls) if _rr is not None else None)}
 
 @app.get("/scope/{jid}")
 def scope_get(jid: str):
@@ -2208,6 +2432,10 @@ def set_scope(payload: dict = Body(...)):
         smap[str(k)] = True
     j["scopeMap"] = smap
     n_park, n_back = _apply_scope(j, smap)
+    try:
+        _apply_nets(j)   # a restored group comes back with HER net, not the gross
+    except Exception:
+        pass
     jobs[jid] = j
     try:
         _persist_job(jid)
@@ -2242,13 +2470,51 @@ def review_queue(jid: str):
         raise HTTPException(404, "job not found")
     if _rr is None:                      # visible, never a silently unordered queue
         raise HTTPException(503, "review_rank unavailable: %s" % (_RR_ERR or "not imported"))
+    polys_by = j.get("polygons_by_page") or {}
+
+    def _page_polys(pn):
+        return polys_by.get(pn) or polys_by.get(str(pn)) or []
+
+    confirmed = j.get("reviewConfirmed") or {}
     rows = []
     for el in (j.get("takeoffData") or []):
+        pn = el.get("pageNumber")
+        _pp = _page_polys(pn)
         for z in (el.get("zones") or []):
             cls = z.get("readerClass")
-            rows.append({"page": el.get("pageNumber"),
+            # ⭐ PER-PIECE ROWS — the 355k SF that looked like a blank page.
+            # r4_absorbed_census: 1,598 of her 2,659 uncredited walls (355k SF) HAVE
+            # ENGINE INK ON THEM. They were invisible here because a row is per
+            # (page, material) and a rollup of nine regions is one row wearing one
+            # SF — she could not see, let alone confirm, the individual walls the
+            # engine had already drawn. This is the STEP-2 "credit what's drawn"
+            # surface and it books NOTHING: the pieces are read straight off
+            # `polygons_by_page` with the zone's own rollup key (the material_group
+            # STAMP, the same identity the scope gate and _apply_nets key on, never
+            # a renameable display string), suggestions and parked pieces excluded
+            # exactly as the zone builder excludes them.
+            _zkey = _scope_group_of_zone(z)
+            pieces = []
+            for _idx, p in enumerate(_pp):
+                if p.get("suggest_only") or p.get("out_of_scope"):
+                    continue
+                if _scope_group_of_poly(p) != _zkey:
+                    continue
+                pieces.append({"id": (p.get("id") if p.get("id") is not None else _idx),
+                               "sf": round(float(p.get("area_sf") or 0), 1),
+                               "cx": p.get("cx"), "cy": p.get("cy"),
+                               "readerClass": p.get("reader_class")})
+            pieces.sort(key=lambda q: -(q["sf"] or 0))
+            rows.append({"page": pn,
                          "materialName": z.get("materialName"),
                          "netArea": z.get("netArea", 0),
+                         "zoneKey": _zkey,
+                         "grossArea": z.get("grossArea"),
+                         "netAreaAuto": z.get("netAreaAuto"),
+                         "netOverride": bool(z.get("netOverride")),
+                         "confirmed": bool(confirmed.get(_net_key(pn, z.get("materialName")))),
+                         "pieces": pieces,
+                         "pieceCount": len(pieces),
                          "readerClass": cls,
                          "reader": z.get("reader") or _rr.label(cls),
                          "reviewRank": z.get("reviewRank", _rr.rank(cls)),
@@ -2267,12 +2533,156 @@ def review_queue(jid: str):
         p["sf"] += float(r.get("netArea") or 0)
         p["zones"] += 1
     page_list = sorted(pages.values(), key=lambda p: _rr.sort_key(p["topClass"], p["sf"]))
+    # ⭐ THE SUGGESTIONS INDEX. Every suggest_only piece in the job, in one payload,
+    # ranked by the same measured risk order as the queue. It replaces the frontend's
+    # N-per-page /polygons scan (one request per page, every page, to find out whether
+    # there was anything to suggest at all) — which is why suggestions were effectively
+    # invisible on long sets. Suggestions are NOT zones: none of this SF is booked, is
+    # in `zones` above, or is in any total; accepting one is a separate human click
+    # through /accept-suggestion.
+    suggestions = []
+    for _pn, _polys in (polys_by or {}).items():
+        try:
+            _pni = int(_pn)
+        except Exception:
+            continue
+        for _idx, p in enumerate(_polys or []):
+            if not p.get("suggest_only"):
+                continue
+            suggestions.append({"page": _pni,
+                                "id": (p.get("id") if p.get("id") is not None else _idx),
+                                "sf": round(float(p.get("area_sf") or 0), 1),
+                                "cx": p.get("cx"), "cy": p.get("cy"),
+                                "readerClass": p.get("reader_class")})
+    suggestions.sort(key=lambda s: _rr.sort_key(s["readerClass"], s["sf"]))
     return {"jobId": jid, "zones": ordered, "pages": page_list,
+            "suggestions": suggestions,
+            "suggestionSF": round(sum(s["sf"] for s in suggestions), 1),
+            "reviewConfirmed": confirmed,
             "table": dict(_rr.TABLE, order=_rr.ORDER, risk=_rr.RISK),
             "note": ("ORDERING ONLY — every region is still confirmed by the estimator and "
                      "no SF is booked, asserted or hidden by this ranking. The order is the "
                      "reader class's measured share of walls where the engine booked more "
                      "than 1.15x the wall's true SF, upper-bounded for support.")}
+
+@app.post("/review-confirm")
+def review_confirm(payload: dict = Body(...)):
+    """SHE LOOKED AT IT — the review walk, moved off the browser and onto the job.
+
+    payload: {jobId, page, materialName, confirmed:bool, pieceId?}
+
+    Until now the walker's progress lived in the frontend's own state and its saved
+    recall record, so it died with the tab and never existed for a second device or a
+    second person. The queue she is walking is the product's core loop (STEP 2/4:
+    "she confirms every number fast"), and its progress belongs to the JOB.
+
+    ⭐ IT BOOKS NOTHING AND IT IS READ BY NOTHING THAT COMPUTES SF. This flag is
+    display state: no zone, total, Excel, evidence PDF, bench or grade reads it. That
+    is deliberate — a confirmation is not a measurement, and the moment "confirmed"
+    starts changing quantities it becomes an assert tier, which is the gate
+    FIX_TWO_TIER_GATE refused to ship. Her NUMBER goes through /set-net.
+
+    `pieceId` is optional and extends the key, so the per-piece rows the queue now
+    returns can be ticked individually without colliding with the row's own tick.
+    """
+    jid = payload.get("jobId")
+    j = get_job(jid)
+    if not j:
+        raise HTTPException(404, "job not found")
+    try:
+        page = int(payload.get("page"))
+    except Exception:
+        raise HTTPException(400, "page required")
+    mat = payload.get("materialName")
+    if mat is None:
+        raise HTTPException(400, "materialName required")
+    key = _net_key(page, mat)
+    if payload.get("pieceId") is not None:
+        key += "|#%s" % payload.get("pieceId")
+    conf = dict(j.get("reviewConfirmed") or {})
+    if payload.get("confirmed", True):
+        conf[key] = {"at": int(time.time() * 1000)}
+    else:
+        conf.pop(key, None)
+    j["reviewConfirmed"] = conf
+    jobs[jid] = j
+    try:
+        _persist_job(jid)
+    except Exception:
+        pass
+    return {"ok": True, "jobId": jid, "key": key,
+            "confirmed": key in conf, "confirmedCount": len(conf),
+            "reviewConfirmed": conf,
+            "note": ("Display state only — no SF, total, Excel or evidence quantity reads "
+                     "this. The confirmed NUMBER is /set-net.")}
+
+
+@app.post("/set-net")
+def set_net(payload: dict = Body(...)):
+    """STEP 4 — NET BY CONFIRMATION. Her number, on one zone, and it is THE number.
+
+    payload: {jobId, page, zoneKey, net}          set the override
+             {jobId, page, zoneKey, net: null}    clear it (back to the machine's draft)
+             {jobId, reset: true}                 clear every override on the job
+
+    `zoneKey` is the zone's scope identity — its `material_group` stamp, or its
+    materialName on ungrouped/marked pages (see `_scope_group_of_zone`). The review
+    queue hands it back on every row as `zoneKey`, so the caller never has to guess.
+
+    ⭐ WHAT THIS DOES NOT DO. It does not compute a net, does not suggest one, does not
+    show the job's habit, and does not apply a ratio to anything. Two programmes (the
+    v18 ladder, then the netting oracle) proved that even PERFECT wall selection with
+    the best constant ratio scores BELOW baseline at 27 confidently-wrong, and
+    FIX_OPENINGS stands: a habit may be SHOWN, never APPLIED. This pass is the
+    plumbing and nothing else — the display of openings/habit is a later pass.
+
+    IDENTITY BY DEFAULT: with no override the takeoff is byte-identical to today's,
+    and clearing an override restores the machine's own number from `netAreaAuto` and
+    removes every field this ever added.
+    """
+    jid = payload.get("jobId")
+    j = get_job(jid)
+    if not j:
+        raise HTTPException(404, "job not found")
+    ov = {} if payload.get("reset") else dict(j.get("netOverrides") or {})
+    key = None
+    if not payload.get("reset"):
+        try:
+            page = int(payload.get("page"))
+        except Exception:
+            raise HTTPException(400, "page required")
+        zk = payload.get("zoneKey")
+        if zk is None:
+            raise HTTPException(400, "zoneKey required")
+        key = _net_key(page, zk)
+        raw = payload.get("net", None)
+        if raw is None or raw == "":
+            ov.pop(key, None)
+        else:
+            try:
+                val = float(raw)
+            except Exception:
+                raise HTTPException(400, "net must be a number")
+            if val < 0:
+                raise HTTPException(400, "net cannot be negative")
+            ov[key] = {"net": round(val, 1), "ts": int(time.time() * 1000),
+                       "by": str(payload.get("by") or "estimator")[:40]}
+    j["netOverrides"] = ov
+    n = _apply_nets(j)
+    jobs[jid] = j
+    try:
+        _persist_job(jid)
+    except Exception:
+        pass
+    return {"ok": True, "jobId": jid, "key": key, "netOverrides": ov,
+            "zonesOverridden": n,
+            "jobTotal": round(sum(float(z.get("netArea") or 0)
+                                  for e in (j.get("takeoffData") or [])
+                                  for z in (e.get("zones") or [])), 1),
+            "takeoffData": j.get("takeoffData") or [],
+            "note": ("Her confirmed net IS the delivered number — totals, the Excel and the "
+                     "evidence PDF all read it. Nothing here computes or suggests a net.")}
+
 
 @app.post("/bid-excel")
 def bid_excel_endpoint(payload: dict = Body(...)):
@@ -2314,10 +2724,30 @@ async def scope_read(pdf: UploadFile = File(...)):
     return {"text": txt, "chars": len(txt), "pages": len(parts)}
 
 @app.get("/snap-points/{jid}/{page}")
-def snap_points(jid: str, page: int):
+def snap_points(jid: str, page: int, rect: str = "", min_len: float = 0.0):
     """Bluebeam-style corner snap: the drawing's real CAD geometry → structural snap corners (endpoints +
     intersections of the LONG horizontal/vertical lines = building outline, floor lines, major openings).
-    The estimator's clicks snap to these (pixel-perfect like Bluebeam); auto-markup can snap its edges too."""
+    The estimator's clicks snap to these (pixel-perfect like Bluebeam); auto-markup can snap its edges too.
+
+    ⭐ DETAIL TIER (2026-08-17): `?rect=x0,y0,x1,y1[&min_len=pt]`.
+
+    `Lmin = 0.06 * max(W, H)` is a WHOLE-SHEET threshold — "structural, not
+    window-mullion/brick/detail noise". It is also why the 869 walls with no engine ink
+    on them (246k SF, r4_truly_missed_partition) cannot be clicked in: they are small
+    trims and friezes, every corner they own is shorter than 6% of a D-size sheet, and
+    a snap layer with no corners on the thing she is trying to trace is a blank page.
+    Zoomed in, "detail noise" is the subject — so when a viewport is supplied the SAME
+    6% rule is measured against the VIEWPORT instead of the sheet, which makes the
+    threshold shrink exactly as fast as she zooms. `min_len` (PDF points) overrides it
+    outright.
+
+    `rect` is in NORMALISED page coordinates (0..1, the frame every other polygon on
+    this API speaks); values above 1 are read as raw PDF points. Points are returned in
+    the same normalised page frame as the full-sheet call, so the caller's transform is
+    unchanged. The 1500-point cap is unchanged, and it now spends all 1500 inside the
+    viewport instead of on the sheet's outline.
+
+    IDENTITY: with neither parameter this is byte-for-byte the endpoint it was."""
     j = get_job(jid)
     if not j or not j.get("pdf"):
         raise HTTPException(404, "job not found")
@@ -2325,7 +2755,26 @@ def snap_points(jid: str, page: int):
     if page < 1 or page > doc.page_count:
         doc.close(); raise HTTPException(404, "page out of range")
     pg = doc[page - 1]; W, H = pg.rect.width, pg.rect.height
-    Lmin = 0.06 * max(W, H)  # "long" = structural, not window-mullion/brick/detail noise
+    box = None
+    if rect:
+        try:
+            v = [float(x) for x in str(rect).replace(" ", "").split(",")]
+            if len(v) != 4:
+                raise ValueError("rect needs 4 numbers")
+            if max(abs(x) for x in v) <= 1.0:      # normalised -> PDF points
+                v = [v[0] * W, v[1] * H, v[2] * W, v[3] * H]
+            x0, x1 = sorted((v[0], v[2])); y0, y1 = sorted((v[1], v[3]))
+            if x1 - x0 <= 0 or y1 - y0 <= 0:
+                raise ValueError("rect is empty")
+            box = (x0, y0, x1, y1)
+        except Exception as ex:
+            doc.close(); raise HTTPException(400, "bad rect (want x0,y0,x1,y1): %s" % ex)
+    if min_len and min_len > 0:
+        Lmin = float(min_len)
+    elif box is not None:
+        Lmin = 0.06 * max(box[2] - box[0], box[3] - box[1])   # the same rule, on the viewport
+    else:
+        Lmin = 0.06 * max(W, H)  # "long" = structural, not window-mullion/brick/detail noise
     hlines = []; vlines = []
     try:
         for d in pg.get_drawings():
@@ -2339,6 +2788,9 @@ def snap_points(jid: str, page: int):
                 for (x1, y1, x2, y2) in segs:
                     if (x2 - x1) ** 2 + (y2 - y1) ** 2 < Lmin ** 2:
                         continue
+                    if box is not None and (max(x1, x2) < box[0] or min(x1, x2) > box[2] or
+                                            max(y1, y2) < box[1] or min(y1, y2) > box[3]):
+                        continue      # segment never enters the viewport
                     if abs(y2 - y1) < abs(x2 - x1) * 0.02:
                         hlines.append((min(x1, x2), max(x1, x2), (y1 + y2) / 2))
                     elif abs(x2 - x1) < abs(y2 - y1) * 0.02:
@@ -2354,14 +2806,27 @@ def snap_points(jid: str, page: int):
         for (ya, yb, xv) in vlines:
             if xa - 2 <= xv <= xb + 2 and ya - 2 <= yh <= yb + 2:
                 pts.append((xv, yh))
+    if box is not None:
+        # spend the 1500 on the thing she is looking at (a 2pt pad keeps a corner that
+        # sits exactly on the viewport edge, which is where a trim usually starts)
+        pts = [p for p in pts if box[0] - 2 <= p[0] <= box[2] + 2 and box[1] - 2 <= p[1] <= box[3] + 2]
+        dedup = min(6.0, 0.006 * max(box[2] - box[0], box[3] - box[1]))
+    else:
+        dedup = 6.0
     keep = []
     for pt in pts[:9000]:
-        if not any(abs(pt[0] - k[0]) < 6 and abs(pt[1] - k[1]) < 6 for k in keep):
+        if not any(abs(pt[0] - k[0]) < dedup and abs(pt[1] - k[1]) < dedup for k in keep):
             keep.append(pt)
         if len(keep) >= 1500:
             break
     norm = [[round(x / W, 5), round(y / H, 5)] for (x, y) in keep]
-    return {"points": norm, "width": W, "height": H, "count": len(norm)}
+    out = {"points": norm, "width": W, "height": H, "count": len(norm)}
+    if box is not None or (min_len and min_len > 0):
+        out["rect"] = ([round(box[0] / W, 5), round(box[1] / H, 5),
+                        round(box[2] / W, 5), round(box[3] / H, 5)] if box else None)
+        out["minLen"] = round(Lmin, 3)
+        out["tier"] = "detail"
+    return out
 
 @app.post("/admin/upload-model")
 async def upload_model(model: UploadFile = File(...), key: str = "", slot: str = ""):
