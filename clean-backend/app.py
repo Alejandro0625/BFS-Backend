@@ -165,9 +165,15 @@ def _persist_job(jid):
         d = _job_dir(jid); os.makedirs(d, exist_ok=True)
         if job.get("pdf") and not os.path.exists(os.path.join(d, "input.pdf")):
             with open(os.path.join(d, "input.pdf"), "wb") as fh: fh.write(job["pdf"])
+        # ⚠ THIS TUPLE IS A WHITELIST, and that is the persistence bug class: a key the
+        # handlers write and this line forgets is silently lost on the next eviction or
+        # redeploy — the job comes back looking untouched. `scopeMap` is the estimator's
+        # ticklist, so losing it would un-park her out-of-scope groups behind her back
+        # (the parked ZONES themselves ride inside takeoffData and the `out_of_scope`
+        # piece flags inside polygons_by_page, both already here).
         meta = {k: job.get(k) for k in ("status", "phase", "progress", "legend", "takeoffData",
                 "scheduleData", "error", "polygons_by_page", "dims_by_page", "log", "projName", "pageCount",
-                "coverageReport", "openingsConvention")}
+                "coverageReport", "openingsConvention", "scopeMap")}
         with open(os.path.join(d, "job.json"), "w", encoding="utf-8") as fh:
             json.dump(meta, fh)
     except Exception:
@@ -313,6 +319,131 @@ def _review_fields(classes, auto=True, src9="", raw_name=""):
             "reviewRate": _rr.rate(cls),
             "reviewWhy": _rr.why(cls),
             "reader": _rr.label(cls, src9)}
+
+
+# ── THE SCOPE GATE (STEP 1, PERFECT_ACCURACY_BLUEPRINT) ──────────────────────
+# 70.8% of every SF this engine draws lands where the estimator marked NOTHING
+# (FIX_SCOREBOARD_DIRECTION, 3 independent runs): she bids a SCOPED subset —
+# brick, EIFS, masonry and glazing belong to other trades by charter — and the
+# drawing never says which subset. That is the single biggest source of wasted
+# estimator time on this product, and it is NOT a detection error: the engine
+# drew the building, she bid a part of it.
+#
+# Every autonomous attempt to GUESS the subset has died. The last one, 10f76e3,
+# auto-demoted the fill reader on a `material`/`group` string prefix and turned
+# the LIVE battery red: `callouts.name_regions` (callouts.py:560/588/655)
+# overwrites material, category AND group 74 lines before the predicate read
+# them, so it missed every piece the drawing had named and removed 5,339 SF of
+# real cladding instead — 14,201 -> 8,862 against her 11,843 (FIX_FILL_DEMOTE_
+# PREDICATE). So this does not guess. The human ticks, once, in ~30 seconds.
+#
+# THREE RULES MAKE THAT SAFE
+#  1. IDENTITY BY DEFAULT. `scopeMap` starts EMPTY and an absent group is IN
+#     SCOPE. `process()` never writes `out_of_scope` — only POST /set-scope
+#     does, and only after a takeoff already exists — so the guards added at the
+#     booking sites below are provable no-ops until she clicks, and a job nobody
+#     touches yields byte-identical zones, totals, Excel and evidence PDF.
+#  2. PARKED, NEVER DELETED. An unticked group's zones MOVE, whole, into
+#     `parkedZones` and move back on a re-tick. Nothing is recomputed, so no
+#     field can be dropped in a rebuild — the /accept-suggestion mirror bug
+#     class (a field the analyze path writes and a rebuild forgets vanishes from
+#     exactly the pages she touched).
+#  3. THE KEY IS THE STAMP, NEVER A NAME PREDICATE. `material_group` is written
+#     once, AFTER every naming pass (~app.py:875), and the zone and its polygons
+#     carry the same value — a later rename cannot desynchronise them. This is
+#     the `reader_class` lesson applied to scope.
+#
+# ⚠ `out_of_scope` is deliberately NOT `suggest_only`. suggest_only carries
+# ACCEPT-FLOW semantics: /accept-suggestion flips it, renames the piece "AI wall
+# (accepted)" and files it as boundary-model training gold. A parked group is
+# none of those — it is real cladding that simply is not in THIS bid. Reusing
+# the flag would have made "she restored it" indistinguishable from "the model
+# was right", and poisoned the flywheel with it.
+
+def _scope_group_of_zone(z):
+    """The ticklist identity of a ZONE. Grouped (auto) pages emit one zone per
+    material_group; MARKED pages are deliberately ungrouped (their names are the
+    estimator's own markup labels) and answer with their own name."""
+    return str(z.get("material_group") or z.get("materialName") or z.get("category") or "Unlabeled")
+
+
+def _scope_group_of_poly(p):
+    """The ticklist identity of a POLYGON — the same stamp its zone was built from
+    (app.py:~875 writes material_group onto the piece and the zone from one pass)."""
+    return str(p.get("material_group") or p.get("material") or p.get("category") or "Unlabeled")
+
+
+def _scope_summary(j):
+    """Every material group in the job with its SF, pages and tick — the panel's
+    whole payload. `scopeMap` is the single source of truth for the tick; the
+    zone's current list (zones vs parkedZones) only follows it."""
+    smap = j.get("scopeMap") or {}
+    rows = {}
+    for el in (j.get("takeoffData") or []):
+        pn = el.get("pageNumber")
+        for z, is_parked in ([(z, False) for z in (el.get("zones") or [])] +
+                             [(z, True) for z in (el.get("parkedZones") or [])]):
+            g = _scope_group_of_zone(z)
+            r = rows.setdefault(g, {"name": g, "sf": 0.0, "zones": 0, "pages": [],
+                                    "category": z.get("category"), "family": z.get("family"),
+                                    "reader": z.get("reader"), "readerClass": z.get("readerClass"),
+                                    "inScope": bool(smap.get(g, True)), "parked": False})
+            r["sf"] += float(z.get("netArea") or 0)
+            r["zones"] += 1
+            r["parked"] = r["parked"] or is_parked
+            if pn and pn not in r["pages"]:
+                r["pages"].append(pn)
+    out = sorted(rows.values(), key=lambda r: -r["sf"])
+    for r in out:
+        r["sf"] = round(r["sf"], 1)
+    return {"groups": out,
+            "inScopeSF": round(sum(r["sf"] for r in out if r["inScope"]), 1),
+            "parkedSF": round(sum(r["sf"] for r in out if not r["inScope"]), 1),
+            "parkedGroups": [r["name"] for r in out if not r["inScope"]]}
+
+
+def _apply_scope(j, smap):
+    """Park every group she unticked; restore every group she re-ticked.
+
+    Zones MOVE as whole objects between `zones` and `parkedZones` — never rebuilt —
+    and each parked zone remembers the index it left, so a restore puts it back
+    where it was. The polygons take the same flag so the canvas can grey them and
+    the evidence PDF can skip them (the parallel of the suggest_only exclusion at
+    :1921). Returns (zones parked, zones restored).
+
+    An empty `smap` parks nothing and restores nothing: the identity path.
+    """
+    n_park = n_back = 0
+    for el in (j.get("takeoffData") or []):
+        zones = list(el.get("zones") or [])
+        parked = list(el.get("parkedZones") or [])
+        keep = []
+        for i, z in enumerate(zones):
+            if smap.get(_scope_group_of_zone(z), True):
+                keep.append(z)
+            else:
+                z["out_of_scope"] = True
+                z["_scopeIdx"] = i
+                parked.append(z); n_park += 1
+        still, back = [], []
+        for z in parked:
+            if smap.get(_scope_group_of_zone(z), True):
+                z.pop("out_of_scope", None)
+                back.append((int(z.pop("_scopeIdx", len(keep)) or 0), z)); n_back += 1
+            else:
+                still.append(z)
+        for idx, z in sorted(back, key=lambda t: t[0]):
+            keep.insert(max(0, min(idx, len(keep))), z)
+        el["zones"] = keep
+        if still or parked:          # never ADD the key to a page nobody parked on
+            el["parkedZones"] = still
+    for _pg, polys in (j.get("polygons_by_page") or {}).items():
+        for p in (polys or []):
+            if smap.get(_scope_group_of_poly(p), True):
+                p.pop("out_of_scope", None)
+            else:
+                p["out_of_scope"] = True
+    return n_park, n_back
 
 
 def jlog(job, msg, level="info"):
@@ -863,7 +994,14 @@ def process(jid, pdf_bytes):
             # two same-family labels (the battery pins the four marked SFs exactly).
             if auto and _mc is not None:
                 try:
-                    _cmap = _mc.build_color_name_map([q for q in polys if not q.get("suggest_only")])
+                    # SCOPE GATE: `out_of_scope` rides beside `suggest_only` at every site
+                    # that decides what gets BOOKED. Inside process() it is provably never
+                    # set (only POST /set-scope writes it, and only to an existing takeoff),
+                    # so these five guards are no-ops on the analyze path by construction —
+                    # they exist so a future re-process of a scoped job cannot resurrect a
+                    # parked group's SF into the totals.
+                    _cmap = _mc.build_color_name_map([q for q in polys if not q.get("suggest_only")
+                                                      and not q.get("out_of_scope")])
                     for q in polys:
                         _g9, _c9 = _mc.material_group(q.get("material") or q.get("category") or "",
                                                       q.get("fill_color"), _cmap)
@@ -893,8 +1031,9 @@ def process(jid, pdf_bytes):
                 continue
             bymat = defaultdict(lambda: {"sf": 0.0, "n": 0, "category": None, "classes": []})
             for p in polys:
-                if p.get("suggest_only"):
-                    continue          # suggestions NEVER enter zones/totals until accepted
+                if p.get("suggest_only") or p.get("out_of_scope"):
+                    continue          # suggestions NEVER enter zones/totals until accepted;
+                                      # parked (out-of-scope) groups leave them the same way
                 key = p.get("material") or p.get("category") or "Unlabeled"
                 bymat[key]["sf"] += p["area_sf"]; bymat[key]["n"] += 1
                 bymat[key]["category"] = p.get("category")
@@ -943,12 +1082,13 @@ def process(jid, pdf_bytes):
             # takes its category, family and reader provenance from its DOMINANT raw name, so
             # every derived field still comes from a real drawing name.
             _grouped = bool(auto and _mc is not None and
-                            any(p.get("material_group") for p in polys if not p.get("suggest_only")))
+                            any(p.get("material_group") for p in polys
+                                if not p.get("suggest_only") and not p.get("out_of_scope")))
             bygrp = defaultdict(lambda: {"sf": 0.0, "n": 0, "cls": None, "classes": []})
             _rawsf9 = defaultdict(float)
             if _grouped:
                 for p in polys:
-                    if p.get("suggest_only"):
+                    if p.get("suggest_only") or p.get("out_of_scope"):
                         continue
                     g9 = p.get("material_group") or "Unlabeled"
                     bygrp[g9]["sf"] += p["area_sf"]; bygrp[g9]["n"] += 1
@@ -1044,7 +1184,8 @@ def process(jid, pdf_bytes):
                 # a merged/leaked region announces itself as a size outlier.
                 try:
                     _sfs = sorted(p.get("area_sf", 0) for p in polys
-                                  if not p.get("suggest_only") and p.get("area_sf", 0) > 0)
+                                  if not p.get("suggest_only") and not p.get("out_of_scope")
+                                  and p.get("area_sf", 0) > 0)
                     if len(_sfs) >= 4:
                         _med = _sfs[len(_sfs) // 2]
                         _big = _sfs[-1]
@@ -1918,8 +2059,11 @@ def evidence_pdf(jid: str, materials: str = ""):
         pg = out.new_page(width=pw, height=ph)
         pg.insert_image(pg.rect, stream=pix.tobytes("jpg", jpg_quality=80))  # JPEG → colored sheets shrink hugely
         for p in page_polys:
-            if p.get("suggest_only"):
-                continue      # unaccepted AI suggestions never appear on the evidence PDF
+            if p.get("suggest_only") or p.get("out_of_scope"):
+                continue      # unaccepted AI suggestions never appear on the evidence PDF,
+                              # and neither does a group she parked as out of scope (its
+                              # zones already left `zones`, so the cover/detail tables above
+                              # drop it too — the receipt shows the bid, not the building)
             col = p.get("fill_color") or [0.85, 0.1, 0.1]
             col = tuple(float(c) for c in col[:3])
             pts = [(float(x) * pw, float(y) * ph) for x, y in (p.get("points") or [])]
@@ -1958,7 +2102,12 @@ def accept_suggestion(payload: dict = Body(...)):
     # and only on the pages the estimator interacted with. Keyed the same way, from the same
     # tag the analyze path already wrote onto each polygon.
     from collections import defaultdict as _dd
-    _live9 = [p for p in polys if not p.get("suggest_only")]
+    # ⚠ SCOPE GATE + THE MIRROR: this handler REPLACES the page's zones wholesale, so a
+    # parked group would be resurrected into the totals by the first suggestion she
+    # accepts on that page — visible only on the pages she touched, which is the exact
+    # failure mode this block's own header warns about. Parked pieces are excluded here
+    # for the same reason suggestions are; their zones stay in `parkedZones` untouched.
+    _live9 = [p for p in polys if not p.get("suggest_only") and not p.get("out_of_scope")]
     _grouped9 = bool(_mc is not None and any(p.get("material_group") for p in _live9))
     if _grouped9 and _mc is not None:
         try:                      # the accepted region is new — it has no group tag yet
@@ -2010,6 +2159,64 @@ def accept_suggestion(payload: dict = Body(...)):
     except Exception:
         pass
     return {"ok": True, "zones": zones, "accepted_sf": hit.get("area_sf")}
+
+@app.get("/scope/{jid}")
+def scope_get(jid: str):
+    """THE SCOPE GATE, read side: every material group this job found, with its SF,
+    the pages it lives on, and whether it is ticked into THIS bid.
+
+    Pure read — it books nothing, changes nothing and cannot fail a takeoff. With no
+    ticklist set every group answers `inScope: true`, which is the identity state.
+    """
+    j = get_job(jid)
+    if not j:
+        raise HTTPException(404, "job not found")
+    return dict(_scope_summary(j), jobId=jid, scopeMap=(j.get("scopeMap") or {}),
+                note=("Untick what another trade is bidding. Unticked groups leave the "
+                      "totals, the Excel and the evidence PDF but stay on the drawing, "
+                      "parked and one-click restorable — nothing is ever deleted."))
+
+
+@app.post("/set-scope")
+def set_scope(payload: dict = Body(...)):
+    """THE SCOPE GATE, write side — the 30-second human input that replaces six dead
+    autonomous levers (PERFECT_ACCURACY_BLUEPRINT STEP 1).
+
+    payload: {jobId, groups:{name: bool}}         explicit ticks (the panel sends this)
+             {jobId, outOfScope:[name,...]}       park these
+             {jobId, inScope:[name,...]}          restore these
+             {jobId, reset:true}                  clear the ticklist -> back to identity
+
+    Persistence follows /accept-suggestion exactly: mutate the dict `get_job` handed
+    back (which IS `jobs[jid]` — get_job rehydrates into the hot cache), then
+    `_persist_job`. `scopeMap` is in that function's whitelist, without which the
+    ticklist would evaporate on the next eviction.
+
+    Returns the fresh takeoffData so the panel updates the job total in one round trip.
+    """
+    jid = payload.get("jobId")
+    j = get_job(jid)
+    if not j:
+        raise HTTPException(404, "job not found")
+    smap = {} if payload.get("reset") else dict(j.get("scopeMap") or {})
+    if isinstance(payload.get("groups"), dict):
+        for k, v in payload["groups"].items():
+            smap[str(k)] = bool(v)
+    for k in (payload.get("outOfScope") or []):
+        smap[str(k)] = False
+    for k in (payload.get("inScope") or []):
+        smap[str(k)] = True
+    j["scopeMap"] = smap
+    n_park, n_back = _apply_scope(j, smap)
+    jobs[jid] = j
+    try:
+        _persist_job(jid)
+    except Exception:
+        pass
+    return dict(_scope_summary(j), ok=True, jobId=jid, scopeMap=smap,
+                zonesParked=n_park, zonesRestored=n_back,
+                takeoffData=j.get("takeoffData") or [])
+
 
 @app.get("/review-queue/{jid}")
 def review_queue(jid: str):
