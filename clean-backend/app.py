@@ -1143,6 +1143,59 @@ def process(jid, pdf_bytes):
                                       f"{len(tpolys)} region(s) / {_ss_sf:,.0f} SF excluded from the takeoff", "warn")
                             tpolys = []
                             page_is_elev = False   # also suppresses the raster-page AI suggestions below
+                        elif _ss_val >= SITE_SCALE_FT_PER_IN:
+                            # ---- GUARD SYMMETRY (2026-08-17) --------------------------------
+                            # The branch above demands a CONFIRMED reading before it will act.
+                            # `texture.py:239` demands nothing: `ft_per_in = sc` BOOKS the page
+                            # at whatever that same call returned, confirmed or not. So the
+                            # engine books on an unconfirmed site scale and only excludes on a
+                            # confirmed one — measured on 26-232 p4, which prints 1"=400' (a
+                            # civil sheet: "...WHERE NEW PAVEMENT MEETS EXISTING PAVEMENT..."),
+                            # reads 400 UNCONFIRMED, clears the cut by 4x, and books 2.8-4.25M
+                            # SF — 91% of that job's off-page total (w3c_guard_census.json).
+                            #
+                            # DEMOTE, NEVER DELETE. The branch above may delete because a
+                            # CONFIRMED coarse read is positive evidence about the sheet. An
+                            # unconfirmed one is an ABSENCE of evidence, and the 08-04 scale
+                            # patch is the standing lesson about acting on those: it withheld
+                            # 42.2% of gold SF and dropped the frozen exam 140 -> 107. So these
+                            # regions stay in the payload as suggest_only — out of zones,
+                            # totals, Excel and evidence, still drawn, one click from real
+                            # through /accept-suggestion (they are stamped with an id at :1209
+                            # like every other piece, so the index and the accept path both
+                            # reach them). Nothing is asserted and nothing is destroyed.
+                            #
+                            # SHIP CONDITION, MEASURED BEFORE THE EDIT (w3c_guard_census.py,
+                            # cross-checked 372/372 against r7x_scale_census): ZERO of the 372
+                            # gold pages in the 122-job pin read >= this cut unconfirmed — the
+                            # coarsest unconfirmed page carrying gold anywhere is 26.8 ft/in,
+                            # 3.7x below it. So this cannot park a wall she marked. The battery
+                            # fixtures are not in that pin and were censused separately
+                            # (w4_guard_pregate_fixtures.json, 10/10): neither has a page that
+                            # qualifies, so a moved battery pin here means this did something
+                            # it was not asked to do.
+                            #
+                            # `material` is deliberately NOT renamed to the suggestion tier's
+                            # label: she needs to see WHAT the engine thinks it found to judge
+                            # it, and an accepted piece must keep the reader class it was
+                            # stamped with at :993. `page_is_elev` is left alone too — the
+                            # suggestion probe below already ran on this page today, and this
+                            # is one change: booked -> suggested.
+                            _ss_sf = sum(float(p.get("area_sf") or 0) for p in tpolys)
+                            for _p9 in tpolys:
+                                _p9["suggest_only"] = True
+                                _p9["site_scale_demoted"] = True
+                            site_scale_flags.append(
+                                f"⚠ SITE/CIVIL SCALE, UNCONFIRMED — this page reads 1\"={_ss_val:g}', a "
+                                f"site scale rather than a wall elevation (an elevation is 1/8\"=1'-0\" "
+                                f"= 8 ft/in), but the reading is NOT confirmed by a printed note. "
+                                f"{len(tpolys)} auto-read region(s) totalling {_ss_sf:,.0f} SF are SHOWN "
+                                f"AS SUGGESTIONS instead of being counted: at this scale the reader "
+                                f"would be measuring LAND, not cladding. If this really is a wall "
+                                f"elevation, calibrate the page — or accept the regions individually.")
+                            jlog(job, f"Page {pi+1}: 1\"={_ss_val:g}' is a site/civil scale and UNCONFIRMED — "
+                                      f"{len(tpolys)} region(s) / {_ss_sf:,.0f} SF demoted to suggestions "
+                                      f"(not counted in the takeoff, one click from real)", "warn")
                     if tpolys:
                         try:  # read the architect's own labels: callout text + leader arrows -> region names
                             n_named = callouts.name_regions(pdf_bytes, pi, tpolys, pw, ph)
