@@ -54,6 +54,8 @@ from fastapi.middleware.cors import CORSMiddleware
 
 # Where corrections accumulate as training data (mount a Railway volume here to persist).
 CORR_DIR = os.environ.get("CORRECTIONS_DIR", "/data/corrections")
+MATERIAL_LEDGER = os.environ.get("MATERIAL_LEDGER",
+                                 os.path.join(os.path.dirname(CORR_DIR), "material_name_ledger.jsonl"))
 # Durable job store — jobs are also written here so takeoffs survive a restart/redeploy.
 JOBS_DIR = os.environ.get("JOBS_DIR", "/data/jobs")
 MAX_MEM_JOBS = int(os.environ.get("MAX_MEM_JOBS", "20"))   # cap RAM: never OOM (evicted jobs live on disk)
@@ -178,7 +180,8 @@ def _persist_job(jid):
         # an hour of confirmation, or worse, the bid silently reverts to the gross.
         meta = {k: job.get(k) for k in ("status", "phase", "progress", "legend", "takeoffData",
                 "scheduleData", "error", "polygons_by_page", "dims_by_page", "log", "projName", "pageCount",
-                "coverageReport", "openingsConvention", "scopeMap", "reviewConfirmed", "netOverrides")}
+                "coverageReport", "openingsConvention", "scopeMap", "reviewConfirmed", "netOverrides",
+                "materialNameMap")}
         with open(os.path.join(d, "job.json"), "w", encoding="utf-8") as fh:
             json.dump(meta, fh)
     except Exception:
@@ -511,6 +514,103 @@ def _apply_nets(j):
             z["netOverrideAt"] = rec.get("ts")
             n += 1
     return n
+
+
+def _disp_name(z):
+    """The label to SHOW for a zone: her confirmed material name when she has given
+    the group one, else the machine's own. DISPLAY/EXPORT ONLY -- it reads the
+    optional `materialNameHer` field and NOTHING else, so it is never an input to a
+    scope, net or review KEY (those stay on the material_group stamp). With no name
+    given it returns exactly `materialName`, so every export is byte-identical."""
+    return z.get("materialNameHer") or z.get("materialName")
+
+
+def _apply_material_names(j):
+    """THE NAMING BRIDGE, apply side (the sibling of `_apply_nets`). Write her
+    confirmed material NAME onto every zone whose group she named; strip it from
+    every zone she did not. Returns the number of names applied.
+
+    DISPLAY ONLY: sets `materialNameHer`, the field `_disp_name` prefers, and never
+    touches materialName / material_group / material_type / netArea -- so not one SF
+    moves and no scope, net or review KEY drifts. Keyed on the material_group STAMP
+    (`_scope_group_of_zone`, the identity the scope gate and `_apply_nets` share) and
+    written ONLY on zones that carry that stamp, so the write can never drift the key
+    it was looked up under -- the exact trap that reverted the fill demotion.
+
+    IDENTITY BY DEFAULT: an empty `materialNameMap` names nothing and removes any
+    stale label a prior map left, so a job nobody named is byte-identical to today's.
+    """
+    nm = j.get("materialNameMap") or {}
+    n = 0
+    for el in (j.get("takeoffData") or []):
+        for z in (list(el.get("zones") or []) + list(el.get("parkedZones") or [])):
+            name = nm.get(_scope_group_of_zone(z)) if z.get("material_group") else None
+            if name:
+                z["materialNameHer"] = str(name)
+                n += 1
+            elif "materialNameHer" in z:
+                z.pop("materialNameHer", None)
+    return n
+
+
+def _materials_summary(j):
+    """GET /materials payload: every material group with its SF, pages, her current
+    name and an is_unnamed flag for the generic / no-identity groups the drawing gave
+    no name to (mat_canon classes 'generic'/'junk') -- the '[name it]' rows that are
+    the flywheel's entry. Pure read; books nothing."""
+    nm = j.get("materialNameMap") or {}
+    rows = {}
+    for el in (j.get("takeoffData") or []):
+        pn = el.get("pageNumber")
+        for z, parked in ([(z, False) for z in (el.get("zones") or [])] +
+                          [(z, True) for z in (el.get("parkedZones") or [])]):
+            g = _scope_group_of_zone(z)
+            cls = z.get("material_class")
+            no_identity = cls in ("generic", "junk")     # reuse mat_canon's classes
+            r = rows.setdefault(g, {"group": g, "machineName": g,
+                                    "name": nm.get(g) or g, "herName": nm.get(g),
+                                    "isNamed": g in nm, "noIdentity": no_identity,
+                                    "isUnnamed": no_identity and g not in nm,
+                                    "sf": 0.0, "zones": 0, "pages": [],
+                                    "category": z.get("category"), "family": z.get("family"),
+                                    "reader": z.get("reader"), "readerClass": z.get("readerClass"),
+                                    "readAs": z.get("readAs"), "materialClass": cls,
+                                    "parked": False})
+            r["sf"] += float(z.get("netArea") or 0)
+            r["zones"] += 1
+            r["parked"] = r["parked"] or parked
+            if pn and pn not in r["pages"]:
+                r["pages"].append(pn)
+    out = sorted(rows.values(), key=lambda r: -r["sf"])
+    for r in out:
+        r["sf"] = round(r["sf"], 1)
+        r["pages"] = sorted(r["pages"])
+    return {"groups": out,
+            "unnamedSF": round(sum(r["sf"] for r in out if r["isUnnamed"]), 1),
+            "namedSF": round(sum(r["sf"] for r in out if r["isNamed"]), 1),
+            "unnamedGroups": [r["group"] for r in out if r["isUnnamed"]]}
+
+
+def _append_material_ledger(j, jid, group, name):
+    """THE FLYWHEEL. Append (practice, job, engine group + how it read + reader class
+    -> her name) to a durable ledger. It is read back as a SUGGESTION on the next job
+    by the same GC/architect -- SHOWN, never auto-applied (FIX_OPENINGS / fill-revert).
+    Best-effort, exactly like `_persist_job`."""
+    rec = {}
+    for el in (j.get("takeoffData") or []):
+        for z in (list(el.get("zones") or []) + list(el.get("parkedZones") or [])):
+            if _scope_group_of_zone(z) == group:
+                rec = z
+                break
+        if rec:
+            break
+    row = {"jobId": jid, "projName": j.get("projName"), "group": group,
+           "readAs": rec.get("readAs"), "readerClass": rec.get("readerClass"),
+           "materialClass": rec.get("material_class"), "name": name,
+           "ts": int(time.time() * 1000)}
+    os.makedirs(os.path.dirname(MATERIAL_LEDGER), exist_ok=True)
+    with open(MATERIAL_LEDGER, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps(row) + "\n")
 
 
 def jlog(job, msg, level="info"):
@@ -1748,7 +1848,8 @@ def status(jid: str):
             # nothing that computes SF, and `netOverrides` is already baked into the
             # `netArea` above by `_apply_nets` (this is the audit trail, not the source).
             "reviewConfirmed": j.get("reviewConfirmed") or {},
-            "netOverrides": j.get("netOverrides") or {}}
+            "netOverrides": j.get("netOverrides") or {},
+            "materialNameMap": j.get("materialNameMap") or {}}
 
 @app.get("/polygons/{jid}/{page}")
 def polygons(jid: str, page: int):
@@ -2159,7 +2260,7 @@ def evidence_pdf(jid: str, materials: str = ""):
     def _match(name, cat):
         return (str(name or "").lower() in sel) or (str(cat or "").lower() in sel)
     # safety: if the selection matches nothing (e.g. renamed groups), mark everything — never a blank PDF
-    if sel is not None and not any(_match(z.get("materialName"), z.get("category"))
+    if sel is not None and not any(_match(_disp_name(z), z.get("category"))
                                    for el in j.get("takeoffData", []) for z in el.get("zones", [])):
         sel = None
     def keep(name, cat):
@@ -2170,9 +2271,9 @@ def evidence_pdf(jid: str, materials: str = ""):
     mats = {}; tot = 0.0
     for el in j.get("takeoffData", []):
         for z in el.get("zones", []):
-            if not keep(z.get("materialName"), z.get("category")):
+            if not keep(_disp_name(z), z.get("category")):
                 continue
-            k = z.get("materialName", "Material"); mats[k] = mats.get(k, 0) + z.get("netArea", 0); tot += z.get("netArea", 0)
+            k = _disp_name(z) or "Material"; mats[k] = mats.get(k, 0) + z.get("netArea", 0); tot += z.get("netArea", 0)
     cov = out.new_page(width=612, height=792)
     cov.insert_text((50, 60), "Boston Facade Systems — Takeoff Evidence", fontsize=17, color=(0.05, 0.11, 0.18))
     cov.insert_text((50, 84), (j.get("projName") or "Project"), fontsize=11, color=(0.4, 0.45, 0.5))
@@ -2217,8 +2318,8 @@ def evidence_pdf(jid: str, materials: str = ""):
     rows = []
     for el in j.get("takeoffData", []):
         for z in el.get("zones", []):
-            if keep(z.get("materialName"), z.get("category")):
-                rows.append((el.get("pageNumber"), str(z.get("materialName") or "Material")[:38],
+            if keep(_disp_name(z), z.get("category")):
+                rows.append((el.get("pageNumber"), str(_disp_name(z) or "Material")[:38],
                              z.get("netArea", 0), _reader_of(z)))
     rows.sort(key=lambda r: -r[2])
     ty = 792
@@ -2359,6 +2460,7 @@ def accept_suggestion(payload: dict = Body(...)):
     # accepting a suggestion silently reverts her confirmed number on that page.
     try:
         _apply_nets(j)
+        _apply_material_names(j)   # keep her name across the page rebuild
     except Exception:
         pass
     try:
@@ -2434,6 +2536,7 @@ def set_scope(payload: dict = Body(...)):
     n_park, n_back = _apply_scope(j, smap)
     try:
         _apply_nets(j)   # a restored group comes back with HER net, not the gross
+        _apply_material_names(j)   # ... and with HER name
     except Exception:
         pass
     jobs[jid] = j
@@ -2443,6 +2546,79 @@ def set_scope(payload: dict = Body(...)):
         pass
     return dict(_scope_summary(j), ok=True, jobId=jid, scopeMap=smap,
                 zonesParked=n_park, zonesRestored=n_back,
+                takeoffData=j.get("takeoffData") or [])
+
+
+@app.get("/materials/{jid}")
+def materials_get(jid: str):
+    """THE NAMING BRIDGE, read side: every material group with its SF, the pages it
+    lives on, the name she has given it (if any) and an is_unnamed flag for the
+    generic / no-identity groups the drawing gave no name to -- the '[name it]' rows.
+
+    Pure read -- it books nothing and cannot fail a takeoff. With no materialNameMap
+    every group answers with the machine's own label, the identity state."""
+    j = get_job(jid)
+    if not j:
+        raise HTTPException(404, "job not found")
+    return dict(_materials_summary(j), jobId=jid,
+                materialNameMap=(j.get("materialNameMap") or {}),
+                note=("Name the 'unnamed cladding' groups the drawing gave no label to -- "
+                      "the engine measured the SF, you give it the product name. A name "
+                      "moves the label on the page, the ledger and the exports; it moves not "
+                      "one SF, and clearing it returns the job byte-identical."))
+
+
+@app.post("/set-material-name")
+def set_material_name(payload: dict = Body(...)):
+    """THE NAMING BRIDGE, write side -- the 1-2 min/job flywheel entry.
+
+    payload: {jobId, group, name}          name this material group
+             {jobId, group, name:null}     clear the name (back to the machine's label)
+             {jobId, reset:true}           clear every name on the job
+
+    `group` is the material_group STAMP -- the same identity the scope gate and
+    /set-net key on (see `_scope_group_of_zone`), never a renameable display string.
+    The name lands ONLY on `materialNameHer`, a display field, so no scope, net or
+    review KEY moves and not one SF changes. Identity by default: an empty map renames
+    nothing and a cleared name removes every field this added, byte-identical to today.
+
+    A confirmed pair also appends to a durable per-practice ledger (the flywheel),
+    which is SHOWN on the next job by the same GC/architect, NEVER auto-applied.
+    Returns fresh takeoffData + the materials summary so the panel updates in one trip.
+    """
+    jid = payload.get("jobId")
+    j = get_job(jid)
+    if not j:
+        raise HTTPException(404, "job not found")
+    nm = {} if payload.get("reset") else dict(j.get("materialNameMap") or {})
+    grp = None
+    if not payload.get("reset"):
+        grp = payload.get("group")
+        if grp is None:
+            raise HTTPException(400, "group required")
+        grp = str(grp)
+        known = {r["group"] for r in _materials_summary(j)["groups"]}
+        if grp not in known:                 # never let an arbitrary key into the map
+            raise HTTPException(404, "unknown material group: %s" % grp[:60])
+        nm_name = payload.get("name")
+        if nm_name is None or str(nm_name).strip() == "":
+            nm.pop(grp, None)
+        else:
+            nm[grp] = str(nm_name).strip()[:80]
+    j["materialNameMap"] = nm
+    napplied = _apply_material_names(j)
+    jobs[jid] = j
+    try:
+        _persist_job(jid)
+    except Exception:
+        pass
+    if grp is not None and nm.get(grp):      # a confirmed pair feeds the flywheel
+        try:
+            _append_material_ledger(j, jid, grp, nm[grp])
+        except Exception:
+            pass
+    return dict(_materials_summary(j), ok=True, jobId=jid, group=grp,
+                materialNameMap=nm, namesApplied=napplied,
                 takeoffData=j.get("takeoffData") or [])
 
 
@@ -2507,6 +2683,7 @@ def review_queue(jid: str):
             pieces.sort(key=lambda q: -(q["sf"] or 0))
             rows.append({"page": pn,
                          "materialName": z.get("materialName"),
+                         "displayName": _disp_name(z),
                          "netArea": z.get("netArea", 0),
                          "zoneKey": _zkey,
                          "grossArea": z.get("grossArea"),
