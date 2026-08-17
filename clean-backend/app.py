@@ -77,6 +77,15 @@ MAX_AUTO_PAGES = int(os.environ.get("MAX_AUTO_PAGES", "30"))  # cap texture auto
 # bfs_overnight/ENGSCALE_EXPOSURE.json carries the same table at 17/20/32/64/100/400,
 # and 20 is NOT usable — it takes a gold page (26-234 p5) and four frozen-exam jobs.
 SITE_SCALE_FT_PER_IN = float(os.environ.get("SITE_SCALE_FT_PER_IN", "100"))
+# BLIND-BAND cut (WAVE 5 Item 2, 2026-08-17): a CONFIRMED site/civil sheet drawn coarser
+# than any elevation but below the 100 ft/in site cut (e.g. an architectural SITE PLAN at
+# 1"=30') slips under SITE_SCALE_FT_PER_IN and books phantom SF — measuring parking lots
+# and courtyards as cladding. 24 ft/in sits ABOVE the coarsest CONFIRMED gold scale in the
+# corpus (21.33 ft/in; r7x: 0 of 372 gold pages read >= 22 confirmed), so demoting on it can
+# never touch a wall she marked. The scale alone does NOT demote — the page must ALSO name
+# itself a site/civil sheet AND carry no wall-material keynote (_is_site_civil_sheet), so a
+# real large-building elevation drawn coarse is never demoted.
+SITE_BLINDBAND_FT_PER_IN = float(os.environ.get("SITE_BLINDBAND_FT_PER_IN", "24"))
 
 app = FastAPI(title="BFS Clean Backend")
 # CORS: browsers may only call this API from the app's own origins (the Vercel prod
@@ -778,6 +787,33 @@ def _titleblock_fallback(pg, t):
         return False
 
 
+_SITE_SHEET_PHRASES = ("SITE PLAN", "LANDSCAPE PLAN", "GRADING PLAN", "UTILITY PLAN",
+                       "PAVING PLAN", "DRAINAGE PLAN", "EROSION CONTROL", "LIMIT OF WORK",
+                       "PLANTING PLAN", "CIVIL SITE")
+_WALL_MATERIAL_TOKENS = ("SIDING", "BRICK", "MASON", "EIFS", "STUCCO", "METAL PANEL",
+                         "MTL PANEL", "FIBER CEMENT", "HARDIE", "NICHIHA", "CMU", "VENEER",
+                         "CURTAIN WALL", "STOREFRONT", "SPANDREL", "CLADDING", "WALL TYPE",
+                         "MATERIAL LEGEND", "MATERIAL SCHEDULE", "ALUCOBOND", "CLAPBOARD",
+                         "SHINGLE", "SHAKE", "PRECAST")
+
+
+def _is_site_civil_sheet(text):
+    """True ONLY for an unambiguous site/civil sheet: it names itself a site / landscape /
+    grading / utility / paving plan AND carries no wall-material keynote. Used to DEMOTE
+    (never delete) a CONFIRMED coarse-scale page (>= SITE_BLINDBAND_FT_PER_IN, above every
+    gold scale) to suggest_only on the AUTO path. Conservative by construction: a real wall
+    elevation drawn coarse still carries material keynotes (fails clause 2); a sheet that does
+    not name itself a site plan fails clause 1. Validated on the 5 admitted blind-band pages
+    (demotes only the two Avalon site plans 26-063 p56/p57) and 30 gold pages (0 fired).
+    """
+    u = (text or "").upper()
+    if not any(ph in u for ph in _SITE_SHEET_PHRASES):
+        return False
+    if any(tok in u for tok in _WALL_MATERIAL_TOKENS):
+        return False
+    return True
+
+
 def is_elevation_page(pg, ocr_fallback=True):
     """Auto-crop to the pages the estimator actually measures = elevations, returns, soffits.
     v2 (cold-run audit 2026-07-24: v1 text-only test found ALL gold pages on just 19/88
@@ -1221,6 +1257,36 @@ def process(jid, pdf_bytes):
                                 f"would be measuring LAND, not cladding. If this really is a wall "
                                 f"elevation, calibrate the page — or accept the regions individually.")
                             jlog(job, f"Page {pi+1}: 1\"={_ss_val:g}' is a site/civil scale and UNCONFIRMED — "
+                                      f"{len(tpolys)} region(s) / {_ss_sf:,.0f} SF demoted to suggestions "
+                                      f"(not counted in the takeoff, one click from real)", "warn")
+                        elif (bool(sinfo.get("scale_confirmed"))
+                              and SITE_BLINDBAND_FT_PER_IN <= _ss_val < SITE_SCALE_FT_PER_IN
+                              and _is_site_civil_sheet(pg.get_text() or "")):
+                            # ---- BLIND-BAND SITE/CIVIL SHEET (WAVE 5 Item 2, 2026-08-17) ------
+                            # A CONFIRMED scale coarser than any elevation but under the 100 cut
+                            # (e.g. an architectural SITE PLAN at 1"=30') passes both guards above
+                            # and books phantom SF — measuring parking, courtyards and paving as
+                            # cladding. Only demote when the page ALSO names itself a site/civil
+                            # sheet AND carries no wall-material keynote (_is_site_civil_sheet), so
+                            # a real large-building elevation drawn coarse is never touched. The cut
+                            # (24 ft/in) is above the coarsest CONFIRMED gold scale (21.33; 0 of 372
+                            # gold pages read >= 22 confirmed — r7x), so this can never park a wall
+                            # she marked. DEMOTE, NEVER DELETE — same policy as the unconfirmed
+                            # branch: out of zones/totals/Excel/evidence, still drawn, one click
+                            # from real through /accept-suggestion.
+                            _ss_sf = sum(float(p.get("area_sf") or 0) for p in tpolys)
+                            for _p9 in tpolys:
+                                _p9["suggest_only"] = True
+                                _p9["site_scale_demoted"] = True
+                            site_scale_flags.append(
+                                f"⚠ SITE/CIVIL SHEET — this page reads a CONFIRMED 1\"={_ss_val:g}', "
+                                f"coarser than any wall elevation, and its text names a site/civil "
+                                f"plan with no wall-material callout. {len(tpolys)} auto-read "
+                                f"region(s) totalling {_ss_sf:,.0f} SF are SHOWN AS SUGGESTIONS "
+                                f"instead of being counted: at this scale the reader would be "
+                                f"measuring LAND, not cladding. If this really is a wall elevation, "
+                                f"calibrate the page — or accept the regions individually.")
+                            jlog(job, f"Page {pi+1}: 1\"={_ss_val:g}' CONFIRMED site/civil sheet (blind band) — "
                                       f"{len(tpolys)} region(s) / {_ss_sf:,.0f} SF demoted to suggestions "
                                       f"(not counted in the takeoff, one click from real)", "warn")
                     if tpolys:
