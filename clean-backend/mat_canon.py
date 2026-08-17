@@ -217,3 +217,104 @@ def material_group(material, fill_color=None, color_name_map=None):
         if qc is not None:
             return ("Color: %s" % (qc,), "code")   # its own real-color swatch group
     return (g, cls)
+
+
+# ── CANONICAL MATERIAL FAMILY TABLE (WAVE 4 ITEM 5) ──────────────────────────
+# The material FAMILIES her practice actually uses (w3_families / w3_wave3_findings) -- the
+# target namespace for the naming bridge. `family_of(name)` collapses an engine group OR one
+# of her subjects to a family, so a delivered group and her differently-spelled group can be
+# compared as the SAME material without a per-name synonym. PURE: it never touches area_sf
+# (mat_canon_selftest's SF-invariance covers the module) and canon() never calls it -- it is
+# a display / measurement helper, additive by construction.
+#
+# ⚠ family_of is a FAMILY guess, not a per-job NAME decode. A code that carries a material
+# signal (FC-1 -> fiber cement) maps to its FAMILY -- that is 'fiber cement' answered blind,
+# the signal FIX_NAMING_COVERAGE measured ~70 points ABOVE a legend decode. A SIGNAL-FREE code
+# (EX-6B, MS-1) returns the '(bare legend code - needs job legend)' bucket and is never decoded
+# here -- decoding it to a specific product is the killed 19.5%-correct legend tier.
+_FAM_TABLE = [
+    ("Fiber cement - lap/plank/siding",
+     r"(FIBER\s*CEMENT|FIBRE\s*CEMENT|HARDIE|\bFCS?\b|\bFC\b|\bFCP\b|\bFCL\b|CEMENTITIOUS|CEMENT\s*BOARD)"
+     r".*(LAP|PLANK|SIDING|CLAPBOARD)|(LAP|PLANK).*(FIBER\s*CEMENT|HARDIE|\bFC\b)"),
+    ("Fiber cement - board & batten",
+     r"(BOARD\s*(AND|&|N)?\s*BATTEN).*(FC|FIBER\s*CEMENT|CEMENT)|(FC|FIBER\s*CEMENT).*(BOARD\s*(AND|&)?\s*BATTEN)"),
+    ("Fiber cement - shingle/shake", r"(FIBER\s*CEMENT|HARDIE|\bFC\b).*(SHINGLE|SHAKE)"),
+    ("Fiber cement - panel",
+     r"(FIBER\s*CEMENT|FIBRE\s*CEMENT|HARDIE|CEMENTITIOUS|\bFCP\b|\bFC\b|\bFCS\b).*(PANEL|SHEET|REVEAL)"
+     r"|(PANEL).*(FIBER\s*CEMENT|CEMENTITIOUS)"),
+    ("Fiber cement - soffit", r"(FIBER\s*CEMENT|\bFC\b|HARDIE).*(SOFFIT)|SOFFIT.*(FIBER\s*CEMENT|\bFC\b)"),
+    ("Fiber cement - unspecified",
+     r"(FIBER\s*CEMENT|FIBRE\s*CEMENT|HARDIE|CEMENTITIOUS|\bFCP?\d*\b|\bFCS\d*\b|\bFCL\d*\b|\bFRC\b|\bJH\b)"),
+    ("ACM / composite metal panel", r"(\bACM\b|\bMCM\b|ALUCOBOND|\bACP\b|COMPOSITE.*METAL|METAL.*COMPOSITE|EQUITONE)"),
+    ("Insulated metal panel (IMP)", r"(\bIMP\b|INSULATED\s*METAL|METAL\s*SANDWICH|SANDWICH\s*PANEL)"),
+    ("Metal panel - corrugated/rib", r"(CORRUGAT|RIBBED|\bRIB\b|STANDING\s*SEAM|\bSSMP\b)"),
+    ("Metal panel - flat/other", r"(METAL\s*(WALL\s*)?PANEL|PANEL.*METAL|\bMP[-_ ]?\d|\bMTL\b|METAL\s*SIDING|COPPER|ZINC)"),
+    ("Metal soffit / GSM / flashing", r"(\bGSM\b|GUTTER|DOWNSPOUT|FASCIA|COPING|FLASHING|METAL\s*SOFFIT)"),
+    ("Wood / cedar siding", r"(CEDAR|\bWOOD\b|\bWD\b|TIMBER|\bIPE\b|THERMORY|SHIPLAP)"),
+    ("Vinyl siding", r"(VINYL|\bPVC\b|AZEK)"),
+    ("Brick / masonry", r"(BRICK|MASON|\bCMU\b|BLOCK|STONE|CAST\s*STONE|PRECAST|TERRACOTTA|TERRA\s*COTTA)"),
+    ("EIFS / stucco", r"(\bEIFS\b|STUCCO|PLASTER|RENDER)"),
+    ("Roofing / membrane", r"(ROOF|MEMBRANE|\bTPO\b|\bEPDM\b|SINGLE\s*PLY|SHINGLE)"),
+    ("Insulation / sheathing / WRB", r"(INSULAT|SHEATH|\bWRB\b|AIR\s*BARRIER|VAPOR|ZIP|DENSGLASS|GYP)"),
+    ("Trim / frieze / band", r"(\bTRIM\b|FRIEZE|\bBAND\b|CORNER\s*BOARD|\bTR[-_ ]?\d|REVEAL\s*TRIM)"),
+    ("Soffit / ceiling (other)", r"(SOFFIT|CANOPY|\bACT\b|CEILING)"),
+    ("Glass / curtain wall / storefront", r"(GLASS|GLAZ|CURTAIN\s*WALL|STOREFRONT|\bCW\b|WINDOW|SPANDREL)"),
+    ("Louver / screen / misc", r"(LOUVER|SCREEN|GRILLE|RAILING|GUARD)"),
+    # last resort WITHIN the real families: a bare lap/siding/panel word with no material
+    # qualifier -- kept last so a qualified name (fiber cement lap) never lands here.
+    ("Lap siding - unqualified", r"(\bLAP\b|CLAPBOARD|\bSIDING\b)"),
+    ("Panel - unqualified", r"(\bPANEL|\bPNL\b|\bPNLS\b)"),
+]
+_FAM_TABLE = [(_n, re.compile(_p)) for _n, _p in _FAM_TABLE]
+_FAM_BARE_CODE = re.compile(r"^[A-Z]{1,6}[-\s._]?\d{1,3}[A-Z]?$")
+_FAM_NUMERIC = re.compile(r"^\d+(\.\d+)?$")
+_FAM_STREETISH = re.compile(r"\b(ST|STREET|AVE|AVENUE|RD|ROAD|BLDG|BUILDING|BASEMENT|LEVEL|FLOOR|NORTH|SOUTH|EAST|WEST)\b")
+
+
+def family_of(name):
+    """Collapse an engine group or one of her subjects to a canonical material family, or a
+    non-material bucket. PURE name->family; never touches SF. First match wins."""
+    u = re.sub(r"\s+", " ", (name or "")).strip().upper()
+    if not u:
+        return "(blank)"
+    if _FAM_NUMERIC.match(u):
+        return "(bare number - no material)"
+    for _fname, _rx in _FAM_TABLE:
+        if _rx.search(u):
+            return _fname
+    if _FAM_BARE_CODE.match(u):
+        return "(bare legend code - needs job legend)"
+    if _FAM_STREETISH.search(u) or len(u) <= 3:
+        return "(location/other - not a material)"
+    return "(unmapped word name)"
+
+
+# ── CONFIRMED-PAIR SYNONYM LEDGER + N-JOB PROMOTION (WAVE 4 ITEM 5) ───────────
+# app.py's /set-material-name appends every confirmed (engine group -> her name) pair to a
+# durable ledger (the flywheel). A pair may enter the GLOBAL synonym table ONLY after it has
+# been confirmed on N INDEPENDENT jobs -- an early promotion is the killed 19.5%-correct legend
+# tier wearing a different hat. Until then a pair is SHOWN as a suggestion, NEVER applied
+# (FIX_OPENINGS / the fill revert). So the global table starts EMPTY and grows only by evidence.
+N_CONFIRM = 3                 # independent jobs a pair needs before it may promote
+SYNONYM_TABLE = {}            # {engine_group: (her_name, family)} -- EMPTY by default, never auto-filled
+
+
+def promote_confirmed_pairs(ledger_rows, n_min=N_CONFIRM):
+    """The pairs a durable material-name ledger has EARNED: (engine group -> her name)
+    confirmed on >= n_min INDEPENDENT jobs. SUGGESTION ONLY -- this returns rows for the
+    caller to SHOW; it mutates neither canon() nor SYNONYM_TABLE. `ledger_rows` are the dicts
+    app.py._append_material_ledger writes ({group, name, jobId, ...})."""
+    import collections
+    seen = collections.defaultdict(lambda: collections.defaultdict(set))
+    for r in (ledger_rows or []):
+        grp, name, job = r.get("group"), r.get("name"), r.get("jobId")
+        if not grp or not name or job is None:
+            continue
+        seen[str(grp)][str(name).strip()].add(str(job))
+    out = []
+    for grp, names in seen.items():
+        for nm, jobs in names.items():
+            if len(jobs) >= n_min:
+                out.append({"engine_group": grp, "her_name": nm, "n_jobs": len(jobs),
+                            "family": family_of(grp)})
+    return sorted(out, key=lambda d: -d["n_jobs"])
