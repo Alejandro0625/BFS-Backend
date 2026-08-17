@@ -31,6 +31,12 @@ JUNK_WORDS = {
     "SLABS", "HDU-4", "ANNUNCIATOR PANEL", "FINISHED END PANEL", "PANEL EDGE NAILING",
     "ANNUNCIATOR", "FIRE RATING (MINS.) PANEL TYPE",
     "FLUSH MOUNTED EMERGENCY CALL BOX AND INSTRUCTION PANEL",
+    # single-word legend-HEADER fragments the OCR lifts off a legend block as
+    # separate "materials" (26-216: COLOR/FIBER/METAL/PANEL/FINISH = one header row;
+    # at practice scale ANGLE/MAIN/LIGHT). One bare word is never a cladding identity,
+    # so fold to Unclassified. Multi-word real names ("Metal panel", "Fiber cement
+    # panel") are untouched -- only the EXACT single token matches this set.
+    "COLOR", "FIBER", "METAL", "PANEL", "FINISH", "ANGLE", "MAIN", "LIGHT", "TYPE",
 }
 
 UNCLASSIFIED = "Unclassified — confirm"
