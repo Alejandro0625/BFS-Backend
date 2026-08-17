@@ -9,7 +9,7 @@ Matches the existing React frontend contract:
   GET  /page-image/{jobId}/{page} -> PNG
   GET  /health
 """
-import os, io, re, uuid, threading, json, time, shutil
+import os, io, re, uuid, threading, json, time, shutil, hashlib
 from collections import defaultdict
 import fitz  # PyMuPDF
 import texture  # classical-CV texture fallback for unmarked drawings
@@ -1057,10 +1057,37 @@ def process(jid, pdf_bytes):
         if not text_reliable and n > 1:
             jlog(job, f"Drawing text not extractable ({text_pages}/{n} pages with text) — scanning every page for cladding", "warn")
         auto_tried = 0; auto_hits = 0
+        # DUPLICATE-PAGE DEDUP (WAVE 5 Item 1, 2026-08-17). Some issued sets bind the same
+        # physical sheet 2+ times (byte-identical /Contents stream — e.g. 26-171 p28==p16,
+        # p30==p25; census w5_overdraw_census.json: 21 of 122 jobs, 58 elevation-ish extras).
+        # On the AUTO path each copy auto-books the SAME SF independently = double-count. A
+        # byte-identical page IS the same sheet, so the first occurrence is read normally and
+        # every later copy contributes 0 new SF. The key is the FULL content-stream md5 —
+        # identical to w5_overdraw_census.py:215, md5(page.read_contents()) — a FULL byte
+        # match, never a near-match, and the FIRST occurrence is never skipped. GATED to the
+        # AUTO path (`not doc_has_markup`): on the digitize/marked path SF comes from the
+        # estimator's OWN annotations, not the /Contents, so two pages with identical /Contents
+        # but different markup are legitimately different takeoffs and must never be deduped.
+        _seen_page_content = {}   # content_md5 -> first 1-based page booked on it
         for pi in range(n):
             job["progress"] = {"label": f"Reading page {pi+1} of {n}", "pct": 5 + int(90 * pi / max(n, 1))}
             job["phase"] = "analyzing"
             pg = doc[pi]; pw, ph = pg.rect.width, pg.rect.height
+            if not doc_has_markup:   # dedup only where booking is driven by /Contents (AUTO path)
+                try:
+                    _cmd5 = hashlib.md5(pg.read_contents()).hexdigest()
+                except Exception:
+                    _cmd5 = None
+                if _cmd5 is not None:
+                    _first_pg = _seen_page_content.get(_cmd5)
+                    if _first_pg is not None:
+                        # exact duplicate of an already-booked sheet -> 0 new SF
+                        jlog(job, f"Page {pi+1}: duplicate of page {_first_pg} (identical "
+                                  f"content) — skipped, contributes 0 SF", "info")
+                        job["polygons_by_page"][pi + 1] = []
+                        job["dims_by_page"][pi + 1] = {"width": pw, "height": ph}
+                        continue
+                    _seen_page_content[_cmd5] = pi + 1
             ft = 8.0  # scale fallback; digitize SF comes from the markup's own labels
             polys = extract_page_polygons(pg, pw, ph, ft)
             lin_sf_polys, lin_lf_items = extract_page_polylines(pg, pw, ph)  # estimator's linear measurements
