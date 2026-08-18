@@ -224,7 +224,7 @@ def _persist_job(jid):
         meta = {k: job.get(k) for k in ("status", "phase", "progress", "legend", "takeoffData",
                 "scheduleData", "error", "polygons_by_page", "dims_by_page", "log", "projName", "pageCount",
                 "coverageReport", "openingsConvention", "scopeMap", "reviewConfirmed", "netOverrides",
-                "materialNameMap")}
+                "materialNameMap", "pageScopeMap")}
         with open(os.path.join(d, "job.json"), "w", encoding="utf-8") as fh:
             json.dump(meta, fh)
     except Exception:
@@ -453,8 +453,12 @@ def _scope_summary(j):
             "parkedGroups": [r["name"] for r in out if not r["inScope"]]}
 
 
-def _apply_scope(j, smap):
-    """Park every group she unticked; restore every group she re-ticked.
+def _apply_scope(j, smap, psmap=None):
+    """Park every group she unticked; restore every group she re-ticked. A zone is
+    IN scope only when its material group is ticked AND its page is ticked — one
+    shared `out_of_scope` flag, two reasons (material-scope `smap` OR page-scope
+    `psmap`). A zone parked for either reason only restores when BOTH the group and
+    the page are back in scope — correct by the AND below.
 
     Zones MOVE as whole objects between `zones` and `parkedZones` — never rebuilt —
     and each parked zone remembers the index it left, so a restore puts it back
@@ -462,15 +466,20 @@ def _apply_scope(j, smap):
     the evidence PDF can skip them (the parallel of the suggest_only exclusion at
     :1921). Returns (zones parked, zones restored).
 
-    An empty `smap` parks nothing and restores nothing: the identity path.
+    `psmap` is `{ "<pageNumber>": bool }` — an absent page defaults IN scope, exactly
+    like an absent group in `smap`. An empty `smap` AND empty/absent `psmap` parks
+    nothing and restores nothing: the identity path (both `.get(..., True)` calls
+    return the True default for every zone, so this is byte-identical to today).
     """
     n_park = n_back = 0
     for el in (j.get("takeoffData") or []):
+        _pg9 = str(el.get("pageNumber"))
+        _page_in = (psmap or {}).get(_pg9, True)
         zones = list(el.get("zones") or [])
         parked = list(el.get("parkedZones") or [])
         keep = []
         for i, z in enumerate(zones):
-            if smap.get(_scope_group_of_zone(z), True):
+            if smap.get(_scope_group_of_zone(z), True) and _page_in:
                 keep.append(z)
             else:
                 z["out_of_scope"] = True
@@ -478,7 +487,7 @@ def _apply_scope(j, smap):
                 parked.append(z); n_park += 1
         still, back = [], []
         for z in parked:
-            if smap.get(_scope_group_of_zone(z), True):
+            if smap.get(_scope_group_of_zone(z), True) and _page_in:
                 z.pop("out_of_scope", None)
                 back.append((int(z.pop("_scopeIdx", len(keep)) or 0), z)); n_back += 1
             else:
@@ -489,12 +498,52 @@ def _apply_scope(j, smap):
         if still or parked:          # never ADD the key to a page nobody parked on
             el["parkedZones"] = still
     for _pg, polys in (j.get("polygons_by_page") or {}).items():
+        _ppage_in = (psmap or {}).get(str(_pg), True)
         for p in (polys or []):
-            if smap.get(_scope_group_of_poly(p), True):
+            if smap.get(_scope_group_of_poly(p), True) and _ppage_in:
                 p.pop("out_of_scope", None)
             else:
                 p["out_of_scope"] = True
     return n_park, n_back
+
+
+def _page_scope_summary(j):
+    """THE PAGE-SCOPE GATE, read side — one row per takeoff page with its detected SF,
+    sheet ref, engine flags and its page tick. `pageScopeMap` is the single source of
+    truth for the tick; the zones only follow it (parked pages MOVE their zones to
+    `parkedZones`, exactly like the material-scope gate, so every total/export drops
+    them for free). `detectedSF` sums zones+parkedZones so it is STABLE whether the
+    page is in or out — the number the panel shows never jitters as she toggles.
+
+    Pure read; books nothing. With no `pageScopeMap` every page answers inScope:true —
+    the identity state. `siteScaleDemoted`/`threeDDemoted`/`needsReview` are the
+    engine-flagged classes the panel may PRE-HIGHLIGHT (never pre-uncheck)."""
+    psmap = j.get("pageScopeMap") or {}
+    pbp = j.get("polygons_by_page") or {}
+    pages = []
+    in_sf = parked_sf = 0.0
+    parked_pages = []
+    for el in (j.get("takeoffData") or []):
+        pn = el.get("pageNumber")
+        zones = list(el.get("zones") or [])
+        parked = list(el.get("parkedZones") or [])
+        sf = sum(float(z.get("netArea") or 0) for z in (zones + parked))
+        polys = pbp.get(pn) or pbp.get(str(pn)) or []
+        site_demoted = any(p.get("site_scale_demoted") for p in polys)
+        three_d = any(p.get("three_d_demoted") for p in polys)
+        in_scope = bool(psmap.get(str(pn), True))
+        pages.append({"pageNumber": pn, "sheetRef": el.get("sheetRef"),
+                      "title": el.get("title"), "detectedSF": round(sf, 1),
+                      "inScope": in_scope, "zonesCount": len(zones) + len(parked),
+                      "flags": el.get("flags") or [], "scaleSource": el.get("scaleSource"),
+                      "siteScaleDemoted": site_demoted, "threeDDemoted": three_d,
+                      "needsReview": el.get("scaleSource") == "default"})
+        if in_scope:
+            in_sf += sf
+        else:
+            parked_sf += sf; parked_pages.append(pn)
+    return {"pages": pages, "inScopeSF": round(in_sf, 1),
+            "parkedSF": round(parked_sf, 1), "parkedPages": parked_pages}
 
 
 # ── NET BY CONFIRMATION (STEP 4, PERFECT_ACCURACY_BLUEPRINT) ─────────────────
@@ -2738,6 +2787,11 @@ def accept_suggestion(payload: dict = Body(...)):
     # on (page, material_group stamp) exactly so it survives that — re-apply it here or
     # accepting a suggestion silently reverts her confirmed number on that page.
     try:
+        # ⚠ THE MIRROR + PAGE SCOPE: the rebuild above put this page's zones back into
+        # `zones`, so a page (or group) she PARKED would be resurrected into the totals by
+        # the first suggestion she accepts on it — the exact mirror-bug class this handler's
+        # header warns of. Re-park before netting/naming so page-park survives the rebuild.
+        _apply_scope(j, j.get("scopeMap") or {}, j.get("pageScopeMap"))
         _apply_nets(j)
         _apply_material_names(j)   # keep her name across the page rebuild
     except Exception:
@@ -2812,7 +2866,7 @@ def set_scope(payload: dict = Body(...)):
     for k in (payload.get("inScope") or []):
         smap[str(k)] = True
     j["scopeMap"] = smap
-    n_park, n_back = _apply_scope(j, smap)
+    n_park, n_back = _apply_scope(j, smap, j.get("pageScopeMap"))
     try:
         _apply_nets(j)   # a restored group comes back with HER net, not the gross
         _apply_material_names(j)   # ... and with HER name
@@ -2824,6 +2878,72 @@ def set_scope(payload: dict = Body(...)):
     except Exception:
         pass
     return dict(_scope_summary(j), ok=True, jobId=jid, scopeMap=smap,
+                zonesParked=n_park, zonesRestored=n_back,
+                takeoffData=j.get("takeoffData") or [])
+
+
+@app.get("/page-scope/{jid}")
+def page_scope_get(jid: str):
+    """THE PAGE-SCOPE GATE, read side: every takeoff page in this job with its detected
+    SF, sheet ref, engine flags and whether it is ticked into THIS bid. The sibling of
+    /scope — material-scope removes a family, page-scope removes a whole sheet (or the
+    off-elevation residual of a family that also lives on her pages).
+
+    Pure read — it books nothing, changes nothing and cannot fail a takeoff. With no
+    page ticklist every page answers `inScope: true`, which is the identity state.
+    """
+    j = get_job(jid)
+    if not j:
+        raise HTTPException(404, "job not found")
+    return dict(_page_scope_summary(j), jobId=jid, pageScopeMap=(j.get("pageScopeMap") or {}),
+                note=("Untick a whole sheet another trade owns, or a civil / 3D / needs-review "
+                      "page the engine flagged. Unticked pages leave the totals, the Excel and "
+                      "the evidence PDF but stay on the drawing, parked and one-click restorable "
+                      "— nothing is ever deleted. All pages are in by default."))
+
+
+@app.post("/set-page-scope")
+def set_page_scope(payload: dict = Body(...)):
+    """THE PAGE-SCOPE GATE, write side — mirrors /set-scope exactly, but keyed on
+    pageNumber instead of material group.
+
+    payload: {jobId, pages:{"<pn>": bool}}        explicit ticks (the panel sends this)
+             {jobId, outOfScope:[pn,...]}          park these pages
+             {jobId, inScope:[pn,...]}             restore these pages
+             {jobId, reset:true}                   clear the ticklist -> back to identity
+
+    Persistence follows /set-scope: mutate the dict `get_job` handed back (which IS
+    `jobs[jid]`), re-apply BOTH scope maps (so page-park composes with material-park),
+    re-bake HER net + HER name onto the restored zones, then `_persist_job`.
+    `pageScopeMap` is in that function's whitelist, without which the page ticklist
+    would evaporate on the next eviction. Returns the fresh page summary + takeoffData
+    so the panel updates the job total in one round trip.
+    """
+    jid = payload.get("jobId")
+    j = get_job(jid)
+    if not j:
+        raise HTTPException(404, "job not found")
+    psmap = {} if payload.get("reset") else dict(j.get("pageScopeMap") or {})
+    if isinstance(payload.get("pages"), dict):
+        for k, v in payload["pages"].items():
+            psmap[str(k)] = bool(v)
+    for k in (payload.get("outOfScope") or []):
+        psmap[str(k)] = False
+    for k in (payload.get("inScope") or []):
+        psmap[str(k)] = True
+    j["pageScopeMap"] = psmap
+    n_park, n_back = _apply_scope(j, j.get("scopeMap") or {}, psmap)
+    try:
+        _apply_nets(j)   # a restored page comes back with HER net, not the gross
+        _apply_material_names(j)   # ... and with HER name
+    except Exception:
+        pass
+    jobs[jid] = j
+    try:
+        _persist_job(jid)
+    except Exception:
+        pass
+    return dict(_page_scope_summary(j), ok=True, jobId=jid, pageScopeMap=psmap,
                 zonesParked=n_park, zonesRestored=n_back,
                 takeoffData=j.get("takeoffData") or [])
 
