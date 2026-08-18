@@ -2709,31 +2709,45 @@ def evidence_pdf(jid: str, materials: str = ""):
     src = fitz.open(stream=j["pdf"], filetype="pdf")
     out = fitz.open()
     # summary cover page (filtered to her selection when given)
-    mats = {}; tot = 0.0
+    # SPEC 3 (a): the column SUMS netArea (the booked number — reader-detected openings deducted,
+    # her net overrides applied), so label it "SF (net)" and show gross alongside so the receipt
+    # is unambiguous once overrides apply. gross = the zone's true gross (net-assist grossSF), or
+    # netArea when the reader computed no breakdown.
+    mats = {}; tot = 0.0; tgross = 0.0
     for el in j.get("takeoffData", []):
         for z in el.get("zones", []):
             if not keep(_disp_name(z), z.get("category")):
                 continue
-            k = _disp_name(z) or "Material"; mats[k] = mats.get(k, 0) + z.get("netArea", 0); tot += z.get("netArea", 0)
+            k = _disp_name(z) or "Material"
+            _n = z.get("netArea", 0) or 0
+            _g = z.get("grossSF", None)
+            _g = float(_g) if _g is not None else _n
+            m = mats.setdefault(k, {"net": 0.0, "gross": 0.0})
+            m["net"] += _n; m["gross"] += _g
+            tot += _n; tgross += _g
     cov = out.new_page(width=612, height=792)
     cov.insert_text((50, 60), "Boston Facade Systems — Takeoff Evidence", fontsize=17, color=(0.05, 0.11, 0.18))
     cov.insert_text((50, 84), (j.get("projName") or "Project"), fontsize=11, color=(0.4, 0.45, 0.5))
     y = 130
     cov.insert_text((50, y), "Material", fontsize=10, color=(0.4, 0.45, 0.5))
-    cov.insert_text((360, y), "SF (gross)", fontsize=10, color=(0.4, 0.45, 0.5)); y += 8
-    cov.draw_line((50, y), (500, y), color=(0.8, 0.83, 0.87)); y += 20
-    for k, sf in sorted(mats.items(), key=lambda x: -x[1]):
-        cov.insert_text((50, y), str(k)[:48], fontsize=11)
-        cov.insert_text((360, y), f"{sf:,.0f}", fontsize=11); y += 22
-    y += 6; cov.draw_line((50, y), (500, y), color=(0.8, 0.83, 0.87)); y += 22
-    cov.insert_text((50, y), "TOTAL", fontsize=12, color=(0.05, 0.11, 0.18))
+    cov.insert_text((360, y), "SF (net)", fontsize=10, color=(0.4, 0.45, 0.5))
+    cov.insert_text((470, y), "SF (gross)", fontsize=10, color=(0.4, 0.45, 0.5)); y += 8
+    cov.draw_line((50, y), (560, y), color=(0.8, 0.83, 0.87)); y += 20
+    for k, mv in sorted(mats.items(), key=lambda x: -x[1]["net"]):
+        cov.insert_text((50, y), str(k)[:44], fontsize=11)
+        cov.insert_text((360, y), f"{mv['net']:,.0f}", fontsize=11)
+        cov.insert_text((470, y), f"{mv['gross']:,.0f}", fontsize=11, color=(0.4, 0.45, 0.5)); y += 22
+    y += 6; cov.draw_line((50, y), (560, y), color=(0.8, 0.83, 0.87)); y += 22
+    cov.insert_text((50, y), "TOTAL (net)", fontsize=12, color=(0.05, 0.11, 0.18))
     cov.insert_text((360, y), f"{tot:,.0f} SF", fontsize=12, color=(0.05, 0.11, 0.18))
+    cov.insert_text((470, y), f"{tgross:,.0f}", fontsize=11, color=(0.4, 0.45, 0.5))
     # BID-READINESS block: provenance + verify-first — the questions a GC exec asks.
     y += 34
     cov.insert_text((50, y), "How these numbers were measured", fontsize=11, color=(0.05, 0.11, 0.18)); y += 16
     cov.insert_text((50, y), "Every region is read from the drawing's own geometry (seams, fills, tags,", fontsize=8.5, color=(0.35, 0.4, 0.45)); y += 12
-    cov.insert_text((50, y), "trained boundary model). Areas are GROSS as drawn - openings are NOT", fontsize=8.5, color=(0.35, 0.4, 0.45)); y += 12
-    cov.insert_text((50, y), "deducted unless a reader cut the opening out of the shape itself.", fontsize=8.5, color=(0.35, 0.4, 0.45)); y += 18
+    cov.insert_text((50, y), "trained boundary model). SF (net) is the booked number: openings the reader", fontsize=8.5, color=(0.35, 0.4, 0.45)); y += 12
+    cov.insert_text((50, y), "detected are deducted and your net overrides applied. SF (gross) is the wall", fontsize=8.5, color=(0.35, 0.4, 0.45)); y += 12
+    cov.insert_text((50, y), "as drawn, before any opening deduction.", fontsize=8.5, color=(0.35, 0.4, 0.45)); y += 18
     nflag = 0
     flagged = []
     for el in j.get("takeoffData", []):
@@ -2771,7 +2785,7 @@ def evidence_pdf(jid: str, materials: str = ""):
             tp.insert_text((50, 50), "Wall-by-wall detail", fontsize=13, color=(0.05, 0.11, 0.18))
             tp.insert_text((50, 72), "Page", fontsize=8.5, color=(0.4, 0.45, 0.5))
             tp.insert_text((90, 72), "Material / wall", fontsize=8.5, color=(0.4, 0.45, 0.5))
-            tp.insert_text((360, 72), "SF (gross)", fontsize=8.5, color=(0.4, 0.45, 0.5))
+            tp.insert_text((360, 72), "SF (net)", fontsize=8.5, color=(0.4, 0.45, 0.5))
             tp.insert_text((430, 72), "Measured by", fontsize=8.5, color=(0.4, 0.45, 0.5))
             tp.draw_line((50, 80), (562, 80), color=(0.8, 0.83, 0.87))
             ty = 96
@@ -2795,6 +2809,11 @@ def evidence_pdf(jid: str, materials: str = ""):
         pix = srcpage.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
         pg = out.new_page(width=pw, height=ph)
         pg.insert_image(pg.rect, stream=pix.tobytes("jpg", jpg_quality=80))  # JPEG → colored sheets shrink hugely
+        # SPEC 3 (b): the per-region labels below are the SF measured per region (as drawn); the
+        # cover TOTAL is the booked net (net overrides + reader openings applied), so the sum of
+        # sheet labels need not equal the cover once nets are applied. Say so on the sheet.
+        pg.insert_text((8, 14), "Region labels = SF measured per region. Cover TOTAL = booked net.",
+                       fontsize=7, color=(0.5, 0.0, 0.0))
         for p in page_polys:
             if p.get("suggest_only") or p.get("out_of_scope"):
                 continue      # unaccepted AI suggestions never appear on the evidence PDF,
@@ -2811,6 +2830,41 @@ def evidence_pdf(jid: str, materials: str = ""):
     data = out.tobytes(); out.close(); src.close()
     return Response(content=data, media_type="application/pdf",
                     headers={"Content-Disposition": f'attachment; filename="BFS_Evidence_{jid}.pdf"'})
+
+@app.get("/takeoff-csv/{jid}")
+def takeoff_csv(jid: str):
+    """SPEC 3 (c): the server-authoritative canonical takeoff — one file, straight from job state
+    (post-scope, post-net, post-name). PURE READ: it books nothing and moves no total. Parked
+    (out_of_scope) and suggest_only zones already left `zones`, so this emits exactly the bid set
+    the evidence-PDF cover and bid-excel read. Keyed on material_group (`_scope_group_of_zone`),
+    the same identity scope / net / materials use, so a second consumer or a re-export reconciles
+    against the review total without re-assembling per_page on the client."""
+    j = get_job(jid)
+    if not j:
+        raise HTTPException(404, "job not found")
+    import csv as _csv, io as _io
+    buf = _io.StringIO()
+    w = _csv.writer(buf)
+    w.writerow(["page", "sheetRef", "material_group", "name", "category",
+                "grossSF", "netSF", "openingSF", "openingsDetected", "netOverride", "reader"])
+    tot_net = 0.0; tot_gross = 0.0
+    for el in j.get("takeoffData", []):
+        pn = el.get("pageNumber"); sref = el.get("sheetRef") or ""
+        for z in el.get("zones", []):
+            net = float(z.get("netArea", 0) or 0)
+            _g = z.get("grossSF", None)
+            gross = float(_g) if _g is not None else net
+            osf = float(z.get("openingSF", 0) or 0)
+            w.writerow([pn, sref, _scope_group_of_zone(z), _disp_name(z) or "",
+                        z.get("category") or "", round(gross, 1), round(net, 1), round(osf, 1),
+                        int(z.get("openingsSuggested") or 0),
+                        "yes" if z.get("netOverride") else "no",
+                        z.get("reader") or z.get("readerClass") or ""])
+            tot_net += net; tot_gross += gross
+    w.writerow([])
+    w.writerow(["TOTAL", "", "", "", "", round(tot_gross, 1), round(tot_net, 1), "", "", "", ""])
+    return Response(content=buf.getvalue(), media_type="text/csv",
+                    headers={"Content-Disposition": f'attachment; filename="BFS_Takeoff_{jid}.csv"'})
 
 @app.post("/accept-suggestion")
 def accept_suggestion(payload: dict = Body(...)):
