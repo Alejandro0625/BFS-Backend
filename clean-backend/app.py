@@ -708,6 +708,44 @@ def _append_material_ledger(j, jid, group, name):
 def jlog(job, msg, level="info"):
     job["log"].append({"msg": msg, "level": level})
 
+# ── NET-ASSIST (Feature 1, 2026-08-18) ──────────────────────────────────────
+# The net step (openings deducted per wall) is where most of her review clicks go and it is
+# HER judgment. The vector reader already detects windows/doors and books `area_sf` NET of
+# them, recording the breakdown in `sf_calc` {gross_sf, openings_sf, net_sf, n_openings}. That
+# per-wall opening detection is COMPUTED but hidden at the zone level (grossArea==netArea,
+# totalOpeningArea==0). These two helpers SURFACE it so the review card can show
+# "gross X · ~N openings ≈ Y SF · [use net Z]" and one-click PRE-FILL the existing /set-net
+# field. Read-only by construction: they return numbers to DISPLAY and add only NEW zone keys;
+# they never touch area_sf/netArea/grossArea/totalOpeningArea (FIX_OPENINGS discipline — an
+# opening deduction may be SHOWN, NEVER auto-applied to the booked total; /set-net still books).
+def _poly_openings(p):
+    """(detected_opening_sf, opening_count) for one piece, from the reader's own sf_calc. The
+    reader books `area_sf` NET of these; when it computed no breakdown (markup / plain fill)
+    there are 0 openings. Openings are counted here only to be DISPLAYED, never re-deducted."""
+    sc = p.get("sf_calc") or {}
+    osf = float(sc.get("openings_sf") or 0.0)
+    if osf < 0:
+        osf = 0.0
+    on = int(sc.get("n_openings") or len(p.get("holes") or []) or 0)
+    return osf, on
+
+def _net_assist(d):
+    """Additive net-assist fields for a zone from its aggregated opening breakdown (`openSF`,
+    `openN`, `sf`). The booked net (`sf`) already has the reader's detected openings removed,
+    so netSuggested == the booked net and grossSF == net + openings — i.e. gross - openings ==
+    net EXACTLY (the task's Z, with no drift from a later rescale). Identity by construction:
+    netArea / grossArea / totalOpeningArea are NOT among these keys, so no booked SF moves."""
+    booked = round(float(d.get("sf") or 0.0), 1)
+    osf = round(float(d.get("openSF") or 0.0), 1)
+    if osf < 0:
+        osf = 0.0
+    return {
+        "grossSF": round(booked + osf, 1),   # gross-of-detected-openings (consistent with net)
+        "openingSF": osf,                    # SF the reader already cut out (shown, not re-applied)
+        "openingsSuggested": int(d.get("openN") or 0),
+        "netSuggested": booked,              # = gross - detected openings; one-click PRE-FILL for /set-net
+    }
+
 def extract_page_polygons(pg, pw, ph, ft_per_in):
     polys = []
     rot = pg.rotation_matrix                       # ROTATED pages (e.g. 270°) store annot vertices in unrotated coords;
@@ -1691,7 +1729,8 @@ def process(jid, pdf_bytes):
                 continue          # a guard-abandoned page (review_flags) is KEPT below so its
                                   # needs-review flag reaches the estimator, exactly like the
                                   # site-scale exclusion — an excluded page must never be silent.
-            bymat = defaultdict(lambda: {"sf": 0.0, "n": 0, "category": None, "classes": []})
+            bymat = defaultdict(lambda: {"sf": 0.0, "n": 0, "category": None, "classes": [],
+                                         "openSF": 0.0, "openN": 0})
             for p in polys:
                 if p.get("suggest_only") or p.get("out_of_scope"):
                     continue          # suggestions NEVER enter zones/totals until accepted;
@@ -1700,6 +1739,8 @@ def process(jid, pdf_bytes):
                 bymat[key]["sf"] += p["area_sf"]; bymat[key]["n"] += 1
                 bymat[key]["category"] = p.get("category")
                 bymat[key]["classes"].append(p.get("reader_class"))
+                _o9o, _n9o = _poly_openings(p)   # net-assist: aggregate the reader's opening breakdown
+                bymat[key]["openSF"] += _o9o; bymat[key]["openN"] += _n9o
             zones = []
             src_txt = ({"vector": "drawing vectors (exact geometry)", "model": "AI model (confirm)"}.get(auto_engine, "AI texture (confirm)")) if auto else "markup"
             # FAMILY LAYER v1 (weekend lane #43, 26-020 probe): normalize each zone's
@@ -1746,7 +1787,8 @@ def process(jid, pdf_bytes):
             _grouped = bool(auto and _mc is not None and
                             any(p.get("material_group") for p in polys
                                 if not p.get("suggest_only") and not p.get("out_of_scope")))
-            bygrp = defaultdict(lambda: {"sf": 0.0, "n": 0, "cls": None, "classes": []})
+            bygrp = defaultdict(lambda: {"sf": 0.0, "n": 0, "cls": None, "classes": [],
+                                         "openSF": 0.0, "openN": 0})
             _rawsf9 = defaultdict(float)
             if _grouped:
                 for p in polys:
@@ -1758,6 +1800,8 @@ def process(jid, pdf_bytes):
                     # the reader classes that BUILT this group — the group's own name is a
                     # display label by now, so the risk can only come from the pieces
                     bygrp[g9]["classes"].append(p.get("reader_class"))
+                    _o9o, _n9o = _poly_openings(p)   # net-assist: same opening breakdown, per group
+                    bygrp[g9]["openSF"] += _o9o; bygrp[g9]["openN"] += _n9o
                     _rawsf9[(g9, p.get("material") or p.get("category") or "Unlabeled")] += p["area_sf"]
             _dom9 = {}
             for (g9, raw9), sf9 in _rawsf9.items():
@@ -1783,7 +1827,7 @@ def process(jid, pdf_bytes):
                     "family": _f9,
                     "netArea": round(d["sf"], 1), "grossArea": round(d["sf"], 1),
                     "totalOpeningArea": 0, "description": f"{d['n']} region(s) from {src_txt}",
-                }, **_review_fields(d["classes"], auto=auto, raw_name=mat)))
+                }, **_net_assist(d), **_review_fields(d["classes"], auto=auto, raw_name=mat)))
                 legend[mat] = {"id": mat, "name": mat, "category": cat}
             for g9, d in bygrp.items():
                 raw9 = _dom9.get(g9, (g9, 0.0))[0]        # dominant raw name carries provenance
@@ -1795,7 +1839,7 @@ def process(jid, pdf_bytes):
                     "totalOpeningArea": 0, "description": f"{d['n']} region(s) from {src_txt}",
                     "material_group": g9, "material_class": d["cls"],
                     "readAs": (str(raw9)[:60] if str(raw9) != str(g9) else None),
-                }, **_review_fields(d["classes"], auto=auto, raw_name=raw9)))
+                }, **_net_assist(d), **_review_fields(d["classes"], auto=auto, raw_name=raw9)))
                 legend[g9] = {"id": g9, "name": g9, "category": cat}
             auto_flags = []
             if auto_flags_pre:
