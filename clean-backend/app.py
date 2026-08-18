@@ -897,6 +897,47 @@ def _is_site_civil_sheet(text):
     return True
 
 
+# ── 3D / AXONOMETRIC / RENDERING SHEET DETECTOR (WAVE 5+, SPEC 2, 2026-08-18) ──
+# A page whose TITLE is a 3D view (axonometric / isometric / perspective / massing /
+# rendering) is a picture of the building, not a flat wall elevation; auto-booking its
+# vector/texture area measures MASSING as cladding and invents huge phantom SF (one
+# 26-002 sheet alone books 346,085 SF). This is a TITLE-vs-TITLE test, NOT the class-c
+# site/civil keynote test: an axonometric MASSING sheet DOES print material call-outs
+# (it colours the massing by material), so _is_site_civil_sheet's "no wall keynote"
+# clause wrongly SPARES those pages. Correct predicate: a STRONG 3D/rendering title is
+# present AND no directional flat-elevation title. Material keynotes are irrelevant.
+# "KEY PLAN" is titleblock/locator noise on 1,932 pages (every 26-002 sheet) and is
+# DELIBERATELY EXCLUDED from the firing vocabulary. Census (rd_3d_detector_census.py,
+# 122/122 jobs, corpus EE743811): fires on 109 pages, 33 currently ADMITTED across 16
+# jobs, and ZERO of the 372 certified gold pages — a demoted real elevation would be
+# confidently-wrong and there are none. Same demote-never-delete discipline as the
+# class-c / blind-band fixes: out of zones/totals/Excel/evidence, still drawn, one click
+# from real via /accept-suggestion. Scale-independent (3D sheets are admitted at any
+# scale: 26-002 p129/26-182 p12 at 80 ft/in, 26-190 isometrics at 8 ft/in).
+_3D_PHRASES = ("AXONOMETRIC", "AXONOMETRICS", "ISOMETRIC", "PERSPECTIVE",
+               "3D VIEW", "3-D VIEW", "3D MASSING", "MASSING MODEL", "MASSING DIAGRAM",
+               "MASSING STUDY", "AERIAL VIEW", "AERIAL PERSPECTIVE",
+               "BIRD'S EYE", "BIRDS EYE", "BIRD'S-EYE", "EYE VIEW",
+               "RENDERING", "RENDERINGS", "RENDERED VIEW", "EXTERIOR RENDERING",
+               "3D RENDERING", "PHOTOREALISTIC", "MASSING")
+# directional flat-elevation TITLE — the ONE exclusion (a real elevation says this)
+_ELEVTITLE_RE = re.compile(r"\b(north|south|east|west|front|rear|left|right|side|"
+                           r"partial|overall|exterior|building|typ(?:ical)?)\s+"
+                           r"[\w\s]{0,18}elevation")
+
+
+def _is_3d_massing_sheet(text):
+    """True for a page whose TITLE is a 3D view / rendering / massing AND which carries
+    NO directional flat-elevation title. Demote-only (suggest_only), never delete.
+    Identical predicate to rd_3d_detector_census.demote_fires (the 0-gold-proven test)."""
+    u = (text or "").upper()
+    if not any(p in u for p in _3D_PHRASES):
+        return False
+    if _ELEVTITLE_RE.search((text or "").lower()):
+        return False
+    return True
+
+
 def is_elevation_page(pg, ocr_fallback=True):
     """Auto-crop to the pages the estimator actually measures = elevations, returns, soffits.
     v2 (cold-run audit 2026-07-24: v1 text-only test found ALL gold pages on just 19/88
@@ -1442,6 +1483,34 @@ def process(jid, pdf_bytes):
                                 f"measuring LAND, not cladding. If this really is a wall elevation, "
                                 f"calibrate the page — or accept the regions individually.")
                             jlog(job, f"Page {pi+1}: 1\"={_ss_val:g}' CONFIRMED site/civil sheet (blind band) — "
+                                      f"{len(tpolys)} region(s) / {_ss_sf:,.0f} SF demoted to suggestions "
+                                      f"(not counted in the takeoff, one click from real)", "warn")
+                        elif _is_3d_massing_sheet(pg.get_text() or ""):
+                            # ---- 3D / AXONOMETRIC / RENDERING SHEET (SPEC 2, 2026-08-18) -----
+                            # This page's TITLE is a 3D view, not a flat wall elevation (see
+                            # _is_3d_massing_sheet: a STRONG 3D/rendering title AND no directional
+                            # flat-elevation title). SCALE-INDEPENDENT — a 3D sheet is admitted at
+                            # any scale (26-002 p129 at 80 ft/in, 26-190 isometrics at 8 ft/in), so
+                            # this branch runs whatever _ss_val is. Booking its vector/texture area
+                            # measures MASSING as cladding = huge phantom SF (26-002 p129 = 346,085).
+                            # DEMOTE, NEVER DELETE — out of zones/totals/Excel/evidence, still drawn,
+                            # one click from real via /accept-suggestion (pieces are stamped with an
+                            # id like every other, so index + accept both reach them). 0 of 372 gold
+                            # pages fire the predicate (rd_3d_detector_census, zero_gold_movement) —
+                            # this cannot park a real elevation she marked. `material` is NOT renamed
+                            # (she must see WHAT it found to judge it); `page_is_elev` is left alone
+                            # like the class-c branch so raster-page suggestions still surface.
+                            _ss_sf = sum(float(p.get("area_sf") or 0) for p in tpolys)
+                            for _p9 in tpolys:
+                                _p9["suggest_only"] = True
+                                _p9["three_d_demoted"] = True
+                            site_scale_flags.append(
+                                f"⚠ 3D / AXONOMETRIC / RENDERING sheet — this page's title is a 3D "
+                                f"view, not a flat wall elevation. {len(tpolys)} region(s) / "
+                                f"{_ss_sf:,.0f} SF are SHOWN AS SUGGESTIONS instead of counted (3D "
+                                f"massing measured as flat cladding is not real SF). If this really "
+                                f"is a flat elevation, accept the regions individually.")
+                            jlog(job, f"Page {pi+1}: 3D / axonometric / rendering sheet — "
                                       f"{len(tpolys)} region(s) / {_ss_sf:,.0f} SF demoted to suggestions "
                                       f"(not counted in the takeoff, one click from real)", "warn")
                     if tpolys:
