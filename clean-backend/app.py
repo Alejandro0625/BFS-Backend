@@ -321,6 +321,69 @@ def scale_ft_per_in(s):
         if 0 < v < 1: return 1.0 / v
     return 8.0
 
+def _flag_scale_outliers(td, jlog=None, job=None):
+    """CROSS-PAGE SCALE-OUTLIER FLAG (review-only; additive; books/removes NOTHING).
+
+    Most elevation pages in ONE set share a single drawing scale. A page read at a
+    CONFIDENTLY-WRONG scale (scale_confirmed, so the existing default-scale warning never
+    fires) inflates SF by scale-squared -- the "85x" total. After every page is processed,
+    each CONFIRMED-scale page that carries booked cladding is compared against the set's
+    shared scale (the median of those pages); when a clear shared scale exists (a MAJORITY
+    agree), any page whose scale departs by >=2x or <=0.5x is FLAGGED -- never has its SF
+    touched -- so the estimator can verify/calibrate. It only ADDS `scaleOutlier`/
+    `scaleOutlierNote` to the page payload; no total, zone or polygon moves, so it can never
+    book or remove SF (confidently-wrong impossible). Returns the count of pages flagged.
+
+    Pages read at a DEFAULT/unread scale (verifiedScale falsy) are skipped -- they already
+    carry the existing calibrate-before-trusting warning. A job with fewer than 3 confirmed
+    booked pages, or with no dominant shared scale, is left untouched (no reference set)."""
+    OUT_HI, OUT_LO = 2.0, 0.5
+    cand = []   # (entry, ft_per_in) for confirmed, booked-cladding pages
+    for e in (td or []):
+        if not e.get("verifiedScale"):
+            continue          # unread/default pages already get the calibrate warning
+        if not any(float(z.get("netArea") or 0) > 0 for z in (e.get("zones") or [])):
+            continue          # no booked cladding on this page -- not part of the scale set
+        m = re.search(r"=\s*([0-9]*\.?[0-9]+)", e.get("scale") or "")  # "1\"=8.0'" -> 8.0
+        if not m:
+            continue
+        try:
+            fpi = float(m.group(1))
+        except ValueError:
+            continue
+        if fpi > 0:
+            cand.append((e, fpi))
+    if len(cand) < 3:
+        return 0              # too few confirmed pages to define a "set" -- no reference
+    vals = sorted(v for _, v in cand)
+    n = len(vals)
+    med = vals[n // 2] if (n % 2) else (vals[n // 2 - 1] + vals[n // 2]) / 2.0
+    if med <= 0:
+        return 0
+    # only speak when a MAJORITY agree on one scale (a real shared "set" scale); a job with
+    # no dominant scale has no reference against which to call any page an outlier.
+    near = sum(1 for v in vals if OUT_LO * med < v < OUT_HI * med)
+    if near <= n / 2.0:
+        return 0
+    def _g(x):
+        return "%g" % round(float(x), 2)
+    flagged = 0
+    for e, fpi in cand:
+        r = fpi / med
+        if r >= OUT_HI or r <= OUT_LO:
+            fac = r if r >= 1.0 else 1.0 / r
+            e["scaleOutlier"] = True
+            e["scaleOutlierNote"] = (
+                "⚠ Scale 1\"=%s' differs from this set's 1\"=%s' by %sx -- SF on this "
+                "page could be ~%sx off. Verify or calibrate this sheet before trusting its SF."
+                % (_g(fpi), _g(med), _g(round(fac, 1)), _g(round(fac * fac))))
+            flagged += 1
+            if jlog and job is not None:
+                jlog(job, "Page %s: scale 1\"=%s' is an outlier vs this set's shared 1\"=%s' -- "
+                          "flagged for review (SF unchanged)" % (e.get("pageNumber"), _g(fpi), _g(med)),
+                     "warn")
+    return flagged
+
 def categorize(subject):
     s = (subject or "").lower()
     if any(k in s for k in ["acm", "mcm", "composite"]): return "ACM/Composite Panel"
@@ -2056,6 +2119,14 @@ def process(jid, pdf_bytes):
             for w in sf_warns:
                 jlog(job, f"Page {pi+1}: ⚠ {w}", "warn")
         doc.close()
+        # CROSS-PAGE SCALE-OUTLIER review flag (additive; touches no SF): a page read at a
+        # confidently-wrong scale won't trip the default-scale warning, yet inflates SF by
+        # scale-squared. Flag any confirmed page whose scale is an outlier vs this set's shared
+        # scale so she can verify/calibrate before trusting its SF. Never books or removes SF.
+        try:
+            _flag_scale_outliers(job["takeoffData"], jlog=jlog, job=job)
+        except Exception:
+            jlog(job, "Cross-page scale-outlier check skipped — takeoff unaffected", "warn")
         job["legend"] = list(legend.values())
         # THE ARCHITECT'S OWN MATERIAL SCHEDULE — read it off any text-bearing page so the
         # estimator can sanity-check our takeoff against the drawing's stated quantities.
