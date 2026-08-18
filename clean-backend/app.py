@@ -103,6 +103,14 @@ SITE_SCALE_FT_PER_IN = float(os.environ.get("SITE_SCALE_FT_PER_IN", "100"))
 # itself a site/civil sheet AND carry no wall-material keynote (_is_site_civil_sheet), so a
 # real large-building elevation drawn coarse is never demoted.
 SITE_BLINDBAND_FT_PER_IN = float(os.environ.get("SITE_BLINDBAND_FT_PER_IN", "24"))
+# SIZE-OUTLIER GATE (Wave B Feature 3, so_sizegate_census.json): an auto region that covers more
+# than this fraction of its page is almost always a page-spanning boundary phantom (a full-page
+# gray box, a legend/whole-sheet smear), not a wall. Demote it to suggest_only (never delete).
+# 0.50 is the census "bulletproof" T: it sits in the empirical 0.50-0.60 zero-gap and is 1.42x
+# over the gold floor 0.3515 (largest fraction any REAL marked wall occupies, 26-070B p16), so at
+# this T the gate demotes 0 IoU-matched-to-gold regions and 0 v13 regions => 0 gold SF lost.
+SIZE_OUTLIER_FRAC = float(os.environ.get("SIZE_OUTLIER_FRAC", "0.50"))
+SIZE_OUTLIER_GOLD_FLOOR = 0.3515
 
 app = FastAPI(title="BFS Clean Backend")
 # CORS: browsers may only call this API from the app's own origins (the Vercel prod
@@ -1552,6 +1560,39 @@ def process(jid, pdf_bytes):
                                       f"{len(tpolys)} region(s) / {_ss_sf:,.0f} SF demoted to suggestions "
                                       f"(not counted in the takeoff, one click from real)", "warn")
                     if tpolys:
+                        # ── SIZE-OUTLIER GATE (Feature 3, so_sizegate_census) — demote page-spanning
+                        # phantoms, NEVER delete. Per REGION (unlike the whole-page site/3D branches):
+                        # a piece covering > SIZE_OUTLIER_FRAC of the page is a boundary/background box,
+                        # not a wall. Scale-independent (normalized frame). Carve-outs mirror the census
+                        # safe predicate: never a v13 or markup read (the confirmed/high-trust classes),
+                        # never one already demoted. 0 of 372 gold pages carry a region this large (floor
+                        # 0.3515), so it cannot park a wall she marked. suggest_only => out of zones/
+                        # totals/Excel/evidence, still drawn, one click from real via /accept-suggestion.
+                        _so_hit = []
+                        for _ps in tpolys:
+                            if _ps.get("suggest_only") or (_ps.get("reader_class") or "") in ("v13", "markup"):
+                                continue
+                            _pts = _ps.get("points") or []
+                            if len(_pts) < 3:
+                                continue
+                            try:
+                                _frac = shoelace(_pts)   # normalized points => fraction of the page area
+                            except Exception:
+                                continue
+                            if _frac > SIZE_OUTLIER_FRAC:
+                                _ps["suggest_only"] = True
+                                _ps["size_outlier_demoted"] = True
+                                _ps["size_outlier_frac"] = round(_frac, 4)
+                                _so_hit.append(_ps)
+                        if _so_hit:
+                            _so_sf = sum(float(p.get("area_sf") or 0) for p in _so_hit)
+                            site_scale_flags.append(
+                                f"⚠ OVERSIZED REGION(S) — {len(_so_hit)} region(s) / {_so_sf:,.0f} SF each cover "
+                                f"more than {int(SIZE_OUTLIER_FRAC * 100)}% of the sheet, larger than any real wall "
+                                f"on a drawing. SHOWN AS SUGGESTIONS instead of counted (a page-spanning box is "
+                                f"usually a boundary/background, not cladding). If one really is a wall, accept it.")
+                            jlog(job, f"Page {pi+1}: {len(_so_hit)} oversized region(s) / {_so_sf:,.0f} SF demoted "
+                                      f"to suggestions (> {int(SIZE_OUTLIER_FRAC * 100)}% of the page — one click from real)", "warn")
                         try:  # read the architect's own labels: callout text + leader arrows -> region names
                             n_named = callouts.name_regions(pdf_bytes, pi, tpolys, pw, ph)
                             if n_named:
@@ -3739,4 +3780,8 @@ def health():
             # RELIABILITY GUARDS: same visibility rule. If rel_guard.py failed to land, the
             # per-page pre-check/timeout silently no-ops (auto-detect runs unbounded again), so
             # the deploy confirms the running app.py imported it and reports the live thresholds.
-            "rel_guard": (False if _rg is None else _rg.health()), "rel_guard_err": _RG_ERR}
+            "rel_guard": (False if _rg is None else _rg.health()), "rel_guard_err": _RG_ERR,
+            # SIZE-OUTLIER GATE (Feature 3): report the live threshold + gold floor, same
+            # visibility rule as the guards above — a demote gate whose threshold silently
+            # drifted (or a build that landed without it) is otherwise invisible.
+            "size_gate": {"frac": SIZE_OUTLIER_FRAC, "gold_floor": SIZE_OUTLIER_GOLD_FLOOR}}
