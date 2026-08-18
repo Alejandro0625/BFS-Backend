@@ -48,6 +48,23 @@ try:
 except Exception as _rre:      # pragma: no cover - deploy-shape guard
     _rr = None
     _RR_ERR = str(_rre)
+# RELIABILITY GUARDS (2026-08-18): per-page/per-job wall-clock bounds so one dense upload
+# cannot occupy the single worker for minutes and starve every concurrent job (measured #1
+# blocker, ~35% of real jobs). Defensive import for the same reason as the two above —
+# a new module was once a 404 in the repo while app.py imported it — but the deploy pushes
+# rel_guard.py BEFORE app.py, and /health reports it. When present it supplies the per-page
+# pre-check + timeout; the per-JOB cap and the big-PDF reject below need no module, so they
+# still fire if it is somehow absent. See rel_guard.py for the censused thresholds.
+try:
+    import rel_guard as _rg
+    _RG_ERR = None
+    _GuardTimeout = _rg.GuardTimeout
+except Exception as _rge:      # pragma: no cover - deploy-shape guard
+    _rg = None
+    _RG_ERR = str(_rge)
+    class _GuardTimeout(Exception):
+        """Never raised when rel_guard is absent — auto-detect runs unbounded, as it did
+        before this change; the per-JOB cap and big-PDF reject still apply."""
 from fastapi import FastAPI, UploadFile, File, BackgroundTasks, HTTPException, Body
 from fastapi.responses import Response
 from fastapi.middleware.cors import CORSMiddleware
@@ -158,6 +175,23 @@ def _safe_jid(jid):
 def _job_dir(jid): return os.path.join(JOBS_DIR, _safe_jid(jid))
 
 BIG_PDF_BYTES = int(os.environ.get("BIG_PDF_BYTES", str(200 * 1024 * 1024)))
+# RELIABILITY thresholds mirrored here so the per-JOB cap + review message work even if
+# rel_guard failed to import (the per-page pre-check/timeout below already no-op in that
+# case). Values + rationale live in rel_guard.py; all env-overridable.
+T_JOB_SECONDS = float(os.environ.get("BFS_T_JOB_SECONDS", "600"))    # whole-job wall-clock cap
+T_PAGE_SECONDS = float(os.environ.get("BFS_T_PAGE_SECONDS", "60"))   # per-page auto-detect cap
+# Cumulative per-JOB budget for title-block OCR admission (is_elevation_page's ocr_fallback).
+# That OCR is the measured #1 hang on scanned/flattened sets (26-180A UNMARKED would spend
+# 326s admitting 26 raster pages). Once spent, remaining pages fall back to TEXT-ONLY
+# admission — real elevations that carry text are still admitted; only OCR-only discovery
+# stops. 120s sits well above any NORMAL job's total run time (so it never fires on real
+# work — identity-preserving) yet caps the scanned-set blow-up an order of magnitude below
+# the job cap. On MARKED jobs no OCR runs at all (see page_is_elev below), so this is moot.
+T_OCR_BUDGET_S = float(os.environ.get("BFS_T_OCR_BUDGET_S", "120"))
+PAGE_REVIEW_MSG = (_rg.PAGE_REVIEW_MSG if _rg is not None else
+                   "⏱ This sheet was too complex to auto-read within the time budget — "
+                   "auto-detect was skipped and NO square footage was booked for it. Review it "
+                   "manually (it may be a dense civil/detail sheet, not a wall elevation).")
 
 def _load_pdf_bytes(path):
     """HEAVY-DOC SAFETY, phase 1: uploads now STREAM to disk (no doubled RAM while a
@@ -1105,9 +1139,24 @@ def process(jid, pdf_bytes):
         # estimator's OWN annotations, not the /Contents, so two pages with identical /Contents
         # but different markup are legitimately different takeoffs and must never be deduped.
         _seen_page_content = {}   # content_md5 -> first 1-based page booked on it
+        _job_t0 = time.monotonic()   # per-JOB wall-clock cap start (reliability guard)
+        _ocr_spent = 0.0             # cumulative title-block OCR admission time (reliability guard)
         for pi in range(n):
             job["progress"] = {"label": f"Reading page {pi+1} of {n}", "pct": 5 + int(90 * pi / max(n, 1))}
             job["phase"] = "analyzing"
+            # PER-JOB WALL-CLOCK CAP (2026-08-18): a single upload must never hold the single
+            # prod worker long enough to starve every concurrent job. Once the budget is spent,
+            # stop admitting pages, record how many were skipped, and finalize the pages already
+            # done — return-or-fail-fast, never hang. The finished pages keep their exact booked
+            # SF; the remainder are surfaced as needs-review, never as a silent zero.
+            if (time.monotonic() - _job_t0) > T_JOB_SECONDS:
+                _skipped = n - pi
+                job["partialReview"] = {"skippedPages": _skipped, "reason": "job_time_budget",
+                                        "budgetSeconds": T_JOB_SECONDS}
+                jlog(job, f"⏱ Job time budget {T_JOB_SECONDS:.0f}s exceeded after {pi} page(s) — "
+                          f"{_skipped} remaining page(s) skipped for manual review; returning a "
+                          f"PARTIAL takeoff of what finished.", "warn")
+                break
             pg = doc[pi]; pw, ph = pg.rect.width, pg.rect.height
             if not doc_has_markup:   # dedup only where booking is driven by /Contents (AUTO path)
                 try:
@@ -1132,7 +1181,30 @@ def process(jid, pdf_bytes):
                 p["id"] = i  # unique ids across polygons + linear runs
             auto = False; scale_conf = True; scale_val = None; auto_engine = None
             site_scale_flags = []   # survives even when the page ends up producing no auto regions
-            page_is_elev = (not doc_any_elevation) or is_elevation_page(pg)  # only auto-mark elevations (or all if none detectable); order skips OCR when all pages are admitted anyway
+            review_flags = []       # per-page "too complex — review manually" (0 SF); reliability guard
+            # RELIABILITY (2026-08-18): is_elevation_page(ocr_fallback=True) runs title-block OCR
+            # on every non-text-elevation page, and that OCR is the measured #1 hang (26-232:
+            # 128s of a 147s run — 21 pages, 14.4s max; 26-180A: 326s over 26 pages).
+            #  * DIGITIZE path (doc_has_markup): page_is_elev is DEAD — its only readers (the
+            #    auto-detect block and the raster-suggestion block below) are both gated on
+            #    `not doc_has_markup` — so computing it, and paying the OCR, is pure waste. Skip
+            #    it (provably behaviour-identical: every reader is already ANDed with that gate).
+            #  * AUTO path: keep OCR admission, but stop once the cumulative OCR budget is spent
+            #    (scanned/flattened sets) — remaining pages use TEXT-ONLY admission so the job
+            #    can't be run for minutes discovering elevations one 14s OCR at a time. A NORMAL
+            #    job never reaches the budget (OCR rarely fires on text sheets) so this is a
+            #    no-op there; the value below is byte-identical to the old expression whenever
+            #    the budget is not exhausted.
+            if doc_has_markup:
+                page_is_elev = False
+            elif not doc_any_elevation:
+                page_is_elev = True                    # inversion: all pages admitted (no OCR)
+            elif _ocr_spent > T_OCR_BUDGET_S:
+                page_is_elev = is_elevation_page(pg, ocr_fallback=False)   # text-only, budget spent
+            else:
+                _t_ocr = time.monotonic()
+                page_is_elev = is_elevation_page(pg)
+                _ocr_spent += time.monotonic() - _t_ocr
             if not polys and not doc_has_markup and page_is_elev:
                 # RAW/clean page -> auto-markup. Engine order: VECTOR (reads the drawn pattern —
                 # exact geometry, openings netted; cheap, so EVERY page gets it) -> trained MODEL
@@ -1141,7 +1213,18 @@ def process(jid, pdf_bytes):
                     auto_tried += 1
                     tpolys = []; sinfo = {}
                     try:
-                        tpolys, _, _, sinfo = vector_hatch.detect(pdf_bytes, pi)
+                        # RELIABILITY GUARD (2026-08-18): vector_hatch.detect cost scales with the
+                        # page's drawing-segment count — legit elevations top out ~23s, but civil/
+                        # detail mega-sheets (951k segs) run 120-213s and hang the single worker.
+                        # PRE-CHECK skips a page too dense to finish in budget (no worker thread is
+                        # even spawned); otherwise the call is bounded to T_PAGE_SECONDS and an
+                        # over-budget page is ABANDONED and marked needs-review, never left with a
+                        # half-computed SF. rel_guard absent (deploy window) => runs unbounded.
+                        if _rg is not None and _rg.too_dense(pg)[0]:
+                            raise _GuardTimeout("pre-check: page too dense to auto-read in budget")
+                        tpolys, _, _, sinfo = (
+                            _rg.call_with_timeout(lambda: vector_hatch.detect(pdf_bytes, pi))
+                            if _rg is not None else vector_hatch.detect(pdf_bytes, pi))
                         auto_engine = "vector"
                         # ⭐ STAMP THE READER CLASS HERE, AND ONLY HERE (FIX_TWO_TIER_GATE).
                         # The class is read off the `material` PREFIX, and `material` is
@@ -1155,15 +1238,38 @@ def process(jid, pdf_bytes):
                         if _rr is not None:
                             for _p9 in tpolys:
                                 _p9["reader_class"] = _rr.classify(_p9.get("material"))
+                    except _GuardTimeout:
+                        tpolys = []
+                        if not review_flags:
+                            review_flags.append(PAGE_REVIEW_MSG)
+                        _nsg = _rg.page_segment_count(pg) if _rg is not None else -1
+                        jlog(job, f"Page {pi+1}: auto-detect exceeded the {T_PAGE_SECONDS:.0f}s "
+                                  f"page budget ({_nsg:,} drawing segments) — skipped for manual "
+                                  f"review (0 SF booked)", "warn")
                     except Exception:
                         tpolys = []
-                    if not tpolys and auto_used < MAX_AUTO_PAGES:
-                        if model_infer.available():
-                            tpolys, _, _, sinfo = model_infer.detect(pdf_bytes, pi, zoom=2.0)
-                            auto_engine = "model"
-                        else:
-                            tpolys, _, _, sinfo = texture.detect(pdf_bytes, pi, ft_per_in=ft, zoom=2.0)
-                            auto_engine = "texture"
+                    if not tpolys and not review_flags and auto_used < MAX_AUTO_PAGES:
+                        # Same reliability bound on the fallback engines: texture.detect calls
+                        # texture._read_scale, which iterates the page geometry (or OCRs a scanned
+                        # sheet) and can blow up (120-150s in the census). Skip if the page already
+                        # failed the vector guard above; otherwise bound the call the same way.
+                        try:
+                            if model_infer.available():
+                                tpolys, _, _, sinfo = (
+                                    _rg.call_with_timeout(lambda: model_infer.detect(pdf_bytes, pi, zoom=2.0))
+                                    if _rg is not None else model_infer.detect(pdf_bytes, pi, zoom=2.0))
+                                auto_engine = "model"
+                            else:
+                                tpolys, _, _, sinfo = (
+                                    _rg.call_with_timeout(lambda: texture.detect(pdf_bytes, pi, ft_per_in=ft, zoom=2.0))
+                                    if _rg is not None else texture.detect(pdf_bytes, pi, ft_per_in=ft, zoom=2.0))
+                                auto_engine = "texture"
+                        except _GuardTimeout:
+                            tpolys = []
+                            if not review_flags:
+                                review_flags.append(PAGE_REVIEW_MSG)
+                            jlog(job, f"Page {pi+1}: fallback auto-detect exceeded the "
+                                      f"{T_PAGE_SECONDS:.0f}s page budget — skipped for review (0 SF)", "warn")
                         # The fallback engines are NOT in the corpus — every graded wall came
                         # from vector_hatch.detect. They are stamped with their engine, which
                         # review_rank has no risk row for, so they rank FIRST (unmeasured is
@@ -1306,9 +1412,11 @@ def process(jid, pdf_bytes):
             # the discriminator). On raster-underlay pages, run the boundary model with
             # EMPTY ownership and surface its pieces as suggest_only: never counted in
             # zones/totals/Excel/evidence until the estimator accepts each one.
-            if not doc_has_markup and page_is_elev:
+            if not doc_has_markup and page_is_elev and not review_flags:
                 # (runs even when auto-detect found NOTHING — the emptiest raster
                 # pages need suggestions most; acid test: p19 had 0 pieces, 0 sugs)
+                # `not review_flags`: a page the guard abandoned as too complex must not then
+                # spend more of the budget running the v13/density suggestion probe on it.
                 try:
                     _imga = 0.0
                     for _im9 in pg.get_images(full=True):
@@ -1461,8 +1569,10 @@ def process(jid, pdf_bytes):
             # exclusion SILENT, which is the exact defect app.py:756's page-total SANITY flag
             # has (it fires on all six blowup pages and has no consumer, so it never becomes a
             # code). An excluded page must arrive at the estimator carrying its own reason.
-            if not polys and not lin_lf_items and not site_scale_flags:
-                continue
+            if not polys and not lin_lf_items and not site_scale_flags and not review_flags:
+                continue          # a guard-abandoned page (review_flags) is KEPT below so its
+                                  # needs-review flag reaches the estimator, exactly like the
+                                  # site-scale exclusion — an excluded page must never be silent.
             bymat = defaultdict(lambda: {"sf": 0.0, "n": 0, "category": None, "classes": []})
             for p in polys:
                 if p.get("suggest_only") or p.get("out_of_scope"):
@@ -1719,7 +1829,7 @@ def process(jid, pdf_bytes):
                 "zones": zones,
                 "linearItems": linear_items,
                 "autoTrim": auto_trim,
-                "flags": auto_flags + sf_warns + sorted(_fam_flags9) + site_scale_flags,
+                "flags": auto_flags + sf_warns + sorted(_fam_flags9) + site_scale_flags + review_flags,
                 "levels": page_levels,
                 "source": "texture-auto" if auto else "digitize",
                 # window/door COUNT surface (count-only takeoffs are a whole bid class):
@@ -1967,6 +2077,29 @@ async def analyze(background_tasks: BackgroundTasks, pdf: UploadFile = File(...)
             if not chunk:
                 break
             fh.write(chunk)
+    # MEMORY GUARD (2026-08-18): reject an oversized set BEFORE it is pulled into RAM. The
+    # stream-to-disk above bounds the UPLOAD, but _load_pdf_bytes reads the whole file back
+    # into memory and process() then renders every page — a 442MB/396pp set (26-002) drove
+    # the single worker into an OOM restart that killed every concurrent job. BIG_PDF_BYTES
+    # was defined at module load but NEVER checked (that was the bug); enforce it here with a
+    # clear, polled-through error instead of an OOM. The job is created in the error state so
+    # the existing GET /status contract surfaces the reason; nothing is queued to process().
+    _sz = os.path.getsize(path)
+    if _sz > BIG_PDF_BYTES:
+        _msg = ("This PDF is %.0f MB, over the %.0f MB limit for automatic processing. Split "
+                "it (e.g. just the architectural elevation sheets) and re-upload, or raise "
+                "BIG_PDF_BYTES if the server has the memory." % (_sz / 1e6, BIG_PDF_BYTES / 1e6))
+        jobs[jid] = {"status": "error", "phase": "error", "log": [], "error": _msg,
+                     "progress": {"label": "File too large", "pct": 0},
+                     "legend": [], "takeoffData": [], "scheduleData": None,
+                     "polygons_by_page": {}, "dims_by_page": {}, "pdf": None}
+        jlog(jobs[jid], _msg, "error")
+        try:
+            os.remove(path)          # free the oversized file immediately; nothing will read it
+        except Exception:
+            pass
+        _persist_job(jid); _gc_disk()
+        return {"jobId": jid}
     data = _load_pdf_bytes(path)
     jobs[jid] = {"status": "queued", "phase": "idle", "log": [], "progress": {"label": "Queued", "pct": 0},
                  "legend": [], "takeoffData": [], "scheduleData": None, "error": None,
@@ -3315,4 +3448,8 @@ def health():
             # derived from are reported, because a table silently frozen at an old corpus
             # is the failure this ships with a guard against.
             "review_rank": (False if _rr is None else dict(_rr.TABLE, order=_rr.ORDER)),
-            "review_rank_err": _RR_ERR}
+            "review_rank_err": _RR_ERR,
+            # RELIABILITY GUARDS: same visibility rule. If rel_guard.py failed to land, the
+            # per-page pre-check/timeout silently no-ops (auto-detect runs unbounded again), so
+            # the deploy confirms the running app.py imported it and reports the live thresholds.
+            "rel_guard": (False if _rg is None else _rg.health()), "rel_guard_err": _RG_ERR}
