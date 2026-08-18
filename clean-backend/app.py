@@ -2843,6 +2843,12 @@ def evidence_pdf(jid: str, materials: str = ""):
         page_polys = [p for p in j.get("polygons_by_page", {}).get(pn, []) if keep(p.get("material"), p.get("category"))]
         if not page_polys:
             continue
+        # Feature 4 (export cosmetic): a page whose kept regions are ALL suggestions or
+        # parked (out_of_scope) draws nothing in the per-region loop below (it skips exactly
+        # those), so appending it here would emit a blank background sheet. Skip it. Render-
+        # only: no zone, total, cover or CSV moves -- the cover already excludes these regions.
+        if not any(not (p.get("suggest_only") or p.get("out_of_scope")) for p in page_polys):
+            continue
         # RENDER the page to a size-capped JPEG background (not the huge vector page) → small, emailable.
         # The region outlines + SF labels are drawn as crisp VECTOR on top, so they stay sharp.
         srcpage = src[pn - 1]; pw, ph = srcpage.rect.width, srcpage.rect.height
