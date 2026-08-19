@@ -303,6 +303,68 @@ def _gc_disk():
     except Exception:
         pass
 
+# ── BOUNDED JOB QUEUE (2026-08-19, PARALLEL_JOB_PROCESSING) ──────────────────
+# The OLD path let every /analyze (and /compare) spawn its own Starlette background
+# thread, so a whole daily batch ran AT ONCE. That is the measured #1 reliability
+# blocker: each analysis peaks at ~5 GB RSS (v13 onnx session + zoom-2 pixmaps + cv2;
+# rel2_census peak 5,045 MB) and the prod container is ~8 GB, so two concurrent jobs
+# OOM-restart the single worker and LOSE every in-flight takeoff (a 442 MB set AND
+# concurrent load both OOMed prod). And the engine's hot path (vector_hatch geometry)
+# is pure-Python / GIL-bound, so those concurrent threads never truly ran in parallel
+# anyway — they time-shared one core and STARVED each other. MAX SAFE CONCURRENCY =
+# container / per-job = 8 / 5 -> 1, so true parallelism is not affordable in this RAM.
+#
+# Jobs now go through a BOUNDED FIFO QUEUE drained by exactly BFS_MAX_CONCURRENCY worker
+# thread(s) (default 1). Excess uploads wait cleanly as "queued" (visible on /status and
+# /health) instead of contending, so RAM stays at 1x per-job and nothing OOMs; each job
+# runs to completion in order; and process()'s existing per-JOB cap (T_JOB_SECONDS=600s)
+# is the real kill that stops one hung job from holding the slot forever — after the cap
+# it returns a partial takeoff and the queue drains to the next job. BFS_MAX_CONCURRENCY
+# is env-tunable so a Railway RAM UPGRADE lets the owner raise concurrency with NO
+# redeploy. Worker THREADS (not processes) so every worker shares the single v13 onnx
+# session; at N=1 the GIL is moot and the queue's role is admission control + reliability,
+# not speedup. process()/process_compare are UNCHANGED — only how they are launched is.
+import queue as _job_queue_mod
+MAX_CONCURRENCY = max(1, int(os.environ.get("BFS_MAX_CONCURRENCY", "1")))
+_JOB_QUEUE = _job_queue_mod.Queue()
+_QUEUE_LOCK = threading.Lock()
+_workers_started = False
+_queue_depth = 0   # jobs currently waiting or running (reported on /health)
+
+def _job_worker():
+    global _queue_depth
+    while True:
+        fn, args = _JOB_QUEUE.get()
+        try:
+            fn(*args)
+        except Exception:
+            import traceback; traceback.print_exc()
+        finally:
+            with _QUEUE_LOCK:
+                _queue_depth -= 1
+            _JOB_QUEUE.task_done()
+
+def _ensure_workers():
+    global _workers_started
+    if _workers_started:
+        return
+    with _QUEUE_LOCK:
+        if _workers_started:
+            return
+        for _ in range(MAX_CONCURRENCY):
+            threading.Thread(target=_job_worker, name="bfs-job-worker", daemon=True).start()
+        _workers_started = True
+
+def _enqueue_job(fn, *args):
+    """Hand a heavy job (process / process_compare) to the bounded worker pool. Replaces
+    background_tasks.add_task so a whole batch cannot run at once and OOM the worker; the
+    job waits in the FIFO as `queued` until a worker is free."""
+    global _queue_depth
+    _ensure_workers()
+    with _QUEUE_LOCK:
+        _queue_depth += 1
+    _JOB_QUEUE.put((fn, args))
+
 # ── helpers ────────────────────────────────────────────────────────────────
 def shoelace(pts):
     n = len(pts); a = 0.0
@@ -2400,7 +2462,7 @@ async def analyze(background_tasks: BackgroundTasks, pdf: UploadFile = File(...)
                  "legend": [], "takeoffData": [], "scheduleData": None, "error": None,
                  "polygons_by_page": {}, "dims_by_page": {}, "pdf": data}
     _persist_job(jid); _evict_mem(); _gc_disk()  # durable + bounded RAM + bounded disk
-    background_tasks.add_task(process, jid, data)
+    _enqueue_job(process, jid, data)  # bounded FIFO queue (was background_tasks) — never OOM the worker
     return {"jobId": jid}
 
 @app.get("/status/{jid}")
@@ -2804,7 +2866,7 @@ async def compare(background_tasks: BackgroundTasks, pdf: UploadFile = File(...)
                  "legend": [], "takeoffData": [], "scheduleData": None, "error": None,
                  "polygons_by_page": {}, "dims_by_page": {}, "pdf": data}
     _persist_job(jid); _evict_mem(); _gc_disk()
-    background_tasks.add_task(process_compare, jid, data)
+    _enqueue_job(process_compare, jid, data)  # bounded FIFO queue (was background_tasks)
     return {"jobId": jid}
 
 @app.get("/compare-result/{jid}")
@@ -3868,6 +3930,11 @@ def health():
             "auto_engine": "model" if model_infer.available() else "texture",
             "ocr": ocr_text.available(), "ocr_err": ocr_text.last_error(),
             "jobs_in_mem": len(jobs), "jobs_on_disk": on_disk, "mem_cap": MAX_MEM_JOBS,
+            # BOUNDED JOB QUEUE: report the live concurrency cap + how many jobs are
+            # waiting/running, so a batch backing up (or a hung slot) is visible. depth
+            # > max_concurrency means uploads are queued behind the RAM-safe worker cap.
+            "job_queue": {"max_concurrency": MAX_CONCURRENCY, "depth": _queue_depth,
+                          "workers_started": _workers_started},
             # FIX #1 grouping: a deploy that lands app.py without mat_canon.py keeps serving
             # takeoffs with today's per-name rollup. That must be VISIBLE — a silent fallback
             # is indistinguishable from "the grouping never worked".
