@@ -1774,6 +1774,32 @@ def process(jid, pdf_bytes):
                         if _rr is not None:
                             for _s9 in _sugs:
                                 _s9["reader_class"] = _rr.classify(_s9.get("material"))
+                    # DEDUP SUGGESTIONS vs BOOKED WALLS (2026-08-19). The density and raster-v13
+                    # branches above call their readers with EMPTY ownership, so a suggestion that
+                    # merely re-outlines a wall the engine ALREADY booked was surfaced as new —
+                    # census rp0818_tier_overlap: 85.8% of the tier (v13 59pc / 37,479 SF) was a
+                    # re-listing, and one click of Accept would DOUBLE-BOOK its SF. Apply the SAME
+                    # booked-territory subtraction the clean-vector helper already does
+                    # (_vector_page_suggestions / _bbox_cover > 0.3), here at the COMMON append
+                    # point so all three branches are guarded uniformly. Removes ONLY suggest_only
+                    # pieces — booked totals sum non-suggest_only pieces only (app.py:1922/1982),
+                    # so booked SF is untouched by construction; a genuinely NEW wall is <30% covered
+                    # by any booked box and survives. Idempotent for the clean-vector branch.
+                    _pre_dd9 = len(_sugs)
+                    _owned_dd9 = [bb for bb in (_piece_bbox(p) for p in polys
+                                                if not p.get("suggest_only")) if bb]
+                    if _owned_dd9 and _sugs:
+                        _kept_dd9 = []
+                        for _sdd9 in _sugs:
+                            _bdd9 = _piece_bbox(_sdd9)
+                            if _bdd9 is not None and any(_bbox_cover(_bdd9, _odd9) > 0.3
+                                                         for _odd9 in _owned_dd9):
+                                continue      # the engine already booked this territory
+                            _kept_dd9.append(_sdd9)
+                        _sugs = _kept_dd9
+                    if _pre_dd9 - len(_sugs):
+                        jlog(job, f"Page {pi+1}: dropped {_pre_dd9 - len(_sugs)} suggestion(s) that "
+                                  f"re-outline already-booked walls (dedup vs booked)", "info")
                     jlog(job, f"Page {pi+1}: suggestion probe — dense={_dense9}, "
                               f"img={_imga / max(pw * ph, 1):.0%}, suggestions={len(_sugs)}", "info")
                     # tag + append OUTSIDE the branches — BOTH readers' suggestions ship
