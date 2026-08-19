@@ -1830,6 +1830,27 @@ def process(jid, pdf_bytes):
             # has (it fires on all six blowup pages and has no consumer, so it never becomes a
             # code). An excluded page must arrive at the estimator carrying its own reason.
             if not polys and not lin_lf_items and not site_scale_flags and not review_flags:
+                # DETECTION-GAP (review-only; additive; books/removes NOTHING). This page is
+                # about to be dropped for carrying no booked wall, no suggestion and no linear
+                # run. When it is an AUTO page (the engine's job to draw) that PASSED elevation
+                # admission on a set where elevations ARE positively identified
+                # (doc_any_elevation), that blank is the high-precision "the engine drew nothing
+                # on an elevation" signal — she cannot confirm a wall she cannot see is missing.
+                # Record a "draw here" gap so the frontend can jump her to the page and arm
+                # add-by-corners. It only APPENDS to a side list nothing else reads: no zone, no
+                # polygon, no total, no SF moves, and the page is still dropped exactly as before
+                # (a page with any booked/suggested wall never reaches here — confidently-wrong
+                # impossible). Requiring doc_any_elevation keeps it high-precision: on a scanned
+                # set where every page is admitted by inversion, a blank cover/plan is NOT flagged.
+                if (not doc_has_markup) and page_is_elev and doc_any_elevation:
+                    try:
+                        job.setdefault("detectionGaps", []).append(
+                            {"page": pi + 1, "sheetRef": f"p{pi+1}", "detectionGap": True,
+                             "note": "elevation page — no cladding detected; draw the walls"})
+                        jlog(job, f"Page {pi+1}: admitted elevation, engine detected no cladding "
+                                  f"— flagged as a draw-here gap for review (0 SF booked)", "warn")
+                    except Exception:
+                        pass
                 continue          # a guard-abandoned page (review_flags) is KEPT below so its
                                   # needs-review flag reaches the estimator, exactly like the
                                   # site-scale exclusion — an excluded page must never be silent.
@@ -3416,9 +3437,20 @@ def review_queue(jid: str):
                                 "cx": p.get("cx"), "cy": p.get("cy"),
                                 "readerClass": p.get("reader_class")})
     suggestions.sort(key=lambda s: _rr.sort_key(s["readerClass"], s["sf"]))
+    # ⭐ DETECTION-GAP ROWS. Admitted ELEVATION pages the auto engine drew nothing on — no
+    # booked wall, no suggestion, no linear run (recorded by process() at the page-drop point).
+    # She cannot accept a wall she cannot see is missing; these turn a silently-dropped blank
+    # elevation into an actionable "draw here" row. Additive and books NOTHING: none of this is
+    # a zone, is in `zones`, or is in any total. Empty (renders nothing) on a job with no gaps.
+    gaps = sorted(
+        ({"page": g.get("page"), "sheetRef": g.get("sheetRef"),
+          "note": g.get("note"), "detectionGap": True}
+         for g in (j.get("detectionGaps") or [])),
+        key=lambda g: (g["page"] if g["page"] is not None else 0))
     return {"jobId": jid, "zones": ordered, "pages": page_list,
             "suggestions": suggestions,
             "suggestionSF": round(sum(s["sf"] for s in suggestions), 1),
+            "gaps": gaps,
             "reviewConfirmed": confirmed,
             "table": dict(_rr.TABLE, order=_rr.ORDER, risk=_rr.RISK),
             "note": ("ORDERING ONLY — every region is still confirmed by the estimator and "
