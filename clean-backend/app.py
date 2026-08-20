@@ -2729,6 +2729,37 @@ def learn(payload: dict = Body(...)):
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
+@app.get("/recall")
+def recall():
+    """Shared hatch learning -- the READ half of the flywheel (the write half is /learn).
+    The frontend calls this on every job load (App.jsx) to pre-identify repeat hatches, so a
+    fresh browser or a second estimator inherits what others already labeled. Reads back the
+    hatch signatures /learn persisted to CORR_DIR and returns {hatches:{sig:{category,
+    materialName, materialId}}} -- exactly the shape App.jsx merges into its learned store.
+    READ-ONLY: opens no job, books/removes no SF, and cannot be confidently-wrong (CW=0)."""
+    hatches = {}
+    try:
+        if os.path.isdir(CORR_DIR):
+            for d in sorted(os.listdir(CORR_DIR)):   # oldest -> newest so the latest label wins
+                lp = os.path.join(CORR_DIR, d, "labels.json")
+                if not os.path.isfile(lp):
+                    continue
+                try:
+                    with open(lp, encoding="utf-8") as fh:
+                        rec = json.load(fh)
+                except Exception:
+                    continue
+                for h in (rec.get("hatches") or []):
+                    sig = h.get("signature")
+                    if not sig:
+                        continue
+                    hatches[sig] = {"category": h.get("category"),
+                                    "materialName": h.get("materialName") or h.get("materialId"),
+                                    "materialId": h.get("materialId")}
+    except Exception:
+        pass
+    return {"hatches": hatches}
+
 @app.get("/autonomy-status")
 def autonomy_status():
     """THE AUTONOMY METER: for every exported bid (answer key = final-* capture), compare the
