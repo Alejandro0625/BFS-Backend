@@ -417,23 +417,38 @@ def _flag_scale_outliers(td, jlog=None, job=None):
             cand.append((e, fpi))
     if len(cand) < 3:
         return 0              # too few confirmed pages to define a "set" -- no reference
-    vals = sorted(v for _, v in cand)
-    n = len(vals)
-    med = vals[n // 2] if (n % 2) else (vals[n // 2 - 1] + vals[n // 2]) / 2.0
+    # SF-WEIGHT the reference scale (M3 fix 2026-08-20): the set's shared scale is the one the
+    # SQUARE FOOTAGE agrees on, not the page COUNT. Otherwise three small 1/4" detail-elevations
+    # outvote one 20,000-SF overall elevation and flag the CORRECT biggest page as the outlier --
+    # one trusting "calibrate" click would then collapse a real wall. Weight each page's scale by
+    # its booked SF; the SF-weighted median is the reference the money actually depends on.
+    def _pgsf(e):
+        return max(1.0, sum(float(z.get("netArea") or 0) for z in (e.get("zones") or [])))
+    wv = sorted((v, _pgsf(e)) for e, v in cand)
+    W = sum(w for _, w in wv)
+    if W <= 0:
+        return 0
+    acc = 0.0
+    med = wv[-1][0]
+    for v, w in wv:
+        acc += w
+        if acc >= W / 2.0:
+            med = v
+            break
     if med <= 0:
         return 0
-    # only speak when a MAJORITY agree on one scale (a real shared "set" scale); a job with
-    # no dominant scale has no reference against which to call any page an outlier.
-    near = sum(1 for v in vals if OUT_LO * med < v < OUT_HI * med)
-    if near <= n / 2.0:
+    # only speak when the SF MAJORITY agrees on one scale (a real shared "set" scale); a job with
+    # no SF-dominant scale has no reference against which to call any page an outlier.
+    near = sum(w for v, w in wv if OUT_LO * med < v < OUT_HI * med)
+    if near <= W / 2.0:
         return 0
     def _g(x):
         return "%g" % round(float(x), 2)
     flagged = 0
     for e, fpi in cand:
         r = fpi / med
-        if r >= OUT_HI or r <= OUT_LO:
-            fac = r if r >= 1.0 else 1.0 / r
+        if r >= OUT_HI:          # only COARSER-than-set (over-reads SF); a finer page is a legit detail sheet, not a hazard
+            fac = r
             e["scaleOutlier"] = True
             e["scaleOutlierNote"] = (
                 "⚠ Scale 1\"=%s' differs from this set's 1\"=%s' by %sx -- SF on this "
