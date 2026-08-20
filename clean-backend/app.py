@@ -102,7 +102,7 @@ SITE_SCALE_FT_PER_IN = float(os.environ.get("SITE_SCALE_FT_PER_IN", "100"))
 # never touch a wall she marked. The scale alone does NOT demote — the page must ALSO name
 # itself a site/civil sheet AND carry no wall-material keynote (_is_site_civil_sheet), so a
 # real large-building elevation drawn coarse is never demoted.
-SITE_BLINDBAND_FT_PER_IN = float(os.environ.get("SITE_BLINDBAND_FT_PER_IN", "24"))
+SITE_BLINDBAND_FT_PER_IN = float(os.environ.get("SITE_BLINDBAND_FT_PER_IN", "9"))  # M4: 9 catches site plans at 1"=10/15/20 (gold census: 0 of 365 gold pages fire _is_site_civil_sheet, so no real wall demoted)
 # SIZE-OUTLIER GATE (Wave B Feature 3, so_sizegate_census.json): an auto region that covers more
 # than this fraction of its page is almost always a page-spanning boundary phantom (a full-page
 # gray box, a legend/whole-sheet smear), not a wall. Demote it to suggest_only (never delete).
@@ -1650,10 +1650,12 @@ def process(jid, pdf_bytes):
                             # and books phantom SF — measuring parking, courtyards and paving as
                             # cladding. Only demote when the page ALSO names itself a site/civil
                             # sheet AND carries no wall-material keynote (_is_site_civil_sheet), so
-                            # a real large-building elevation drawn coarse is never touched. The cut
-                            # (24 ft/in) is above the coarsest CONFIRMED gold scale (21.33; 0 of 372
-                            # gold pages read >= 22 confirmed — r7x), so this can never park a wall
-                            # she marked. DEMOTE, NEVER DELETE — same policy as the unconfirmed
+                            # a real large-building elevation drawn coarse is never touched. M4 (2026-08-20)
+                            # lowered the floor 24 -> 9 to catch site plans at 1"=10/15/20 that slipped under
+                            # the old 24 cut and booked pavement. 9 is BELOW the coarsest gold scale (21.33),
+                            # so the safety is NO LONGER the floor but the _is_site_civil_sheet text-gate: the
+                            # M4 gold census confirmed it fires on 0 of 365 gold pages, so no wall she marked
+                            # is ever demoted. DO NOT revert to 24. DEMOTE, NEVER DELETE — same policy as the unconfirmed
                             # branch: out of zones/totals/Excel/evidence, still drawn, one click
                             # from real through /accept-suggestion.
                             _ss_sf = sum(float(p.get("area_sf") or 0) for p in tpolys)
