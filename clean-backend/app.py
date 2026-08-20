@@ -1282,6 +1282,54 @@ def _bbox_cover(a, b):
     return (ix * iy) / max(1e-9, (a[2] - a[0]) * (a[3] - a[1]))
 
 
+def clip_suggestions(pdf_bytes, pi, pw, ph, ft_pt, max_new=15):
+    """COVERAGE reader (accuracy-hunt lever #1, 2026-08-20). The architect's CLIP scissor rects bound
+    cladding areas the geometry readers often leave BLANK -- the engine under-reads ~36% of gold SF and
+    ~46% of that gap is walls where ink exists but nothing was emitted. Emit each clip region as a
+    SUGGEST_ONLY piece the estimator confirms; NEVER auto-booked (SF is the clip bbox = approximate).
+    Nested-dedup + top-N cap turns the raw ~250 nested clips/page into ~5-15 reviewable regions. Mirrors
+    bfs_product/fusion.py clip_candidates. Books nothing (suggest_only, out of zones/totals); CW=0."""
+    out = []
+    try:
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        page = doc[pi]
+        W = float(pw) or 1.0; H = float(ph) or 1.0
+        raw = []
+        for d in page.get_drawings(extended=True):
+            if d.get("type") != "clip" or not d.get("scissor"):
+                continue
+            r = fitz.Rect(d["scissor"]); w = abs(r.width); h = abs(r.height)
+            if w < 40 or h < 40:
+                continue
+            cov = (w * h) / (W * H)
+            if cov > 0.55:            # a near-whole-page clip is the sheet border, not a wall
+                continue
+            sf = w * h * ft_pt * ft_pt
+            if sf < 40:
+                continue
+            raw.append((round(sf, 1), (r.x0 / W, r.y0 / H, r.x1 / W, r.y1 / H)))
+        doc.close()
+    except Exception:
+        return []
+    raw.sort(reverse=True)            # biggest first
+    def _cov(x, y):
+        ix = max(0.0, min(x[2], y[2]) - max(x[0], y[0])); iy = max(0.0, min(x[3], y[3]) - max(x[1], y[1]))
+        aa = (x[2] - x[0]) * (x[3] - x[1]); return (ix * iy) / aa if aa > 0 else 0.0
+    kept = []
+    for sf, bb in raw:
+        if any(_cov(bb, k[1]) > 0.7 or _cov(k[1], bb) > 0.7 for k in kept):
+            continue              # drop a clip nested in / near-duplicating one already kept
+        kept.append((sf, bb))
+        if len(kept) >= max_new:
+            break
+    for sf, (x0, y0, x1, y1) in kept:
+        out.append({"points": [[x0, y0], [x1, y0], [x1, y1], [x0, y1]], "area_sf": sf,
+                    "cx": round((x0 + x1) / 2, 5), "cy": round((y0 + y1) / 2, 5),
+                    "fill_color": [0.16, 0.75, 0.75], "source": "clip", "holes": [],
+                    "reader_class": "clip", "label": "~%s SF (clip region)" % (round(sf),)})
+    return out
+
+
 def _vector_page_suggestions(job, pdf_bytes, pi, polys, pw, ph, scale_val, max_new=40):
     """v13 pieces on a clean VECTOR elevation, minus everything the engine already booked.
 
@@ -1791,6 +1839,15 @@ def process(jid, pdf_bytes):
                         if _rr is not None:
                             for _s9 in _sugs:
                                 _s9["reader_class"] = _rr.classify(_s9.get("material"))
+                    # CLIP-COVERAGE suggestions (accuracy-hunt lever #1, 2026-08-20): recover walls the
+                    # geometry readers left blank from the architect's clip regions -- suggest_only, she
+                    # confirms; flows through the booked-territory dedup below like every other suggestion.
+                    try:
+                        _clip9 = clip_suggestions(pdf_bytes, pi, pw, ph, float(scale_val or 8.0) / 72.0, max_new=15)
+                        if _clip9:
+                            _sugs = (_sugs or []) + _clip9
+                    except Exception:
+                        pass
                     # DEDUP SUGGESTIONS vs BOOKED WALLS (2026-08-19). The density and raster-v13
                     # branches above call their readers with EMPTY ownership, so a suggestion that
                     # merely re-outlines a wall the engine ALREADY booked was surfaced as new —
