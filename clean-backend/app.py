@@ -1768,7 +1768,7 @@ def process(jid, pdf_bytes):
                     if _dense9:
                         # Callahan-class micro-texture: the density reader's fields
                         # become confirmable suggestions (probe-proven 22/114 ensemble)
-                        _sugs = density_reader.suggest_pieces(pdf_bytes, pi, pw, ph, max_new=40)
+                        _sugs = density_reader.suggest_pieces(pdf_bytes, pi, pw, ph, max_new=40, ft_pt=float(scale_val or 8.0) / 72.0)  # M2: real page scale
                         for _s9 in _sugs:
                             _s9["reader_class"] = "density"   # not in the corpus — unmeasured
                     elif _imga >= 0.25 * pw * ph:
