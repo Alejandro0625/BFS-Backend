@@ -32,7 +32,7 @@ def is_dense_page(pg):
     return lines >= 40000 and hair >= 0.8 * max(lines, 1)
 
 
-def suggest_pieces(pdf_bytes, page_index, W, H, max_new=40):
+def suggest_pieces(pdf_bytes, page_index, W, H, max_new=40, ft_pt=FT_PT):
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     try:
         pg = doc[page_index]
@@ -87,7 +87,7 @@ def suggest_pieces(pdf_bytes, page_index, W, H, max_new=40):
     mx = stk.max(0)
     am = stk.argmax(0)
     cls[(mx >= 2)] = (am + 1)[(mx >= 2)]
-    cell_sf = (CELL * FT_PT) ** 2
+    cell_sf = (CELL * ft_pt) ** 2   # M2: page's real scale, not hardcoded 1"=8'
     # view cuts at big vertical whitespace gaps
     occ = ((V + D + Hh + F) > 0).sum(axis=0)
     viewcuts = []
