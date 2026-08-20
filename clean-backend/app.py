@@ -3199,7 +3199,7 @@ def accept_suggestion(payload: dict = Body(...)):
         except Exception:
             _grouped9 = False
     bymat = _dd(lambda: {"sf": 0.0, "n": 0, "category": None, "raw": None, "cls": None,
-                         "classes": []})
+                         "classes": [], "openSF": 0.0, "openN": 0})
     for p in _live9:
         key = ((p.get("material_group") or "Unlabeled") if _grouped9
                else (p.get("material") or p.get("category") or "Unlabeled"))
@@ -3215,11 +3215,13 @@ def accept_suggestion(payload: dict = Body(...)):
         # (accepted)"): a click confirms the wall EXISTS, it does not re-measure its area,
         # so the region keeps the risk of the reader that drew it.
         bymat[key]["classes"].append(p.get("reader_class"))
+        _o9o, _n9o = _poly_openings(p)   # M5: carry the reader's opening breakdown through the accept rebuild (was dropped -> gross=net on accepted walls)
+        bymat[key]["openSF"] += _o9o; bymat[key]["openN"] += _n9o
     zones = [dict({"materialName": m, "material_type": m, "category": d["category"] or "Other",
                    "netArea": round(d["sf"], 1), "grossArea": round(d["sf"], 1),
                    "totalOpeningArea": 0, "description": f"{d['n']} region(s)",
                    "material_group": (m if _grouped9 else None), "material_class": d["cls"]},
-                  **_review_fields(d["classes"], auto=True, raw_name=d["raw"]))
+                  **_net_assist(d), **_review_fields(d["classes"], auto=True, raw_name=d["raw"]))
              for m, d in bymat.items()]
     for e in j.get("takeoffData") or []:
         if e.get("pageNumber") == page:
