@@ -2264,7 +2264,7 @@ def process(jid, pdf_bytes):
             auto_trim = []
             if auto and scale_conf and scale_val:
                 try:
-                    auto_trim = auto_trim_mod.compute(polys, pw, ph, float(scale_val) / 72.0)
+                    auto_trim = auto_trim_mod.compute([_pt for _pt in polys if not _pt.get("suggest_only")], pw, ph, float(scale_val) / 72.0)  # COV1 fix: trim LF from BOOKED walls only, never clip/suggestion regions (they inflated autoTrim)
                     if auto_trim:
                         auto_flags.append("Suggested trim (auto) below — verify each line against your scope before pricing")
                 except Exception as _te:
