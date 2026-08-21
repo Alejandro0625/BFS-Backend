@@ -3267,26 +3267,54 @@ def accept_suggestion(payload: dict = Body(...)):
     polys = (j.get("polygons_by_page") or {}).get(page) or (j.get("polygons_by_page") or {}).get(str(page))
     if polys is None:
         raise HTTPException(404, "no polygons for page")
-    hit = next((p for p in polys if str(p.get("id")) == str(pid) and p.get("suggest_only")), None)
-    if hit is None and pid is not None:
-        # ID FALLBACK (2026-08-17): jobs analysed BEFORE pieces were stamped with an id
-        # (~:1030) are still on the volume and still rehydrate, and every piece in them
-        # answers `id: None`. Without this, her click on suggestion #4 of an old job
-        # 404s; with the old matcher it accepted #1. The array index IS the id this
-        # analyse path now assigns, so an index lookup is the same answer.
-        try:
-            _cand = polys[int(pid)]
-            if _cand.get("suggest_only") and _cand.get("id") is None:
-                hit = _cand
-        except Exception:
-            hit = None
-    if hit is None:
-        raise HTTPException(404, "suggestion not found (already accepted?)")
-    _accepted_cls = hit.get("reader_class")
-    hit["suggest_only"] = False
-    hit["material"] = "AI wall (accepted)"
-    hit["category"] = "AI wall (accepted)"
-    hit["group"] = "AI wall (accepted)"
+    undo = bool(payload.get("undo"))
+    if undo:
+        # M11a UNDO: put an accepted suggestion back to a suggestion. GUARDED to pieces that
+        # were accepted from a suggestion (the accept tag or the stashed pre-accept), so a
+        # real detected wall can never be un-booked by an undo.
+        hit = next((p for p in polys if str(p.get("id")) == str(pid) and not p.get("suggest_only")
+                    and (p.get("material") == "AI wall (accepted)" or p.get("_pre_accept"))), None)
+        if hit is None and pid is not None:
+            try:
+                _cand = polys[int(pid)]
+                if (not _cand.get("suggest_only") and _cand.get("id") is None
+                        and (_cand.get("material") == "AI wall (accepted)" or _cand.get("_pre_accept"))):
+                    hit = _cand
+            except Exception:
+                hit = None
+        if hit is None:
+            raise HTTPException(404, "accepted suggestion not found (already undone?)")
+        _accepted_cls = hit.get("reader_class")
+        _pa = hit.get("_pre_accept") or {}
+        hit["suggest_only"] = True
+        hit["material"] = _pa.get("material") or "AI wall (suggested)"
+        hit["category"] = _pa.get("category") or "AI wall (suggested)"
+        hit["group"] = _pa.get("group") or "AI wall (suggested)"
+        hit.pop("_pre_accept", None)
+    else:
+        hit = next((p for p in polys if str(p.get("id")) == str(pid) and p.get("suggest_only")), None)
+        if hit is None and pid is not None:
+            # ID FALLBACK (2026-08-17): jobs analysed BEFORE pieces were stamped with an id
+            # (~:1030) are still on the volume and still rehydrate, and every piece in them
+            # answers `id: None`. Without this, her click on suggestion #4 of an old job
+            # 404s; with the old matcher it accepted #1. The array index IS the id this
+            # analyse path now assigns, so an index lookup is the same answer.
+            try:
+                _cand = polys[int(pid)]
+                if _cand.get("suggest_only") and _cand.get("id") is None:
+                    hit = _cand
+            except Exception:
+                hit = None
+        if hit is None:
+            raise HTTPException(404, "suggestion not found (already accepted?)")
+        _accepted_cls = hit.get("reader_class")
+        # M11a: stash the pre-accept identity so an undo restores it EXACTLY (reversible).
+        hit["_pre_accept"] = {"material": hit.get("material"), "category": hit.get("category"),
+                              "group": hit.get("group")}
+        hit["suggest_only"] = False
+        hit["material"] = "AI wall (accepted)"
+        hit["category"] = "AI wall (accepted)"
+        hit["group"] = "AI wall (accepted)"
     # rebuild the page's zones from non-suggestion polys (mirror the analyze path).
     # ⚠ THIS MIRROR IS LOAD-BEARING: it overwrites the page's zones wholesale, so if it keyed
     # on the raw name while /analyze keyed on the material group, accepting one suggestion
@@ -3357,21 +3385,22 @@ def accept_suggestion(payload: dict = Body(...)):
         _persist_job(jid)
     except Exception:
         pass
-    try:  # flywheel: an accepted suggestion is gold-grade boundary supervision
-        ts = int(time.time() * 1000)
-        os.makedirs(CORR_DIR, exist_ok=True)
-        with open(os.path.join(CORR_DIR, f"{ts}_suggest-accept.json"), "w", encoding="utf-8") as fh:
-            json.dump({"jobId": jid, "page": page, "source": "suggest-accept",
-                       "shapes": [{"points": hit.get("points"), "area_sf": hit.get("area_sf")}],
-                       "_ts": ts}, fh)
-    except Exception:
-        pass
+    if not undo:  # flywheel training is for real accepts only, never an undo
+        try:  # an accepted suggestion is gold-grade boundary supervision
+            ts = int(time.time() * 1000)
+            os.makedirs(CORR_DIR, exist_ok=True)
+            with open(os.path.join(CORR_DIR, f"{ts}_suggest-accept.json"), "w", encoding="utf-8") as fh:
+                json.dump({"jobId": jid, "page": page, "source": "suggest-accept",
+                           "shapes": [{"points": hit.get("points"), "area_sf": hit.get("area_sf")}],
+                           "_ts": ts}, fh)
+        except Exception:
+            pass
     # `readerClass` rides back so the accept button can say WHICH reader drew the wall she
     # just booked, and the review queue can rank it, without a second round trip. It is the
     # stamp taken BEFORE the rename above — the piece is now called "AI wall (accepted)",
     # and re-deriving a class from that name would give every accepted wall the same wrong
     # risk. A click confirms the wall EXISTS; it does not re-measure it or re-classify it.
-    return {"ok": True, "zones": zones, "accepted_sf": hit.get("area_sf"),
+    return {"ok": True, "zones": zones, "accepted_sf": hit.get("area_sf"), "undone": undo,
             "readerClass": _accepted_cls,
             "reader": (_rr.label(_accepted_cls) if _rr is not None else None),
             "reviewRisk": (_rr.risk(_accepted_cls) if _rr is not None else None)}
