@@ -233,10 +233,52 @@ def _persist_job(jid):
                 "scheduleData", "error", "polygons_by_page", "dims_by_page", "log", "projName", "pageCount",
                 "coverageReport", "openingsConvention", "scopeMap", "reviewConfirmed", "netOverrides",
                 "materialNameMap", "pageScopeMap")}
-        with open(os.path.join(d, "job.json"), "w", encoding="utf-8") as fh:
-            json.dump(meta, fh)
+        # ATOMIC WRITE: a SIGKILL/OOM/redeploy mid json.dump used to leave a truncated
+        # job.json that _load_job reads as None -> the WHOLE job looks lost. Write a temp
+        # then os.replace (atomic within a dir) so an interrupt keeps the prior good file.
+        _tmp = os.path.join(d, "job.json.tmp")
+        with open(_tmp, "w", encoding="utf-8") as fh:
+            json.dump(meta, fh); fh.flush(); os.fsync(fh.fileno())
+        os.replace(_tmp, os.path.join(d, "job.json"))
     except Exception:
         pass  # persistence is a bonus; the app still works from RAM without a volume
+
+@app.on_event("startup")
+def _reconcile_orphaned_jobs():
+    """A Railway OOM is SIGKILL (uncatchable): the process dies with in-flight jobs still
+    marked queued/running/processing on disk, and NOTHING re-drives them -> /status returns
+    a non-terminal state FOREVER and the UI spinner never ends. At startup the queue is empty
+    and no worker runs, so any non-terminal job on disk is orphaned from a dead process ->
+    mark it FAILED (not requeued: the set that OOMed would OOM again and crash-loop the single
+    worker; a clear error lets her re-run or split the file)."""
+    try:
+        if not os.path.isdir(JOBS_DIR):
+            return
+        msg = ("Processing stopped unexpectedly \u2014 the server restarted mid-analysis "
+               "(most likely out of memory on a large set). No square footage was booked. "
+               "Re-run it, or split the set to the elevation sheets and re-upload.")
+        for _d in os.listdir(JOBS_DIR):
+            _jf = os.path.join(JOBS_DIR, _d, "job.json")
+            if not os.path.isfile(_jf):
+                continue
+            try:
+                with open(_jf, encoding="utf-8") as fh:
+                    meta = json.load(fh)
+            except Exception:
+                continue
+            if meta.get("status") in ("done", "error"):
+                continue
+            meta["status"] = "error"; meta["phase"] = "error"; meta["error"] = msg
+            meta["progress"] = {"label": "Failed \u2014 server restarted", "pct": 0}
+            try:
+                _t = os.path.join(JOBS_DIR, _d, "job.json.tmp")
+                with open(_t, "w", encoding="utf-8") as fh:
+                    json.dump(meta, fh); fh.flush(); os.fsync(fh.fileno())
+                os.replace(_t, _jf)
+            except Exception:
+                pass
+    except Exception:
+        pass
 
 def _load_job(jid):
     d = _job_dir(jid)
@@ -328,6 +370,10 @@ import queue as _job_queue_mod
 MAX_CONCURRENCY = max(1, int(os.environ.get("BFS_MAX_CONCURRENCY", "1")))
 _JOB_QUEUE = _job_queue_mod.Queue()
 _QUEUE_LOCK = threading.Lock()
+# Serialize read-modify-write+persist of a shared job dict. /review-confirm and /set-net
+# run on Starlette's threadpool; two overlapping full-file writes lose one via
+# last-writer-wins (or json.dump hits "dict changed size"). One global lock suffices.
+_JOB_WRITE_LOCK = threading.Lock()
 _workers_started = False
 _queue_depth = 0   # jobs currently waiting or running (reported on /health)
 
@@ -2635,7 +2681,10 @@ def material_groups_route(payload: dict = Body(...)):
     j = get_job(payload.get("jobId"))
     if not j or not j.get("pdf"):
         raise HTTPException(404, "job not found")
-    page = int(payload.get("page", 1)) - 1
+    try:
+        page = int(payload.get("page", 1)) - 1
+    except (TypeError, ValueError):
+        raise HTTPException(400, "page must be an integer")
     # VECTOR-FIRST (estimator-confirmed: the geometry path beats texture clustering by a mile).
     # Each vector region is emitted as grid patches so the existing select + exact-on-select
     # flow works unchanged; the texture clustering stays as the fallback for scanned pages.
@@ -2690,7 +2739,10 @@ def snap_fill_route(payload: dict = Body(...)):
     j = get_job(payload.get("jobId"))
     if not j or not j.get("pdf"):
         raise HTTPException(404, "job not found")
-    page = int(payload.get("page", 1)) - 1
+    try:
+        page = int(payload.get("page", 1)) - 1
+    except (TypeError, ValueError):
+        raise HTTPException(400, "page must be an integer")
     dims = j.get("dims_by_page", {}).get(page + 1) or {"width": 612, "height": 792}
     try:
         if payload.get("corners"):
@@ -3203,7 +3255,11 @@ def accept_suggestion(payload: dict = Body(...)):
     """Flip a suggest_only v13 piece into a REAL zone (the human said it's a wall).
     payload: {jobId, page (1-based), pieceId}. Rebuilds that page's zone rows,
     persists, logs the acceptance as flywheel training data."""
-    jid = payload.get("jobId"); page = int(payload.get("page") or 0)
+    jid = payload.get("jobId")
+    try:
+        page = int(payload.get("page") or 0)
+    except (TypeError, ValueError):
+        raise HTTPException(400, "page must be an integer")
     pid = payload.get("pieceId")
     j = get_job(jid)
     if not j or page < 1:
@@ -3687,17 +3743,18 @@ def review_confirm(payload: dict = Body(...)):
     key = _net_key(page, mat)
     if payload.get("pieceId") is not None:
         key += "|#%s" % payload.get("pieceId")
-    conf = dict(j.get("reviewConfirmed") or {})
-    if payload.get("confirmed", True):
-        conf[key] = {"at": int(time.time() * 1000)}
-    else:
-        conf.pop(key, None)
-    j["reviewConfirmed"] = conf
-    jobs[jid] = j
-    try:
-        _persist_job(jid)
-    except Exception:
-        pass
+    with _JOB_WRITE_LOCK:
+        conf = dict(j.get("reviewConfirmed") or {})
+        if payload.get("confirmed", True):
+            conf[key] = {"at": int(time.time() * 1000)}
+        else:
+            conf.pop(key, None)
+        j["reviewConfirmed"] = conf
+        jobs[jid] = j
+        try:
+            _persist_job(jid)
+        except Exception:
+            pass
     return {"ok": True, "jobId": jid, "key": key,
             "confirmed": key in conf, "confirmedCount": len(conf),
             "reviewConfirmed": conf,
@@ -3755,13 +3812,14 @@ def set_net(payload: dict = Body(...)):
                 raise HTTPException(400, "net cannot be negative")
             ov[key] = {"net": round(val, 1), "ts": int(time.time() * 1000),
                        "by": str(payload.get("by") or "estimator")[:40]}
-    j["netOverrides"] = ov
-    n = _apply_nets(j)
-    jobs[jid] = j
-    try:
-        _persist_job(jid)
-    except Exception:
-        pass
+    with _JOB_WRITE_LOCK:
+        j["netOverrides"] = ov
+        n = _apply_nets(j)
+        jobs[jid] = j
+        try:
+            _persist_job(jid)
+        except Exception:
+            pass
     return {"ok": True, "jobId": jid, "key": key, "netOverrides": ov,
             "zonesOverridden": n,
             "jobTotal": round(sum(float(z.get("netArea") or 0)
@@ -3949,10 +4007,13 @@ def split_suggest(payload: dict = Body(...)):
     boundary supervision for v14. payload: {jobId, page(1-based), points([[x,y]..]
     normalized)} → {cuts: [{axis:'v'|'h', pos: normalized, span:[a,b]}]}"""
     jid = payload.get("jobId")
-    page = int(payload.get("page") or 0)
+    try:
+        page = int(payload.get("page") or 0)
+    except (TypeError, ValueError):
+        raise HTTPException(400, "page must be an integer")
     pts = payload.get("points") or []
     j = get_job(jid)
-    if not j or not j.get("pdf") or page < 1 or len(pts) < 3:
+    if not j or not j.get("pdf") or page < 1 or not isinstance(pts, list) or len(pts) < 3:
         raise HTTPException(400, "bad request")
     import numpy as np, cv2
     mp = os.environ.get("V13_ONNX", "/data/model_v13.onnx")
